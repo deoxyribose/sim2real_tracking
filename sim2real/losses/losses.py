@@ -23,7 +23,9 @@ class PretrainLossConfig:
     lambda_where: float = 1.0
     lambda_pres: float = 0.5
     lambda_mask: float = 1.0
-    lambda_kl: float = 0.01
+    # KL is not used during supervised pretrain — the GT labels pin all latents directly.
+    # Set >0 only if you want to lightly nudge posteriors toward the priors.
+    lambda_kl: float = 0.0
 
 
 @dataclass(frozen=True)

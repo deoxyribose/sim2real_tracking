@@ -21,6 +21,12 @@ def main():
     ap.add_argument("--run-dir", default=None)
     ap.add_argument("--n-max", type=int, default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--lambda-recon", type=float, default=1.0)
+    ap.add_argument("--lambda-where", type=float, default=1.0)
+    ap.add_argument("--lambda-pres", type=float, default=0.5)
+    ap.add_argument("--lambda-mask", type=float, default=1.0)
+    ap.add_argument("--log-every", type=int, default=25)
+    ap.add_argument("--ckpt-every", type=int, default=500)
     args = ap.parse_args()
 
     # Pick a reasonable model n_max per sim (must be ≤ sim n_max).
@@ -37,12 +43,23 @@ def main():
         glimpse_size=16,
         stem_channels=(16, 32, 64),
     )
+    from sim2real.losses.losses import PretrainLossConfig
+    loss_cfg = PretrainLossConfig(
+        lambda_recon=args.lambda_recon,
+        lambda_where=args.lambda_where,
+        lambda_pres=args.lambda_pres,
+        lambda_mask=args.lambda_mask,
+        lambda_kl=0.0,
+    )
     cfg = PretrainConfig(
         sim_kind=args.sim,
         model_cfg=model_cfg,
+        loss_cfg=loss_cfg,
         batch_size=args.batch,
         n_steps=args.steps,
         lr_peak=args.lr,
+        log_every=args.log_every,
+        ckpt_every=args.ckpt_every,
         run_dir=args.run_dir or f"runs/pretrain_{args.sim}",
         seed=args.seed,
     )

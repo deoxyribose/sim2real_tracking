@@ -5,8 +5,14 @@ from __future__ import annotations
 import optax
 
 
-def adamw_cosine(lr_peak: float, total_steps: int, warmup_steps: int = 500, wd: float = 1e-4):
-    """Cosine LR schedule with warmup. Returns (optimizer, schedule_fn).
+def adamw_cosine(
+    lr_peak: float,
+    total_steps: int,
+    warmup_steps: int = 500,
+    wd: float = 1e-4,
+    grad_clip: float | None = 1.0,
+):
+    """Cosine LR schedule with warmup, optional global-norm gradient clipping.
 
     Note: optax's `warmup_cosine_decay_schedule` interprets `decay_steps` as the TOTAL number
     of steps over the full run (warmup + cosine decay), not the post-warmup duration.
@@ -19,7 +25,11 @@ def adamw_cosine(lr_peak: float, total_steps: int, warmup_steps: int = 500, wd: 
         decay_steps=max(total_steps, warmup_steps + 1),
         end_value=lr_peak * 0.05,
     )
-    return optax.adamw(schedule, weight_decay=wd), schedule
+    transforms = []
+    if grad_clip is not None and grad_clip > 0:
+        transforms.append(optax.clip_by_global_norm(grad_clip))
+    transforms.append(optax.adamw(schedule, weight_decay=wd))
+    return optax.chain(*transforms), schedule
 
 
 def kl_ramp(step: int, ramp_steps: int = 2000, max_beta: float = 1.0) -> float:
