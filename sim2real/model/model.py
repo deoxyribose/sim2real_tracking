@@ -82,26 +82,47 @@ class SlotVideoModel(nn.Module):
             lambda key: jax.random.normal(key, (c.n_max, 3)) * 0.1,
         )
 
-    def _per_slot_head(self, q, key_p, key_w, prev_zwhere, image):
-        """Apply heads + decoder + STN for one slot. q: (d,) ; prev_zwhere: (3,)."""
+    def _predict_zwhere(self, q, prev_zwhere):
+        return self.where_head(q, prev_zwhere)
+
+    def _per_slot_head(self, q, key_p, key_w, zwhere_pred, render_zwhere, image):
+        """Apply heads + decoder + STN for one slot.
+
+        Args:
+          q: (d,) refined slot token.
+          zwhere_pred: (3,) the model's PREDICTED z_where — kept in outputs so L_where can train it.
+          render_zwhere: (3,) the z_where used by `stn_read` / `stn_write`. Equal to
+            `zwhere_pred` in self-prediction mode, or to GT z_where in teacher-forcing mode.
+          image: (H, W, C).
+        """
         cfg = self.cfg
-        zwhere = self.where_head(q, prev_zwhere)
-        glimpse = stn_read(image, zwhere, cfg.glimpse_size)
+        glimpse = stn_read(image, render_zwhere, cfg.glimpse_size)
         glimpse_feat = self.glimpse_encoder(glimpse)
         zpres, zpres_logit = self.pres_head(q, key_p, tau=cfg.pres_tau, straight_through=True)
         zwhat, mu_w, lv_w = self.what_head(q, glimpse_feat, key_w)
         appear_patch, mask_logit_patch = self.glimpse_decoder(zwhat)
-        # Separate seg head (independent from appearance mask)
-        seg_logit_patch = self.seg_head(zwhat, zwhere)
-        # Place onto canvas
-        appear_canvas = stn_write(appear_patch, zwhere, image.shape[0])               # (R, R, 1)
+        seg_logit_patch = self.seg_head(zwhat, render_zwhere)
+        appear_canvas = stn_write(appear_patch, render_zwhere, image.shape[0])         # (R, R, 1)
         mask_appear_canvas = stn_write(
-            nn.sigmoid(mask_logit_patch) * zpres, zwhere, image.shape[0]
-        )[..., 0]                                                                     # (R, R)
-        mask_seg_canvas = stn_write(nn.sigmoid(seg_logit_patch), zwhere, image.shape[0])[..., 0]
-        return zwhere, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat, appear_canvas, mask_appear_canvas, mask_seg_canvas
+            nn.sigmoid(mask_logit_patch) * zpres, render_zwhere, image.shape[0]
+        )[..., 0]
+        mask_seg_canvas = stn_write(nn.sigmoid(seg_logit_patch), render_zwhere, image.shape[0])[..., 0]
+        return zwhere_pred, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat, appear_canvas, mask_appear_canvas, mask_seg_canvas
 
-    def __call__(self, video: Array, key):
+    def __call__(self, video: Array, key, *, teacher_zwhere=None, teacher_zpres=None):
+        """Forward one video.
+
+        Args:
+          video: (T, H, W, C).
+          key:   PRNG key.
+          teacher_zwhere: optional (T, N, 3) — GT z_where in slot-index order. If provided, the
+            residual anchor for `head_where` becomes `teacher_zwhere[t-1]` and `stn_read/write`
+            both use `teacher_zwhere[t]`. The predicted z_where is still produced and still
+            trained via `L_where`.
+          teacher_zpres: optional (T, N) — GT z_pres in slot-index order. If provided, the
+            alive/dormant gate that selects between `q_prop` and `q_disc` uses
+            `teacher_zpres[t-1]` instead of the model's previous prediction.
+        """
         cfg = self.cfg
         T, H, W, C = video.shape
 
@@ -119,16 +140,20 @@ class SlotVideoModel(nn.Module):
         prev_zpres0 = jnp.zeros((cfg.n_max,))                                         # all dormant
         prev_zwhat0 = jnp.zeros((cfg.n_max, cfg.z_what_dim))
 
-        def step(carry, inputs):
-            slot_h, prev_zwhere, prev_zpres, prev_zwhat = carry
-            t_idx, feat_grid, image, k = inputs
-            del t_idx
+        def step(carry, inputs, prev_zwhere_anchor, prev_zpres_gate, render_zwhere_teacher):
+            slot_h, _prev_zwhere_carry, _prev_zpres_carry, prev_zwhat = carry
+            feat_grid, image, k = inputs
+
+            # Use teacher anchor/gate when given, otherwise the predicted carry values.
+            prev_zwhere = (
+                prev_zwhere_anchor if prev_zwhere_anchor is not None else _prev_zwhere_carry
+            )
+            prev_zpres = (
+                prev_zpres_gate if prev_zpres_gate is not None else _prev_zpres_carry
+            )
 
             # Residual mask for discovery: 1 - Σ_slots prev_zpres * indicator(in-glimpse-region).
-            # We approximate this by pooling the previous-frame predicted masks; since we don't have
-            # them in carry, we use a soft "alive presence" → low-res indicator from prev_zwhere.
             if cfg.use_discovery:
-                # Build a coarse alive-mask at encoder resolution from prev_zwhere using gaussian bumps.
                 grid_y = (jnp.linspace(-1.0, 1.0, h_prime))
                 grid_x = (jnp.linspace(-1.0, 1.0, w_prime))
                 yy, xx = jnp.meshgrid(grid_y, grid_x, indexing="ij")
@@ -146,9 +171,9 @@ class SlotVideoModel(nn.Module):
 
             q_prop, q_disc, _ = self.slot_transformer(feat_grid, slot_h, residual_mask_pixel)
 
-            # Choose tokens per slot: alive (prev_zpres ≈ 1) → q_prop; dormant → q_disc.
-            alive = prev_zpres[:, None]                                              # (N, 1)
-            q = alive * q_prop + (1.0 - alive) * q_disc                              # (N, d)
+            # Choose tokens per slot: alive → q_prop; dormant → q_disc.
+            alive = prev_zpres[:, None]
+            q = alive * q_prop + (1.0 - alive) * q_disc
 
             # Heads + decoder per slot.
             k_p = jax.random.fold_in(k, 1)
@@ -156,10 +181,17 @@ class SlotVideoModel(nn.Module):
             keys_p = jax.random.split(k_p, cfg.n_max)
             keys_w = jax.random.split(k_w, cfg.n_max)
 
+            # Always produce the PREDICTED z_where so L_where can train it.
+            zwhere_pred = jax.vmap(self._predict_zwhere)(q, prev_zwhere)              # (N, 3)
+            # Render branch uses teacher's z_where if given, otherwise the prediction.
+            render_zwhere = (
+                render_zwhere_teacher if render_zwhere_teacher is not None else zwhere_pred
+            )
+
             (zwhere, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat,
              appear_canvas, mask_appear_canvas, mask_seg_canvas) = jax.vmap(
-                self._per_slot_head, in_axes=(0, 0, 0, 0, None)
-            )(q, keys_p, keys_w, prev_zwhere, image)
+                self._per_slot_head, in_axes=(0, 0, 0, 0, 0, None)
+            )(q, keys_p, keys_w, zwhere_pred, render_zwhere, image)
 
             # Composite frame from alive slots only (z_pres already gates the appearance mask).
             num = jnp.sum(appear_canvas * mask_appear_canvas[..., None], axis=0)
@@ -192,7 +224,25 @@ class SlotVideoModel(nn.Module):
         carry = (slot_h0, prev_zwhere0, prev_zpres0, prev_zwhat0)
         outs = []
         for t in range(T):
-            carry, out_t = step(carry, (jnp.asarray(t), feats[t], video[t], keys_t[t]))
+            # Per-frame teacher slices (slot-index aligned to GT).
+            if teacher_zwhere is not None:
+                prev_zwhere_anchor = teacher_zwhere[t - 1] if t > 0 else teacher_zwhere[0]
+                render_zwhere_teacher = teacher_zwhere[t]
+            else:
+                prev_zwhere_anchor = None
+                render_zwhere_teacher = None
+            if teacher_zpres is not None:
+                prev_zpres_gate = teacher_zpres[t - 1] if t > 0 else teacher_zpres[0]
+            else:
+                prev_zpres_gate = None
+
+            carry, out_t = step(
+                carry,
+                (feats[t], video[t], keys_t[t]),
+                prev_zwhere_anchor,
+                prev_zpres_gate,
+                render_zwhere_teacher,
+            )
             outs.append(out_t)
 
         traj = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *outs)

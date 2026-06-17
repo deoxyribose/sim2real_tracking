@@ -27,6 +27,8 @@ def main():
     ap.add_argument("--lambda-mask", type=float, default=1.0)
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--ckpt-every", type=int, default=500)
+    ap.add_argument("--teacher-force-zwhere", action="store_true")
+    ap.add_argument("--teacher-force-zpres", action="store_true")
     args = ap.parse_args()
 
     # Pick a reasonable model n_max per sim (must be ≤ sim n_max).
@@ -62,6 +64,8 @@ def main():
         ckpt_every=args.ckpt_every,
         run_dir=args.run_dir or f"runs/pretrain_{args.sim}",
         seed=args.seed,
+        teacher_force_zwhere=args.teacher_force_zwhere,
+        teacher_force_zpres=args.teacher_force_zpres,
     )
     train_pretrain(cfg)
 

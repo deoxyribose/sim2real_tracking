@@ -43,17 +43,41 @@ class PretrainConfig:
     ckpt_every: int = 500
     run_dir: str = "runs/pretrain"
     seed: int = 0
+    # When True, model.stn_read/write uses GT z_where (and the residual head's anchor is GT[t-1])
+    # while the predicted z_where is still produced and trained via L_where.
+    teacher_force_zwhere: bool = False
+    # When True, the alive/dormant gate that selects propagate vs discover uses GT z_pres[t-1].
+    teacher_force_zpres: bool = False
 
 
-def train_step_factory(model, loss_cfg, prior_cfg, optimizer):
-    """Build a jitted train_step closure."""
+def train_step_factory(model, loss_cfg, prior_cfg, optimizer,
+                       teacher_force_zwhere=False, teacher_force_zpres=False):
+    """Build a jitted train_step closure.
 
-    def model_forward_one(params, video, key):
-        return model.apply(params, video, key)
+    teacher_force_*: if True, pass the corresponding GT tensors from the batch into model.apply,
+    so the residual anchor / discover gate / STN read are anchored on GT slot data while the
+    predicted latents are still produced and supervised by the losses.
+    """
+
+    def model_forward_one(params, video, key, t_zw, t_zp):
+        return model.apply(params, video, key, teacher_zwhere=t_zw, teacher_zpres=t_zp)
 
     def loss_fn(params, batch, key):
         keys = jax.random.split(key, batch.video.shape[0])
-        outs = jax.vmap(lambda v, k: model_forward_one(params, v, k))(batch.video, keys)
+        t_zw = batch.z_where if teacher_force_zwhere else None
+        t_zp = batch.z_pres if teacher_force_zpres else None
+
+        def fwd_one(v, k, t_zw_i, t_zp_i):
+            return model_forward_one(params, v, k, t_zw_i, t_zp_i)
+
+        if t_zw is None and t_zp is None:
+            outs = jax.vmap(lambda v, k: fwd_one(v, k, None, None))(batch.video, keys)
+        elif t_zw is not None and t_zp is None:
+            outs = jax.vmap(lambda v, k, z: fwd_one(v, k, z, None))(batch.video, keys, t_zw)
+        elif t_zw is None and t_zp is not None:
+            outs = jax.vmap(lambda v, k, p: fwd_one(v, k, None, p))(batch.video, keys, t_zp)
+        else:
+            outs = jax.vmap(lambda v, k, z, p: fwd_one(v, k, z, p))(batch.video, keys, t_zw, t_zp)
 
         def per_video(out, smp):
             total, metrics = pretrain_loss(out, smp, loss_cfg, prior_cfg)
@@ -112,7 +136,15 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
         cfg.lr_peak, cfg.n_steps, cfg.warmup_steps, grad_clip=cfg.grad_clip
     )
     opt_state = optimizer.init(params)
-    train_step = train_step_factory(model, cfg.loss_cfg, cfg.prior_cfg, optimizer)
+    train_step = train_step_factory(
+        model, cfg.loss_cfg, cfg.prior_cfg, optimizer,
+        teacher_force_zwhere=cfg.teacher_force_zwhere,
+        teacher_force_zpres=cfg.teacher_force_zpres,
+    )
+    print(
+        f"teacher_force_zwhere={cfg.teacher_force_zwhere}  "
+        f"teacher_force_zpres={cfg.teacher_force_zpres}"
+    )
 
     logger = Logger(cfg.run_dir)
     os.makedirs(os.path.join(cfg.run_dir, "ckpts"), exist_ok=True)
