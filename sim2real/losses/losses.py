@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from sim2real.losses.kl import total_kl
 from sim2real.losses.matching import gather_along_slots, hungarian_per_frame
 from sim2real.losses.recon import recon_mse
-from sim2real.losses.supervised import bce_one_sided, mask_loss, masked_mse
+from sim2real.losses.supervised import bce_from_logits, mask_loss, masked_mse
 from sim2real.priors.registry import PriorConfig
 from sim2real.types import ModelOut, SimSample
 
@@ -62,7 +62,7 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
 
     L_recon = recon_mse(out.composite, sample.video)
     L_where = masked_mse(z_where_matched, sample.z_where, sample.z_pres)
-    L_pres = bce_one_sided(z_pres_matched, sample.z_pres)
+    L_pres = bce_from_logits(z_pres_logit_matched, sample.z_pres)
     L_mask = mask_loss(masks_pred_matched, sample.masks, sample.z_pres)
 
     L_kl, kl_breakdown = total_kl(
