@@ -51,6 +51,11 @@ class ModelConfig:
     pres_init_bias: float = -1.0
     pres_tau: float = 0.5
     use_discovery: bool = True
+    # When True, the recon path uses stop_gradient on z_where (render position) and z_pres
+    # (presence gate) before stn_write. Decoder + z_what are trained by L_recon; the pose head
+    # is trained exclusively by L_where, the pres head by L_pres, the seg head by L_mask.
+    # See cellulose/sqair_cells/train_mixed.py:662-663 for the original pattern.
+    stop_grad_recon_path: bool = True
 
 
 class SlotVideoModel(nn.Module):
@@ -102,9 +107,20 @@ class SlotVideoModel(nn.Module):
         zwhat, mu_w, lv_w = self.what_head(q, glimpse_feat, key_w)
         appear_patch, mask_logit_patch = self.glimpse_decoder(zwhat)
         seg_logit_patch = self.seg_head(zwhat, render_zwhere)
-        appear_canvas = stn_write(appear_patch, render_zwhere, image.shape[0])         # (R, R, 1)
+
+        # For the recon path, optionally stop gradient on position and presence so L_recon trains
+        # the decoder + z_what only, not the pose / presence heads. The seg path keeps gradients
+        # flowing because L_mask is GT-supervised.
+        if cfg.stop_grad_recon_path:
+            recon_zwhere = jax.lax.stop_gradient(render_zwhere)
+            recon_zpres = jax.lax.stop_gradient(zpres)
+        else:
+            recon_zwhere = render_zwhere
+            recon_zpres = zpres
+
+        appear_canvas = stn_write(appear_patch, recon_zwhere, image.shape[0])           # (R, R, 1)
         mask_appear_canvas = stn_write(
-            nn.sigmoid(mask_logit_patch) * zpres, render_zwhere, image.shape[0]
+            nn.sigmoid(mask_logit_patch) * recon_zpres, recon_zwhere, image.shape[0]
         )[..., 0]
         mask_seg_canvas = stn_write(nn.sigmoid(seg_logit_patch), render_zwhere, image.shape[0])[..., 0]
         return zwhere_pred, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat, appear_canvas, mask_appear_canvas, mask_seg_canvas

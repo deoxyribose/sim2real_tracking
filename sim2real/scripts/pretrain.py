@@ -29,6 +29,9 @@ def main():
     ap.add_argument("--ckpt-every", type=int, default=500)
     ap.add_argument("--teacher-force-zwhere", action="store_true")
     ap.add_argument("--teacher-force-zpres", action="store_true")
+    ap.add_argument("--t-curriculum", action="store_true")
+    ap.add_argument("--t-start", type=int, default=3)
+    ap.add_argument("--t-curriculum-steps", type=int, default=25_000)
     args = ap.parse_args()
 
     # Pick a reasonable model n_max per sim (must be ≤ sim n_max).
@@ -66,6 +69,9 @@ def main():
         seed=args.seed,
         teacher_force_zwhere=args.teacher_force_zwhere,
         teacher_force_zpres=args.teacher_force_zpres,
+        t_curriculum=args.t_curriculum,
+        t_start=args.t_start,
+        t_curriculum_steps=args.t_curriculum_steps,
     )
     train_pretrain(cfg)
 

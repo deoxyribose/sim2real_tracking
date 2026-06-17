@@ -48,6 +48,11 @@ class PretrainConfig:
     teacher_force_zwhere: bool = False
     # When True, the alive/dormant gate that selects propagate vs discover uses GT z_pres[t-1].
     teacher_force_zpres: bool = False
+    # SQAIR-style frame curriculum: start at `t_start` frames, ramp linearly to the simulator's
+    # native T over `t_curriculum_steps`. Each T bump triggers a JIT recompile (~15s).
+    t_curriculum: bool = False
+    t_start: int = 3
+    t_curriculum_steps: int = 25_000
 
 
 def train_step_factory(model, loss_cfg, prior_cfg, optimizer,
@@ -90,10 +95,24 @@ def train_step_factory(model, loss_cfg, prior_cfg, optimizer,
     @jax.jit
     def train_step(params, opt_state, batch, key):
         (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch, key)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        metrics["grad_norm"] = optax.global_norm(grads)
-        return params, opt_state, loss, metrics
+        # Compute gradient norm BEFORE skipping — useful diagnostic even on bad batches.
+        gnorm = optax.global_norm(grads)
+        # NaN guard: if any grad leaf is non-finite, skip the update entirely.
+        finite_per_leaf = jax.tree.map(lambda x: jnp.all(jnp.isfinite(x)), grads)
+        all_finite = jax.tree.reduce(jnp.logical_and, finite_per_leaf)
+
+        def good_update(_):
+            updates, new_st = optimizer.update(grads, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+            return new_params, new_st
+
+        def skip_update(_):
+            return params, opt_state
+
+        new_params, new_opt_state = jax.lax.cond(all_finite, good_update, skip_update, operand=None)
+        metrics["grad_norm"] = gnorm
+        metrics["skipped_nan"] = (~all_finite).astype(jnp.float32)
+        return new_params, new_opt_state, loss, metrics
 
     return train_step
 
@@ -149,29 +168,65 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
     logger = Logger(cfg.run_dir)
     os.makedirs(os.path.join(cfg.run_dir, "ckpts"), exist_ok=True)
 
+    def current_T(step: int) -> int:
+        """SQAIR-style frame curriculum. Returns the current sequence length."""
+        if not cfg.t_curriculum:
+            return int(sample.video.shape[1])
+        T_max = int(sample.video.shape[1])
+        if step >= cfg.t_curriculum_steps:
+            return T_max
+        frac = step / max(cfg.t_curriculum_steps, 1)
+        T = int(cfg.t_start + frac * (T_max - cfg.t_start))
+        return max(cfg.t_start, min(T_max, T))
+
+    def slice_T(batch_m, T: int):
+        from sim2real.types import SimSample
+        return SimSample(
+            video=batch_m.video[:, :T],
+            z_where=batch_m.z_where[:, :T],
+            z_pres=batch_m.z_pres[:, :T],
+            z_style=batch_m.z_style,
+            masks=batch_m.masks[:, :T],
+            z_what=batch_m.z_what,
+            meta=batch_m.meta,
+        )
+
     rng_iter = rng
     t0 = time.time()
     last_metrics = None
+    last_T = -1
+    skipped_nan = 0
     for step in range(1, cfg.n_steps + 1):
         rng_iter, k_batch, k_step = jax.random.split(rng_iter, 3)
         batch = jit_sample(k_batch)
         batch_m = slice_to_model(batch)
+        T_now = current_T(step)
+        batch_m = slice_T(batch_m, T_now)
+        if T_now != last_T:
+            print(f"[curriculum] step {step}: T = {T_now}", flush=True)
+            last_T = T_now
+
         params, opt_state, loss, metrics = train_step(params, opt_state, batch_m, k_step)
+        if bool(metrics["skipped_nan"] > 0.5):
+            skipped_nan += 1
+            print(f"[nan-guard] step {step}: non-finite grad detected — update skipped", flush=True)
         last_metrics = metrics
 
         if step % cfg.log_every == 0 or step == 1:
             elapsed = time.time() - t0
             print(
-                f"step {step:6d}  loss {float(loss):.4f}  recon {float(metrics['L_recon']):.4f}  "
+                f"step {step:6d}  T={T_now:2d}  loss {float(loss):.4f}  recon {float(metrics['L_recon']):.4f}  "
                 f"where {float(metrics['L_where']):.4f}  pres {float(metrics['L_pres']):.4f}  "
                 f"mask {float(metrics['L_mask']):.4f}  "
-                f"gnorm {float(metrics['grad_norm']):.2f}  "
+                f"gnorm {float(metrics['grad_norm']):.2f}  nan_skips {skipped_nan}  "
                 f"({elapsed:.1f}s)",
                 flush=True,
             )
             for k, v in metrics.items():
                 logger.scalar(f"train/{k}", v, step)
             logger.scalar("train/lr", float(lr_schedule(step)), step)
+            logger.scalar("train/T", T_now, step)
+            logger.scalar("train/skipped_nan", skipped_nan, step)
 
         if step % cfg.ckpt_every == 0 or step == cfg.n_steps:
             ckpt_save(
