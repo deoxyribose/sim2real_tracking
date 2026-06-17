@@ -24,6 +24,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
+from sim2real.model.background import BackgroundRenderer
 from sim2real.model.encoder import FrameEncoder
 from sim2real.model.glimpse import GlimpseDecoder, GlimpseEncoder, SegHead
 from sim2real.model.heads import PresHead, WhatHead, WhereHead
@@ -56,6 +57,11 @@ class ModelConfig:
     # is trained exclusively by L_where, the pres head by L_pres, the seg head by L_mask.
     # See cellulose/sqair_cells/train_mixed.py:662-663 for the original pattern.
     stop_grad_recon_path: bool = True
+    # When True, a per-video background field is rendered from z_style and slots composite OVER
+    # it. Removes the L_recon = 0.21 floor caused by "unexplained pixels → composite=0".
+    use_background: bool = True
+    bg_base_res: int = 8
+    bg_channels: tuple = (64, 32, 16)
 
 
 class SlotVideoModel(nn.Module):
@@ -76,9 +82,18 @@ class SlotVideoModel(nn.Module):
         self.glimpse_decoder = GlimpseDecoder(
             glimpse_size=c.glimpse_size, z_what_dim=c.z_what_dim, channels=(32, 16)
         )
-        self.seg_head = SegHead(glimpse_size=c.glimpse_size, hidden=c.d_model)
+        self.seg_head = SegHead(glimpse_size=c.glimpse_size)
         self.slot_gru = SlotGRU(d_model=c.d_model)
         self.style_encoder = StyleEncoder(z_style_dim=c.z_style_dim, hidden=c.d_model)
+        if c.use_background:
+            # out_res set at __call__ time would require dynamic shapes; we instead use a
+            # placeholder out_res = 128 which is then cropped to the actual frame size if needed.
+            self.bg_renderer = BackgroundRenderer(
+                out_res=128,
+                base_res=c.bg_base_res,
+                channels=tuple(c.bg_channels),
+                z_style_dim=c.z_style_dim,
+            )
 
         # Learned per-slot z_where init (used on frame 0 as the residual anchor).
         # Initialize positions roughly spread across the canvas via small noise.
@@ -148,6 +163,14 @@ class SlotVideoModel(nn.Module):
         # 2) z_style from pooled features.
         k_style = jax.random.fold_in(key, 0)
         z_style_sample, z_style_mu, z_style_logvar = self.style_encoder(pools, k_style)
+
+        # 2b) Per-video background field — same across frames.
+        if cfg.use_background:
+            bg_frame = self.bg_renderer(z_style_sample)                              # (128, 128, 1)
+            # Crop to actual frame size if smaller. (Sim runs at 128 today, so no-op.)
+            bg_frame = bg_frame[:H, :W]
+        else:
+            bg_frame = jnp.zeros((H, W, 1))
 
         # 3) Scan over time.
         slot_h0 = jnp.zeros((cfg.n_max, cfg.d_model))
@@ -231,10 +254,16 @@ class SlotVideoModel(nn.Module):
                 )                                                                     # (N,)
                 mask_appear_canvas = mask_appear_canvas * gate[:, None, None]
 
-            # Composite frame from alive slots only (z_pres already gates the appearance mask).
+            # Composite: foreground (slot mixture) OVER background.
             num = jnp.sum(appear_canvas * mask_appear_canvas[..., None], axis=0)
             den = jnp.sum(mask_appear_canvas, axis=0)[..., None] + 1e-6
-            composite = jnp.clip(num / den, 0.0, 1.0)                                # (H, W, 1)
+            fg = num / den                                                          # (H, W, 1)
+            alpha_fg = jnp.clip(jnp.sum(mask_appear_canvas, axis=0), 0.0, 1.0)[..., None]
+            if cfg.use_background:
+                bg = bg_frame                                                       # (H, W, 1), in [0,1]
+                composite = jnp.clip(alpha_fg * fg + (1.0 - alpha_fg) * bg, 0.0, 1.0)
+            else:
+                composite = jnp.clip(fg, 0.0, 1.0)
 
             # Slot state update (vmapped GRU).
             gru_input = jnp.concatenate(

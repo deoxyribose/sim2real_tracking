@@ -75,21 +75,40 @@ class GlimpseDecoder(nn.Module):
 
 
 class SegHead(nn.Module):
-    """Dedicated per-slot segmentation head: independent of appearance.
+    """Per-slot segmentation head with spatial inductive bias.
 
-    Takes [z_what; z_where_decoded] → small MLP → (g, g, 1) mask logit patch.
+    Mirrors `GlimpseDecoder`'s ConvT architecture but has its own parameters so it can specialize
+    for binary cell shapes while the appearance decoder handles texture. Input is the slot's
+    [z_what; z_where] concatenation, mapped to a (glimpse_size, glimpse_size, 1) mask logit patch.
     """
 
     glimpse_size: int = 16
-    hidden: int = 128
+    channels: tuple = (64, 32)        # ConvT channels (matches GlimpseDecoder.channels in spirit)
+    base_res: int = 4
 
     @nn.compact
     def __call__(self, z_what, z_where):
-        from jax import nn as jnn
-        s = jnn.sigmoid(z_where[..., 0:1])
+        s = nn.sigmoid(z_where[..., 0:1])
         txy = jnp.tanh(z_where[..., 1:3])
         feat = jnp.concatenate([z_what, s, txy], axis=-1)
-        x = nn.Dense(self.hidden)(feat)
-        x = nn.gelu(x)
-        x = nn.Dense(self.glimpse_size * self.glimpse_size)(x)
-        return x.reshape(self.glimpse_size, self.glimpse_size, 1)
+        c0 = self.channels[0]
+        x = nn.Dense(self.base_res * self.base_res * c0)(feat)
+        x = nn.gelu(x).reshape(self.base_res, self.base_res, c0)
+
+        cur = self.base_res
+        for c in self.channels[1:]:
+            x = nn.ConvTranspose(c, (3, 3), strides=(2, 2), padding="SAME")(x)
+            x = nn.gelu(x)
+            cur *= 2
+        while cur < self.glimpse_size:
+            x = nn.ConvTranspose(self.channels[-1], (3, 3), strides=(2, 2), padding="SAME")(x)
+            x = nn.gelu(x)
+            cur *= 2
+        x = x[: self.glimpse_size, : self.glimpse_size]
+        # 1x1 conv to a single logit channel. Init bias negative so the initial sigmoid is small
+        # (≈0.12) — prevents the "uniform 0.5 mask everywhere at step 0" failure.
+        x = nn.Conv(
+            1, (1, 1),
+            bias_init=nn.initializers.constant(-2.0),
+        )(x)
+        return x                                                                      # (g, g, 1)
