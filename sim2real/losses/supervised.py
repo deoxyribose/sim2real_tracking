@@ -47,11 +47,14 @@ def bce_two_sided(pred_pres: Array, gt_pres: Array, eps: float = 1e-6) -> Array:
 
 
 def mask_loss(pred_mask: Array, gt_mask: Array, alive: Array, dice_weight: float = 1.0) -> Array:
-    """BCE + soft-Dice over ALL slots.
+    """BCE over ALL slots + soft-Dice over ALIVE slots only.
 
-    Dead slots (alive=0) get their GT mask zeroed so the seg head is supervised to output empty
-    masks for padding. This prevents the "uniform red square over the canvas" failure mode where
-    padding slots' masks drift at sigmoid(init)≈0.5.
+    Rationale:
+    - BCE is well-defined for empty targets: it pulls pred → 0 on padding slots, which is what
+      we want (no "red square over the canvas" failure).
+    - Dice on empty targets is degenerate — `1 − 2·0/(p+0+ε) ≈ 1` for any small p, adding a
+      constant ~`n_dead/n_total` floor to the loss with no useful gradient. So we only Dice on
+      alive slots.
 
     Args:
       pred_mask: (T, N, H, W) in [0,1].
@@ -64,12 +67,12 @@ def mask_loss(pred_mask: Array, gt_mask: Array, alive: Array, dice_weight: float
     bce = -(gt_effective * jnp.log(p) + (1.0 - gt_effective) * jnp.log(1.0 - p))      # (T,N,H,W)
     bce_per_slot = jnp.mean(bce, axis=(-1, -2))                                       # (T, N)
 
-    # Soft Dice — alive slots use real GT; dead slots get a small offset to keep dice well-defined
-    # (we add eps to denom so 0/0 → 1−0 = 1, then take 1 − 2·0/eps = 1, then dice_weight·1 is
-    # a constant offset).
     inter = jnp.sum(p * gt_effective, axis=(-1, -2))
     denom = jnp.sum(p + gt_effective, axis=(-1, -2)) + eps
-    dice = 1.0 - 2.0 * inter / denom                                                  # (T, N)
+    dice_per_slot = 1.0 - 2.0 * inter / denom                                         # (T, N)
 
-    per_slot = bce_per_slot + dice_weight * dice
-    return jnp.mean(per_slot)
+    L_bce = jnp.mean(bce_per_slot)                                                    # over ALL slots
+    L_dice_num = jnp.sum(dice_per_slot * alive)
+    L_dice_den = jnp.sum(alive) + 1e-6
+    L_dice = L_dice_num / L_dice_den                                                  # alive only
+    return L_bce + dice_weight * L_dice
