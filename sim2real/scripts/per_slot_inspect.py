@@ -136,8 +136,81 @@ def main():
             k_star = int(np.argmax(g_post[n]))
             print(f"    slot {n:2d}: k*={k_star}  p(k*)={g_post[n, k_star]:.3f}  full={np.round(g_post[n], 2)}")
         _plot_group_attribution(g_post, gt_pres, gt_zwhere, args.out_dir)
+        # All-frames group-colored composite
+        all_g_post = np.asarray(out.aux["g_post"])                                       # (T, N, K)
+        all_masks = np.asarray(out.masks_pred)                                           # (T, N, H, W)
+        gt_video = np.asarray(b.video[0])                                                # (T, H, W, 1)
+        full_composite = np.asarray(out.composite)                                       # (T, H, W, 1)
+        _plot_group_colored_recon(gt_video, full_composite, all_masks, all_g_post, args.out_dir)
 
     _plot_slot_grid(pred_masks, gt_masks, gt_pres, gt_zwhere, args.out_dir)
+
+
+_GROUP_COLORS = np.array(
+    [
+        [1.0, 0.20, 0.20],   # red
+        [0.20, 0.60, 1.00],  # blue
+        [0.20, 0.90, 0.30],  # green
+        [1.00, 0.85, 0.10],  # yellow
+        [0.80, 0.30, 0.95],  # purple
+        [0.95, 0.55, 0.10],  # orange
+        [0.10, 0.85, 0.85],  # cyan
+        [0.95, 0.45, 0.75],  # pink
+    ]
+)
+
+
+def _plot_group_colored_recon(gt_video, composite, masks, g_post, out_dir, alpha=0.6):
+    """For each frame, paint each slot's mask with its argmax-group color and overlay on the GT.
+
+    gt_video:  (T, H, W, 1)
+    composite: (T, H, W, 1)
+    masks:     (T, N, H, W)  — per-slot predicted masks
+    g_post:    (T, N, K)     — per-slot group posterior
+    """
+    import matplotlib.pyplot as plt
+
+    T = gt_video.shape[0]
+    cols = min(T, 6)
+    fig, axes = plt.subplots(3, cols, figsize=(2.6 * cols, 8))
+    K = g_post.shape[-1]
+    colors = _GROUP_COLORS[:K]
+
+    for col, t in enumerate(np.linspace(0, T - 1, cols).astype(int)):
+        # Row 0: GT
+        axes[0, col].imshow(gt_video[t, ..., 0], cmap="gray", vmin=0, vmax=1)
+        axes[0, col].set_title(f"GT t={t}")
+        axes[0, col].axis("off")
+        # Row 1: full recon
+        axes[1, col].imshow(composite[t, ..., 0], cmap="gray", vmin=0, vmax=1)
+        axes[1, col].set_title("recon")
+        axes[1, col].axis("off")
+        # Row 2: group-colored slot masks overlaid on GT
+        gt_gray = gt_video[t, ..., 0]
+        # Per-slot dominant group color
+        slot_groups = np.argmax(g_post[t], axis=-1)                                      # (N,)
+        slot_color = colors[slot_groups]                                                 # (N, 3)
+        # Soft-color overlay: pixel_color = Σ_n masks[t,n] * slot_color[n] / max(1, Σ_n masks[t,n])
+        weighted = (masks[t][..., None] * slot_color[:, None, None, :]).sum(axis=0)      # (H, W, 3)
+        weight_norm = np.clip(masks[t].sum(axis=0)[..., None], 0.0, 1.0)                 # (H, W, 1)
+        bg = np.broadcast_to(gt_gray[..., None], (gt_gray.shape[0], gt_gray.shape[1], 3))
+        rgb = (1.0 - alpha * weight_norm) * bg + alpha * weighted
+        rgb = np.clip(rgb, 0.0, 1.0)
+        axes[2, col].imshow(rgb)
+        axes[2, col].set_title("masks colored by group")
+        axes[2, col].axis("off")
+
+    # Legend
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color=colors[k]) for k in range(K)
+    ]
+    labels = [f"group {k}" for k in range(K)]
+    fig.legend(handles, labels, loc="upper right", ncol=K, fontsize=9, frameon=False)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    out = os.path.join(out_dir, "group_colored_recon.png")
+    plt.savefig(out, dpi=100)
+    plt.close(fig)
+    print(f"wrote {out}")
 
 
 def _plot_group_attribution(g_post, gt_pres, gt_zwhere, out_dir):
