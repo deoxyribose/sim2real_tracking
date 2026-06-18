@@ -32,6 +32,12 @@ def main():
     ap.add_argument("--t-curriculum", action="store_true")
     ap.add_argument("--t-start", type=int, default=3)
     ap.add_argument("--t-curriculum-steps", type=int, default=25_000)
+    ap.add_argument("--n-groups", type=int, default=1)
+    ap.add_argument("--lambda-group", type=float, default=0.0)
+    ap.add_argument("--lambda-group-temp", type=float, default=0.0)
+    ap.add_argument("--glimpse-size", type=int, default=16)
+    ap.add_argument("--d-model", type=int, default=128)
+    ap.add_argument("--n-transformer-layers", type=int, default=2)
     args = ap.parse_args()
 
     # Pick a reasonable model n_max per sim (must be ≤ sim n_max).
@@ -40,13 +46,17 @@ def main():
 
     model_cfg = ModelConfig(
         n_max=n_max,
-        d_model=128,
+        d_model=args.d_model,
         n_heads=4,
-        n_transformer_layers=2,
+        n_transformer_layers=args.n_transformer_layers,
         z_what_dim=64,
-        z_style_dim=16,
-        glimpse_size=16,
+        z_style_dim=4,
+        glimpse_size=args.glimpse_size,
         stem_channels=(16, 32, 64),
+        n_groups=args.n_groups,
+        use_background=True,
+        bg_base_res=4,
+        bg_channels=(8,),
     )
     from sim2real.losses.losses import PretrainLossConfig
     loss_cfg = PretrainLossConfig(
@@ -55,6 +65,8 @@ def main():
         lambda_pres=args.lambda_pres,
         lambda_mask=args.lambda_mask,
         lambda_kl=0.0,
+        lambda_group=args.lambda_group,
+        lambda_group_temp=args.lambda_group_temp,
     )
     cfg = PretrainConfig(
         sim_kind=args.sim,
