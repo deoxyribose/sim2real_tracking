@@ -43,6 +43,13 @@ def main():
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--n-max", type=int, default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--z-style-dim", type=int, default=4)
+    ap.add_argument("--glimpse-size", type=int, default=32)
+    ap.add_argument("--n-groups", type=int, default=1)
+    ap.add_argument("--d-model", type=int, default=128)
+    ap.add_argument("--n-transformer-layers", type=int, default=2)
+    ap.add_argument("--bg-base-res", type=int, default=4)
+    ap.add_argument("--bg-channels", type=int, nargs="+", default=[8])
     args = ap.parse_args()
 
     ck = ckpt_load(args.ckpt)
@@ -52,13 +59,17 @@ def main():
     n_max = args.n_max if args.n_max is not None else default_n_max[args.sim]
     model_cfg = ModelConfig(
         n_max=n_max,
-        d_model=128,
+        d_model=args.d_model,
         n_heads=4,
-        n_transformer_layers=2,
+        n_transformer_layers=args.n_transformer_layers,
         z_what_dim=64,
-        z_style_dim=16,
-        glimpse_size=16,
+        z_style_dim=args.z_style_dim,
+        glimpse_size=args.glimpse_size,
         stem_channels=(16, 32, 64),
+        n_groups=args.n_groups,
+        use_background=True,
+        bg_base_res=args.bg_base_res,
+        bg_channels=tuple(args.bg_channels),
     )
     model = SlotVideoModel(cfg=model_cfg)
     batch_fn, _ = build_sim(args.sim)
