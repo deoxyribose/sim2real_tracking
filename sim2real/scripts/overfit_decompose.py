@@ -28,6 +28,8 @@ from sim2real.types import SimSample
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--sim", default="many_cells",
+                    choices=["flagella", "many_cells", "multiscale", "worms"])
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--n-max", type=int, default=48)
@@ -41,7 +43,7 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    batch_fn, _ = build_sim("many_cells")
+    batch_fn, _ = build_sim(args.sim)
     key = jax.random.key(0)
     batch = batch_fn(key, 1)
     b = SimSample(
