@@ -53,7 +53,7 @@ class GlimpseDecoder(nn.Module):
     use_coord_conv: bool = True
 
     @nn.compact
-    def __call__(self, z_what):
+    def __call__(self, z_what):  # noqa: C901
         base = 4
         x = nn.Dense(base * base * self.channels[0])(z_what)
         x = nn.gelu(x).reshape(base, base, self.channels[0])
@@ -78,6 +78,67 @@ class GlimpseDecoder(nn.Module):
         appearance = nn.sigmoid(x[..., 0:1])              # (g, g, 1)
         mask_logit = x[..., 1:2]
         return appearance, mask_logit                     # both (g, g, 1)
+
+
+class GroupedDecoder(nn.Module):
+    """Wrap GlimpseDecoder with K-way categorical enumeration over a per-slot group latent.
+
+    For each slot:
+      1. Learn K prototype embeddings `group_emb ∈ R^{K × z_what_dim}`.
+      2. Predict a categorical posterior `q(g_n)` via softmax over a head on the slot query `q`.
+      3. Decode K candidate patches by adding each prototype to `z_local` and calling the shared
+         GlimpseDecoder K times (params shared across k via re-using the same module instance).
+      4. Marginalize: `appear = Σ_k q(g_n=k) · appear_k`, same for `mask_logit`.
+
+    This is *strictly more expressive* than mixing prototypes before decoding (soft prototype
+    attention), because the GlimpseDecoder is nonlinear. The price is K× decoder forward
+    passes per slot; with our tiny decoder this is fine for K ≤ 8.
+
+    Returns: (appear, mask_logit, g_post)
+      appear:     (g, g, 1)
+      mask_logit: (g, g, 1)
+      g_post:     (K,)  — interpretable as which prototype this slot belongs to.
+    """
+
+    n_groups: int = 4
+    glimpse_size: int = 16
+    z_what_dim: int = 64
+    channels: tuple[int, ...] = (64, 32)
+    use_coord_conv: bool = True
+    group_emb_std: float = 0.5
+
+    @nn.compact
+    def __call__(self, z_local, q):
+        K = self.n_groups
+        group_emb = self.param(
+            "group_emb",
+            nn.initializers.normal(stddev=self.group_emb_std),
+            (K, self.z_what_dim),
+        )
+        g_logits = nn.Dense(K)(q)
+        g_post = nn.softmax(g_logits)                                                    # (K,)
+
+        decoder = GlimpseDecoder(
+            glimpse_size=self.glimpse_size,
+            z_what_dim=self.z_what_dim,
+            channels=tuple(self.channels),
+            use_coord_conv=self.use_coord_conv,
+        )
+
+        # Decode K times with shared params (re-using the same module instance).
+        appears = []
+        masks = []
+        for k in range(K):
+            a, m = decoder(z_local + group_emb[k])
+            appears.append(a)
+            masks.append(m)
+        appears = jnp.stack(appears, axis=0)                                             # (K, g, g, 1)
+        masks = jnp.stack(masks, axis=0)                                                 # (K, g, g, 1)
+
+        w = g_post[:, None, None, None]
+        appear_marg = jnp.sum(w * appears, axis=0)
+        mask_logit_marg = jnp.sum(w * masks, axis=0)
+        return appear_marg, mask_logit_marg, g_post
 
 
 class SegHead(nn.Module):

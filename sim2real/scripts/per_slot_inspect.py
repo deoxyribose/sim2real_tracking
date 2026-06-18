@@ -40,6 +40,7 @@ def main():
     ap.add_argument("--no-teacher-zwhere", dest="teacher_zwhere", action="store_false")
     ap.add_argument("--teacher-zpres", action="store_true", default=True)
     ap.add_argument("--no-teacher-zpres", dest="teacher_zpres", action="store_false")
+    ap.add_argument("--n-groups", type=int, default=1)
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -60,6 +61,7 @@ def main():
         z_what_dim=64, z_style_dim=16, glimpse_size=16,
         stem_channels=(16, 32, 64),
         use_background=args.use_bg, stop_grad_recon_path=True,
+        n_groups=args.n_groups,
     )
     model = SlotVideoModel(cfg=cfg)
     params = model.init(key, b.video[0], key)
@@ -124,7 +126,37 @@ def main():
     print(f"  max |pred z_where - gt z_where| per alive slot: max={z_where_diff[gt_pres>0.5].max():.4f}")
     print(f"  z_where dim: {pred_zwhere.shape[-1]}")
 
+    # Group posterior diagnostic.
+    g_post = np.asarray(out.aux["g_post"][0])                                            # (N, K)
+    if g_post.shape[-1] > 1:
+        alive_idx = np.where(gt_pres > 0.5)[0]
+        print(f"  n_groups: K={g_post.shape[-1]}")
+        print("  per-alive-slot group posterior (argmax + max prob):")
+        for n in alive_idx:
+            k_star = int(np.argmax(g_post[n]))
+            print(f"    slot {n:2d}: k*={k_star}  p(k*)={g_post[n, k_star]:.3f}  full={np.round(g_post[n], 2)}")
+        _plot_group_attribution(g_post, gt_pres, gt_zwhere, args.out_dir)
+
     _plot_slot_grid(pred_masks, gt_masks, gt_pres, gt_zwhere, args.out_dir)
+
+
+def _plot_group_attribution(g_post, gt_pres, gt_zwhere, out_dir):
+    """Heatmap of per-slot group posterior, with alive-slot rows highlighted."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(1, 1, figsize=(min(10, g_post.shape[1] * 1.2), max(4, g_post.shape[0] * 0.25)))
+    im = ax.imshow(g_post, cmap="viridis", vmin=0, vmax=1, aspect="auto")
+    ax.set_xlabel("group k")
+    ax.set_ylabel("slot n")
+    ax.set_title("Group posterior q(g_n=k)  (alive slots: cyan marker)")
+    for n in range(g_post.shape[0]):
+        if gt_pres[n] > 0.5:
+            ax.plot(-0.5, n, marker=">", color="cyan", markersize=6)
+    plt.colorbar(im, ax=ax, label="prob")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "group_attribution.png"), dpi=100)
+    plt.close(fig)
+    print(f"wrote {out_dir}/group_attribution.png")
 
 
 def _plot_slot_grid(pred_masks, gt_masks, gt_pres, gt_zwhere, out_dir):

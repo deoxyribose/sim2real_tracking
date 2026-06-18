@@ -26,7 +26,7 @@ import jax.numpy as jnp
 
 from sim2real.model.background import BackgroundRenderer
 from sim2real.model.encoder import FrameEncoder
-from sim2real.model.glimpse import GlimpseDecoder, GlimpseEncoder
+from sim2real.model.glimpse import GlimpseDecoder, GlimpseEncoder, GroupedDecoder
 from sim2real.model.heads import PresHead, WhatHead, WhereHead
 from sim2real.model.slot_transformer import SlotTransformer
 from sim2real.model.stn import stn_read, stn_write
@@ -62,6 +62,10 @@ class ModelConfig:
     use_background: bool = True
     bg_base_res: int = 8
     bg_channels: tuple = (64, 32, 16)
+    # K-way hierarchical group latent on z_what (enumerated, no sampling). n_groups = 1 means
+    # the vanilla decoder is used (no grouping); n_groups > 1 wraps the decoder in
+    # GroupedDecoder which renders K candidates and marginalizes.
+    n_groups: int = 1
 
 
 class SlotVideoModel(nn.Module):
@@ -79,9 +83,17 @@ class SlotVideoModel(nn.Module):
         self.pres_head = PresHead(hidden=c.d_model, init_bias=c.pres_init_bias)
         self.what_head = WhatHead(z_what_dim=c.z_what_dim, hidden=c.d_model)
         self.glimpse_encoder = GlimpseEncoder(feat_dim=c.z_what_dim, channels=(16, 32))
-        self.glimpse_decoder = GlimpseDecoder(
-            glimpse_size=c.glimpse_size, z_what_dim=c.z_what_dim, channels=(32, 16)
-        )
+        if c.n_groups > 1:
+            self.glimpse_decoder = GroupedDecoder(
+                n_groups=c.n_groups,
+                glimpse_size=c.glimpse_size,
+                z_what_dim=c.z_what_dim,
+                channels=(32, 16),
+            )
+        else:
+            self.glimpse_decoder = GlimpseDecoder(
+                glimpse_size=c.glimpse_size, z_what_dim=c.z_what_dim, channels=(32, 16)
+            )
         # NOTE: removed standalone SegHead — masks_pred now reuses the GlimpseDecoder's
         # mask_logit channel. Saves params and lets the L_mask gradient train the same network
         # as L_recon, instead of an independent head that empirically didn't converge.
@@ -124,7 +136,11 @@ class SlotVideoModel(nn.Module):
         glimpse_feat = self.glimpse_encoder(glimpse)
         zpres, zpres_logit = self.pres_head(q, key_p, tau=cfg.pres_tau, straight_through=True)
         zwhat, mu_w, lv_w = self.what_head(q, glimpse_feat, key_w)
-        appear_patch, mask_logit_patch = self.glimpse_decoder(zwhat)
+        if self.cfg.n_groups > 1:
+            appear_patch, mask_logit_patch, g_post = self.glimpse_decoder(zwhat, q)
+        else:
+            appear_patch, mask_logit_patch = self.glimpse_decoder(zwhat)
+            g_post = jnp.ones((1,))
 
         if cfg.stop_grad_recon_path:
             recon_zwhere = jax.lax.stop_gradient(render_zwhere)
@@ -148,7 +164,10 @@ class SlotVideoModel(nn.Module):
         # can flow into pose if stop_grad_recon_path is False later; today render_zwhere is
         # already a teacher constant when teacher forcing is on.
         mask_seg_canvas = stn_write(mask_prob_patch, render_zwhere, image.shape[0])[..., 0]
-        return zwhere_pred, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat, appear_canvas, mask_appear_canvas, mask_seg_canvas
+        return (
+            zwhere_pred, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat,
+            appear_canvas, mask_appear_canvas, mask_seg_canvas, g_post,
+        )
 
     def __call__(self, video: Array, key, *, teacher_zwhere=None, teacher_zpres=None):
         """Forward one video.
@@ -246,7 +265,7 @@ class SlotVideoModel(nn.Module):
             # use the model's predicted z_pres (computed inside _per_slot_head; until then we
             # use a placeholder of ones — _per_slot_head overwrites this when teacher is None).
             (zwhere, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat,
-             appear_canvas, mask_appear_canvas, mask_seg_canvas) = jax.vmap(
+             appear_canvas, mask_appear_canvas, mask_seg_canvas, g_post) = jax.vmap(
                 self._per_slot_head, in_axes=(0, 0, 0, 0, 0, 0, None)
             )(
                 q,
@@ -295,6 +314,7 @@ class SlotVideoModel(nn.Module):
                 mask_appear_pred=mask_appear_canvas,
                 mask_seg_pred=mask_seg_canvas,
                 composite=composite,
+                g_post=g_post,
             )
             return new_carry, out
 
@@ -347,5 +367,6 @@ class SlotVideoModel(nn.Module):
                 mu_w=traj["mu_w"],
                 lv_w=traj["lv_w"],
                 mask_appear_pred=traj["mask_appear_pred"],
+                g_post=traj["g_post"],                          # (T, N, K)
             ),
         )
