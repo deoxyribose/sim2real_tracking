@@ -28,7 +28,7 @@ def test_forward_finite_loss_and_grad():
     video = jax.random.uniform(jax.random.fold_in(key, 1), (4, 64, 64, 1))
     params = model.init(key, video, key)
     out = model.apply(params, video, key)
-    assert out.z_where.shape == (4, 8, 3)
+    assert out.z_where.shape == (4, 8, 5)
     assert out.z_pres.shape == (4, 8)
     assert out.composite.shape == (4, 64, 64, 1)
     loss = jnp.mean((out.composite - video) ** 2)

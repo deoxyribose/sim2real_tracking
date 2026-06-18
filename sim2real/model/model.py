@@ -26,7 +26,7 @@ import jax.numpy as jnp
 
 from sim2real.model.background import BackgroundRenderer
 from sim2real.model.encoder import FrameEncoder
-from sim2real.model.glimpse import GlimpseDecoder, GlimpseEncoder, SegHead
+from sim2real.model.glimpse import GlimpseDecoder, GlimpseEncoder
 from sim2real.model.heads import PresHead, WhatHead, WhereHead
 from sim2real.model.slot_transformer import SlotTransformer
 from sim2real.model.stn import stn_read, stn_write
@@ -82,7 +82,9 @@ class SlotVideoModel(nn.Module):
         self.glimpse_decoder = GlimpseDecoder(
             glimpse_size=c.glimpse_size, z_what_dim=c.z_what_dim, channels=(32, 16)
         )
-        self.seg_head = SegHead(glimpse_size=c.glimpse_size)
+        # NOTE: removed standalone SegHead — masks_pred now reuses the GlimpseDecoder's
+        # mask_logit channel. Saves params and lets the L_mask gradient train the same network
+        # as L_recon, instead of an independent head that empirically didn't converge.
         self.slot_gru = SlotGRU(d_model=c.d_model)
         self.style_encoder = StyleEncoder(z_style_dim=c.z_style_dim, hidden=c.d_model)
         if c.use_background:
@@ -96,10 +98,10 @@ class SlotVideoModel(nn.Module):
             )
 
         # Learned per-slot z_where init (used on frame 0 as the residual anchor).
-        # Initialize positions roughly spread across the canvas via small noise.
+        # 5-dim affine: (sx_raw, sy_raw, theta_raw, tx_raw, ty_raw). Small random init.
         self.z_where_init = self.param(
             "z_where_init",
-            lambda key: jax.random.normal(key, (c.n_max, 3)) * 0.1,
+            lambda key: jax.random.normal(key, (c.n_max, 5)) * 0.1,
         )
 
     def _predict_zwhere(self, q, prev_zwhere):
@@ -123,7 +125,6 @@ class SlotVideoModel(nn.Module):
         zpres, zpres_logit = self.pres_head(q, key_p, tau=cfg.pres_tau, straight_through=True)
         zwhat, mu_w, lv_w = self.what_head(q, glimpse_feat, key_w)
         appear_patch, mask_logit_patch = self.glimpse_decoder(zwhat)
-        seg_logit_patch = self.seg_head(zwhat, render_zwhere)
 
         if cfg.stop_grad_recon_path:
             recon_zwhere = jax.lax.stop_gradient(render_zwhere)
@@ -132,11 +133,21 @@ class SlotVideoModel(nn.Module):
             recon_zwhere = render_zwhere
             recon_zpres = render_zpres
 
+        # The mask_logit_patch from the GlimpseDecoder is reused for BOTH the recon composite
+        # gating AND the supervised L_mask target (overfit-one diagnostic showed an independent
+        # SegHead can't compete with the recon-driven gradient on the decoder's mask channel).
+        # Recon-side: gate by recon_zpres (stop_grad if configured).
+        # Seg-side: same mask, no zpres gate, full gradient through stn_write.
+        mask_prob_patch = nn.sigmoid(mask_logit_patch)                                  # (g, g, 1)
+
         appear_canvas = stn_write(appear_patch, recon_zwhere, image.shape[0])           # (R, R, 1)
         mask_appear_canvas = stn_write(
-            nn.sigmoid(mask_logit_patch) * recon_zpres, recon_zwhere, image.shape[0]
-        )[..., 0]
-        mask_seg_canvas = stn_write(nn.sigmoid(seg_logit_patch), render_zwhere, image.shape[0])[..., 0]
+            mask_prob_patch * recon_zpres, recon_zwhere, image.shape[0]
+        )[..., 0]                                                                       # (R, R)
+        # mask_seg_canvas keeps the original (non-stopped) render_zwhere so L_mask's gradient
+        # can flow into pose if stop_grad_recon_path is False later; today render_zwhere is
+        # already a teacher constant when teacher forcing is on.
+        mask_seg_canvas = stn_write(mask_prob_patch, render_zwhere, image.shape[0])[..., 0]
         return zwhere_pred, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat, appear_canvas, mask_appear_canvas, mask_seg_canvas
 
     def __call__(self, video: Array, key, *, teacher_zwhere=None, teacher_zpres=None):
@@ -196,9 +207,13 @@ class SlotVideoModel(nn.Module):
                 grid_y = (jnp.linspace(-1.0, 1.0, h_prime))
                 grid_x = (jnp.linspace(-1.0, 1.0, w_prime))
                 yy, xx = jnp.meshgrid(grid_y, grid_x, indexing="ij")
-                s = jax.nn.sigmoid(prev_zwhere[:, 0])
-                tx = jnp.tanh(prev_zwhere[:, 1])
-                ty = jnp.tanh(prev_zwhere[:, 2])
+                # Use max(sx, sy) for the discovery bump radius — anisotropic slots cover at
+                # most this radius from their center.
+                sx = jax.nn.sigmoid(prev_zwhere[:, 0])
+                sy = jax.nn.sigmoid(prev_zwhere[:, 1])
+                s = jnp.maximum(sx, sy)
+                tx = jnp.tanh(prev_zwhere[:, 3])
+                ty = jnp.tanh(prev_zwhere[:, 4])
                 d2 = (xx[None] - tx[:, None, None]) ** 2 + (yy[None] - ty[:, None, None]) ** 2
                 alive_bumps = jnp.exp(-0.5 * d2 / (s[:, None, None] ** 2 + 1e-4))
                 explained = jnp.clip(

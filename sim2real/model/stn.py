@@ -1,11 +1,15 @@
-"""Spatial transformer (read/write) with z_where = (s_raw, tx_raw, ty_raw) in tanh-space.
+"""Affine spatial transformer (read/write) with 5-dim z_where.
 
 Conventions:
-  s   = sigmoid(s_raw)  ∈ (0, 1)  — half-extent (1.0 ≈ filling the canvas).
-  tx  = tanh(tx_raw)    ∈ (-1, 1) — normalized center in x (image is [-1, 1]² space).
-  ty  = tanh(ty_raw)    ∈ (-1, 1) — normalized center in y.
+  z_where = (sx_raw, sy_raw, theta_raw, tx_raw, ty_raw)
+  sx    = sigmoid(sx_raw)     ∈ (0, 1)  — half-extent along the patch's x axis
+  sy    = sigmoid(sy_raw)     ∈ (0, 1)  — half-extent along the patch's y axis
+  theta = π · tanh(theta_raw) ∈ (-π, π) — rotation of patch frame relative to canvas
+  tx    = tanh(tx_raw)        ∈ (-1, 1) — center in canvas-x, normalized
+  ty    = tanh(ty_raw)        ∈ (-1, 1) — center in canvas-y, normalized
 
-Both `stn_read` and `stn_write` use bilinear interpolation via `jax.scipy.ndimage.map_coordinates`.
+Forward affine (patch grid → canvas):
+    image_xy = (tx, ty) + R(θ) · diag(sx, sy) · patch_xy
 """
 
 from __future__ import annotations
@@ -16,31 +20,32 @@ import jax.numpy as jnp
 Array = jnp.ndarray
 
 
-def _decode_zwhere(z_where: Array) -> tuple[Array, Array, Array]:
-    s_raw, tx_raw, ty_raw = z_where[..., 0], z_where[..., 1], z_where[..., 2]
-    return jax.nn.sigmoid(s_raw), jnp.tanh(tx_raw), jnp.tanh(ty_raw)
+def _decode_zwhere(z_where: Array):
+    sx = jax.nn.sigmoid(z_where[..., 0])
+    sy = jax.nn.sigmoid(z_where[..., 1])
+    theta = jnp.pi * jnp.tanh(z_where[..., 2])
+    tx = jnp.tanh(z_where[..., 3])
+    ty = jnp.tanh(z_where[..., 4])
+    return sx, sy, theta, tx, ty
 
 
 def stn_read(image: Array, z_where: Array, glimpse_size: int) -> Array:
-    """Read a (glimpse_size, glimpse_size, C) glimpse from `image` at `z_where`.
-
-    Args:
-      image: (H, W, C).
-      z_where: (3,).
-      glimpse_size: side length of the glimpse.
-
-    Returns:
-      glimpse: (glimpse_size, glimpse_size, C).
-    """
+    """Read a (glimpse_size, glimpse_size, C) glimpse from `image` at the affine `z_where`."""
     H, W, C = image.shape
-    s, tx, ty = _decode_zwhere(z_where)
-    half = s  # half-extent in normalized [-1, 1] space
-    # Build sampling coords in normalized space.
+    sx, sy, theta, tx, ty = _decode_zwhere(z_where)
+    cos = jnp.cos(theta)
+    sin = jnp.sin(theta)
+
+    # Patch grid in [-1, 1]² (axis-aligned in patch frame).
     grid_n = jnp.linspace(-1.0, 1.0, glimpse_size)
-    gy, gx = jnp.meshgrid(grid_n, grid_n, indexing="ij")           # (g, g)
-    # Map normalized glimpse coords (in [-1,1]) into image normalized coords centered at (tx, ty).
-    src_x_norm = tx + half * gx                                     # (g, g)
-    src_y_norm = ty + half * gy
+    gy, gx = jnp.meshgrid(grid_n, grid_n, indexing="ij")               # (g, g)
+
+    # Apply affine: scale then rotate then translate (in normalized canvas coords).
+    sxgx = sx * gx
+    sygy = sy * gy
+    src_x_norm = tx + cos * sxgx - sin * sygy
+    src_y_norm = ty + sin * sxgx + cos * sygy
+
     # Convert to pixel coords.
     src_x = (src_x_norm + 1.0) * 0.5 * (W - 1)
     src_y = (src_y_norm + 1.0) * 0.5 * (H - 1)
@@ -52,28 +57,32 @@ def stn_read(image: Array, z_where: Array, glimpse_size: int) -> Array:
 
 
 def stn_write(patch: Array, z_where: Array, out_size: int) -> Array:
-    """Place a (gh, gw, C) `patch` onto an (out_size, out_size, C) canvas at `z_where`.
+    """Place a (gh, gw, C) `patch` onto an (out_size, out_size, C) canvas at the affine `z_where`.
 
-    Inverse-warp: for each output pixel (in canvas), compute the corresponding patch coord and
-    sample. Pixels outside the patch get 0.
+    Inverse-warp: for each canvas pixel, compute its location in patch coords and bilinear-sample.
     """
     gh, gw, C = patch.shape
-    s, tx, ty = _decode_zwhere(z_where)
-    half = s
+    sx, sy, theta, tx, ty = _decode_zwhere(z_where)
+    cos = jnp.cos(theta)
+    sin = jnp.sin(theta)
 
-    # Output canvas normalized grid.
+    # Output canvas grid in [-1, 1]².
     grid_n = jnp.linspace(-1.0, 1.0, out_size)
-    oy, ox = jnp.meshgrid(grid_n, grid_n, indexing="ij")           # (out, out)
-    # Map canvas coords back to patch coords.
-    # Canvas normalized (oy, ox) -> patch normalized via inverse of (ty + half * py = oy).
-    py_n = (oy - ty) / (half + 1e-8)
-    px_n = (ox - tx) / (half + 1e-8)
+    oy, ox = jnp.meshgrid(grid_n, grid_n, indexing="ij")               # (out, out)
+
+    # Inverse affine: (canvas - translation) → R⁻¹(θ) → diag(1/sx, 1/sy)
+    dx = ox - tx
+    dy = oy - ty
+    # R⁻¹(θ) = R(-θ): (cos -sin; sin cos) inverted.
+    rx = cos * dx + sin * dy
+    ry = -sin * dx + cos * dy
+    px_n = rx / (sx + 1e-8)
+    py_n = ry / (sy + 1e-8)
+    inside = (jnp.abs(px_n) <= 1.0) & (jnp.abs(py_n) <= 1.0)
+
     # Convert to patch pixel coords.
     py = (py_n + 1.0) * 0.5 * (gh - 1)
     px = (px_n + 1.0) * 0.5 * (gw - 1)
-
-    # mask pixels outside patch [-1, 1]
-    inside = (jnp.abs(py_n) <= 1.0) & (jnp.abs(px_n) <= 1.0)
 
     def sample_channel(p_c):
         v = jax.scipy.ndimage.map_coordinates(p_c, [py, px], order=1, mode="constant", cval=0.0)

@@ -16,7 +16,7 @@ def _check_sample(kind: str, batch_size: int = 2):
     N = cm.n_max
 
     assert s.video.shape == (batch_size, T, H, W, 1), f"{kind} video shape {s.video.shape}"
-    assert s.z_where.shape == (batch_size, T, N, 3)
+    assert s.z_where.shape == (batch_size, T, N, 5)
     assert s.z_pres.shape == (batch_size, T, N)
     assert s.masks.shape == (batch_size, T, N, H, W)
     assert s.z_style.shape == (batch_size, cm.style_dim)

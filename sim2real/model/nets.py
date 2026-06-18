@@ -16,6 +16,18 @@ def zero_init(key, shape, dtype=jnp.float32):
     return jnp.zeros(shape, dtype=dtype)
 
 
+def add_coords(x: Array) -> Array:
+    """Concat normalized (y, x) coord channels to a (H, W, C) feature map.
+
+    Output shape: (H, W, C + 2). Coord values in [-1, 1]. Lets following convs learn
+    position-aware patterns (CoordConv — Liu et al. 2018, arXiv:1807.03247).
+    """
+    h, w, _ = x.shape
+    yy = jnp.broadcast_to(jnp.linspace(-1.0, 1.0, h)[:, None, None], (h, w, 1))
+    xx = jnp.broadcast_to(jnp.linspace(-1.0, 1.0, w)[None, :, None], (h, w, 1))
+    return jnp.concatenate([x, yy, xx], axis=-1)
+
+
 class MLP(nn.Module):
     """Simple MLP — `hidden` is a sequence of layer widths, the last entry is the output dim."""
 

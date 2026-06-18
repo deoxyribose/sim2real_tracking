@@ -22,8 +22,9 @@ Array = jnp.ndarray
 
 @dataclass(frozen=True)
 class WherePriorConfig:
-    sigma_init: tuple = (0.5, 1.0, 1.0)   # initial std for (s_raw, tx_raw, ty_raw)
-    sigma_step: tuple = (0.05, 0.1, 0.1)  # random-walk std per frame
+    # 5-dim z_where = (sx_raw, sy_raw, theta_raw, tx_raw, ty_raw).
+    sigma_init: tuple = (0.5, 0.5, 0.3, 1.0, 1.0)
+    sigma_step: tuple = (0.05, 0.05, 0.03, 0.1, 0.1)
 
 
 def log_prob(z_where: Array, alive_mask: Array, cfg: WherePriorConfig) -> Array:

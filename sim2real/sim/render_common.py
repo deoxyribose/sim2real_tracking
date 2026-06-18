@@ -14,6 +14,51 @@ from sim2real.sim.background import perlin_background
 Array = jnp.ndarray
 
 
+# --- z_where encoding helpers (5-dim affine) -------------------------------------------------
+
+_S_CLIP = (1e-3, 0.97)        # keeps logit finite
+_T_CLIP = 0.97                # keeps arctanh finite
+_TH_CLIP = 0.97               # for theta / π
+
+
+def pack_zwhere(sx: Array, sy: Array, theta: Array, tx: Array, ty: Array) -> Array:
+    """Convert decoded values to the unconstrained raw form used by the model.
+
+    All inputs broadcast; shapes preserved. Output last-dim is 5.
+    """
+    sx_raw = jax.scipy.special.logit(jnp.clip(sx, _S_CLIP[0], _S_CLIP[1]))
+    sy_raw = jax.scipy.special.logit(jnp.clip(sy, _S_CLIP[0], _S_CLIP[1]))
+    theta_raw = jnp.arctanh(jnp.clip(theta / jnp.pi, -_TH_CLIP, _TH_CLIP))
+    tx_raw = jnp.arctanh(jnp.clip(tx, -_T_CLIP, _T_CLIP))
+    ty_raw = jnp.arctanh(jnp.clip(ty, -_T_CLIP, _T_CLIP))
+    return jnp.stack([sx_raw, sy_raw, theta_raw, tx_raw, ty_raw], axis=-1)
+
+
+def oriented_extent(points: Array) -> tuple[Array, Array, Array, Array]:
+    """PCA-based oriented bounding box for a (P, 2) point cloud.
+
+    Returns (centroid_xy(2,), theta_scalar, sx_half_scalar, sy_half_scalar) where theta is the
+    angle of the principal axis in radians (canonicalized so the principal direction has a
+    non-negative x component) and sx_half / sy_half are the maximum |projection| of the
+    centered points onto the principal / perpendicular axes.
+    """
+    centroid = jnp.mean(points, axis=0)                                                # (2,)
+    centered = points - centroid                                                       # (P, 2)
+    cov = (centered.T @ centered) / centered.shape[0]                                  # (2, 2)
+    eigvals, eigvecs = jnp.linalg.eigh(cov)                                            # ascending
+    v1 = eigvecs[:, 1]                                                                  # principal
+    # Canonicalize: ensure v1[0] >= 0 (flip otherwise) — kills the 180° sign ambiguity.
+    sign = jnp.where(v1[0] >= 0, 1.0, -1.0)
+    v1 = v1 * sign
+    v2 = jnp.array([-v1[1], v1[0]])                                                    # 90° rot
+    theta = jnp.arctan2(v1[1], v1[0])                                                  # in [-π/2, π/2]
+    proj1 = centered @ v1
+    proj2 = centered @ v2
+    sx_half = jnp.maximum(jnp.max(jnp.abs(proj1)), 1e-3)
+    sy_half = jnp.maximum(jnp.max(jnp.abs(proj2)), 1e-3)
+    return centroid, theta, sx_half, sy_half
+
+
 def render_object_appearance(soft_mask: Array, color: Array) -> Array:
     """Multiply a (H,W) soft mask by a (C,) color vector → (H,W,C) appearance layer."""
     return soft_mask[..., None] * color[None, None, :]

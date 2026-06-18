@@ -17,6 +17,8 @@ from sim2real.sim.configs import WormsConfig
 from sim2real.sim.render_common import (
     add_observation_noise,
     composite_video_frame,
+    oriented_extent,
+    pack_zwhere,
     perlin_grayscale_bg,
 )
 from sim2real.sim.splines import catmull_rom_eval, render_polyline_segments_sdf
@@ -106,16 +108,12 @@ def sample(key: jax.Array, cfg: WormsConfig) -> SimSample:
     keys_n = jax.random.split(k_noise, cm.T)
     video = jax.vmap(render_frame)(masks, keys_n)                                            # (T, H, W, 1)
 
-    # z_where: derived from curve extents per frame.
-    def zwhere_from_curves(c):
-        centroid = jnp.mean(c, axis=0)
-        half = 0.5 * (jnp.max(c, axis=0) - jnp.min(c, axis=0))
-        extent = jnp.max(half)
-        txy = jnp.clip(centroid, -0.99, 0.99)
-        s_clipped = jnp.clip(extent, 1e-3, 0.95)
-        return jnp.array([jax.scipy.special.logit(s_clipped), jnp.arctanh(txy[0]), jnp.arctanh(txy[1])])
+    # 5-dim z_where via oriented PCA on each per-frame curve.
+    def zwhere_from_curves(points):
+        centroid, theta, sx_half, sy_half = oriented_extent(points)
+        return pack_zwhere(sx_half, sy_half, theta, centroid[0], centroid[1])
 
-    z_where = jax.vmap(jax.vmap(zwhere_from_curves))(curves)                                 # (T, N, 3)
+    z_where = jax.vmap(jax.vmap(zwhere_from_curves))(curves)                                 # (T, N, 5)
     z_pres = jnp.broadcast_to(
         jnp.concatenate([jnp.ones(n_active), jnp.zeros(n_max - n_active)])[None, :],
         (cm.T, n_max),

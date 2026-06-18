@@ -27,18 +27,19 @@ def _gumbel_sigmoid(key, logits, tau, straight_through=True):
 class WhereHead(nn.Module):
     """z_where residual head with zero-init final layer (v17 lesson).
 
-    Returns prev_z_where + scale * tanh(W·Q), where W is initialized to zero so the model starts
-    at identity and learns motion gradually.
+    Now 5-dim: (sx_raw, sy_raw, theta_raw, tx_raw, ty_raw). Returns
+    prev_z_where + scale * tanh(W·Q), W initialized to zero so the model starts at identity.
     """
 
     scale: float = 0.5
     hidden: int = 64
+    dim: int = 5
 
     @nn.compact
     def __call__(self, q, prev_z_where):
         x = nn.Dense(self.hidden)(q)
         x = nn.gelu(x)
-        delta = nn.Dense(3, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros)(x)
+        delta = nn.Dense(self.dim, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros)(x)
         return prev_z_where + self.scale * jnp.tanh(delta)
 
 

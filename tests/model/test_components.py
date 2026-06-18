@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 
 from sim2real.model.encoder import FrameEncoder
-from sim2real.model.glimpse import GlimpseDecoder, GlimpseEncoder, SegHead
+from sim2real.model.glimpse import GlimpseDecoder, GlimpseEncoder
 from sim2real.model.posenc import sinusoidal_2d
 from sim2real.model.stn import stn_read, stn_write
 
@@ -28,7 +28,8 @@ def test_posenc():
 
 def test_stn_read_write_shapes():
     img = jnp.ones((32, 32, 1))
-    zw = jnp.array([-0.5, 0.0, 0.0])  # smaller scale
+    # 5-dim z_where: (sx_raw, sy_raw, theta_raw, tx_raw, ty_raw)
+    zw = jnp.array([-0.5, -0.5, 0.0, 0.0, 0.0])  # smaller isotropic scale
     g = stn_read(img, zw, 16)
     assert g.shape == (16, 16, 1)
     out = stn_write(g, zw, 32)
@@ -36,12 +37,20 @@ def test_stn_read_write_shapes():
 
 
 def test_stn_read_recovers_constant():
-    # A constant image read at any z_where should produce a constant glimpse.
     img = 0.7 * jnp.ones((32, 32, 1))
-    zw = jnp.array([0.0, 0.2, -0.3])
+    zw = jnp.array([0.0, 0.0, 0.0, 0.2, -0.3])  # 5-dim, isotropic
     g = stn_read(img, zw, 8)
-    # Interior pixels should be ≈ 0.7 (boundary may be 0 if outside).
     assert float(g[3, 3, 0]) > 0.6
+
+
+def test_stn_anisotropic_and_rotation_run():
+    img = jnp.arange(32 * 32, dtype=jnp.float32).reshape(32, 32, 1) / (32 * 32)
+    # Anisotropic + rotated z_where.
+    zw = jnp.array([0.5, -0.5, 0.7, 0.1, -0.1])
+    g = stn_read(img, zw, 16)
+    out = stn_write(g, zw, 32)
+    assert g.shape == (16, 16, 1)
+    assert out.shape == (32, 32, 1)
 
 
 def test_glimpse_decoder_shapes():
@@ -52,14 +61,6 @@ def test_glimpse_decoder_shapes():
     assert appear.shape == (16, 16, 1)
     assert m.shape == (16, 16, 1)
     assert 0.0 <= float(appear.min()) and float(appear.max()) <= 1.0
-
-
-def test_seg_head_shape():
-    sh = SegHead(glimpse_size=16, hidden=64)
-    key = jax.random.key(0)
-    params = sh.init(key, jnp.zeros((32,)), jnp.zeros((3,)))
-    m = sh.apply(params, jnp.zeros((32,)), jnp.zeros((3,)))
-    assert m.shape == (16, 16, 1)
 
 
 def test_glimpse_encoder_shape():

@@ -44,19 +44,25 @@ def hungarian(cost: Array) -> Array:
 
 
 def build_cost_zwhere(pred_zwhere: Array, gt_zwhere: Array, gt_pres: Array) -> Array:
-    """Cost matrix for matching predicted slots to GT slots using a single z_where frame.
+    """Cost matrix for matching predicted slots to GT slots using POSITION ONLY (tx, ty).
+
+    We deliberately ignore (sx, sy, θ) for matching cost — those are shape descriptors and
+    coupling them into identity makes the model reluctant to assign a slot whose shape isn't
+    quite right yet. Position alone (z_where indices 3, 4) is what tells us "this slot is at
+    this cell".
 
     Args:
-      pred_zwhere: (N, 3)
-      gt_zwhere:   (N, 3)
-      gt_pres:     (N,)    1 = real GT slot, 0 = padding (we set cost huge for dead GT to avoid matching).
+      pred_zwhere: (N, 5) — last 2 dims are (tx_raw, ty_raw).
+      gt_zwhere:   (N, 5)
+      gt_pres:     (N,)    1 = real GT slot, 0 = padding.
 
     Returns:
       (N, N) cost matrix.
     """
-    diff = pred_zwhere[:, None, :] - gt_zwhere[None, :, :]                            # (N, N, 3)
-    base = jnp.sum(diff * diff, axis=-1)                                              # (N, N)
-    # Heavy penalty for matching against a padding (dead) GT slot.
+    pos_pred = pred_zwhere[:, -2:]                                                     # (N, 2)
+    pos_gt = gt_zwhere[:, -2:]
+    diff = pos_pred[:, None, :] - pos_gt[None, :, :]                                   # (N, N, 2)
+    base = jnp.sum(diff * diff, axis=-1)
     penalty = (1.0 - gt_pres)[None, :] * 1e6
     return base + penalty
 

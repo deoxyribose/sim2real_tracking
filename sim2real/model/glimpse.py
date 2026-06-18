@@ -12,6 +12,7 @@ from __future__ import annotations
 import flax.linen as nn
 import jax.numpy as jnp
 
+from sim2real.model.nets import add_coords
 from sim2real.model.stn import stn_read
 
 Array = jnp.ndarray
@@ -41,33 +42,38 @@ def read_glimpse(image: Array, z_where: Array, glimpse_size: int) -> Array:
 class GlimpseDecoder(nn.Module):
     """Decode z_what → (g, g, 2) patch with appearance + mask_logit channels.
 
-    We use a small MLP→reshape→ConvT stack. Architecture is deliberately tiny: the work is done
-    by the slot transformer; the decoder just produces a patch.
+    Uses CoordConv (coord channels concatenated before each ConvT) so the kernels can learn
+    position-aware patterns — e.g. "Gaussian blob peaked at patch center", which the bare
+    shift-equivariant convs cannot express directly.
     """
 
     glimpse_size: int = 16
     z_what_dim: int = 128
     channels: tuple[int, ...] = (64, 32)
+    use_coord_conv: bool = True
 
     @nn.compact
     def __call__(self, z_what):
-        # Start from a 4x4 feature map, upsample to glimpse_size via ConvT.
         base = 4
         x = nn.Dense(base * base * self.channels[0])(z_what)
         x = nn.gelu(x).reshape(base, base, self.channels[0])
 
         cur = base
         for c in self.channels[1:]:
+            if self.use_coord_conv:
+                x = add_coords(x)
             x = nn.ConvTranspose(c, (3, 3), strides=(2, 2), padding="SAME")(x)
             x = nn.gelu(x)
             cur *= 2
         while cur < self.glimpse_size:
+            if self.use_coord_conv:
+                x = add_coords(x)
             x = nn.ConvTranspose(self.channels[-1], (3, 3), strides=(2, 2), padding="SAME")(x)
             x = nn.gelu(x)
             cur *= 2
-        # Crop / resize to exact glimpse_size.
         x = x[: self.glimpse_size, : self.glimpse_size]
-        # Final 1x1 to 2 channels.
+        if self.use_coord_conv:
+            x = add_coords(x)
         x = nn.Conv(2, (1, 1))(x)
         appearance = nn.sigmoid(x[..., 0:1])              # (g, g, 1)
         mask_logit = x[..., 1:2]

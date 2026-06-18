@@ -16,6 +16,7 @@ from sim2real.sim.primitives import gaussian_blob, make_grid
 from sim2real.sim.render_common import (
     add_observation_noise,
     composite_video_frame,
+    pack_zwhere,
     perlin_grayscale_bg,
 )
 from sim2real.types import SimSample
@@ -90,14 +91,9 @@ def sample(key: jax.Array, cfg: MultiScaleConfig) -> SimSample:
     frames, masks = jax.vmap(render_frame)(t_idx, keys_n)
     video = jax.vmap(add_observation_noise, in_axes=(0, 0, None))(keys_n, frames, cm.obs_noise)
 
-    z_where = jnp.stack(
-        [
-            jnp.broadcast_to(jax.scipy.special.logit(jnp.clip(radii, 1e-3, 0.95))[None, :], (cm.T, n_max)),
-            jnp.arctanh(jnp.clip(xy_traj[..., 0], -0.99, 0.99)),
-            jnp.arctanh(jnp.clip(xy_traj[..., 1], -0.99, 0.99)),
-        ],
-        axis=-1,
-    )
+    radii_TN = jnp.broadcast_to(radii[None, :], (cm.T, n_max))
+    theta_TN = jnp.zeros_like(radii_TN)
+    z_where = pack_zwhere(radii_TN, radii_TN, theta_TN, xy_traj[..., 0], xy_traj[..., 1])
     z_pres = jnp.broadcast_to(
         jnp.concatenate([jnp.ones(n_active), jnp.zeros(n_max - n_active)])[None, :],
         (cm.T, n_max),

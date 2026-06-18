@@ -39,13 +39,13 @@ def test_single_frame_forward_finite_loss():
     q_prop, q_disc, _ = st.apply(st_p, fg, jnp.zeros((n_max, d)))
 
     # Heads (vmapped over slots).
-    where_p = where_h.init(jax.random.fold_in(key, 3), q_prop[0], jnp.zeros((3,)))
+    where_p = where_h.init(jax.random.fold_in(key, 3), q_prop[0], jnp.zeros((5,)))
     pres_p = pres_h.init(jax.random.fold_in(key, 4), q_prop[0], key)
     what_p = what_h.init(jax.random.fold_in(key, 5), q_prop[0], jnp.zeros((z_what_dim,)), key)
     ge_p = ge.init(jax.random.fold_in(key, 6), jnp.zeros((glimpse, glimpse, 1)))
     gd_p = gd.init(jax.random.fold_in(key, 7), jnp.zeros((z_what_dim,)))
 
-    prev_zwhere = jnp.zeros((n_max, 3))
+    prev_zwhere = jnp.zeros((n_max, 5))
 
     def per_slot(q, k_p, k_w, prev_zw):
         zwhere = where_h.apply(where_p, q, prev_zw)

@@ -10,7 +10,7 @@ from sim2real.priors import style as style_mod
 
 def test_where_log_prob_zero_delta_is_finite():
     cfg = where_mod.WherePriorConfig()
-    zw = jnp.zeros((3, 4, 3))
+    zw = jnp.zeros((3, 4, 5))
     alive = jnp.ones((3, 4))
     lp = where_mod.log_prob(zw, alive, cfg)
     assert jnp.isfinite(lp)
@@ -19,8 +19,8 @@ def test_where_log_prob_zero_delta_is_finite():
 def test_where_log_prob_increases_with_smaller_delta():
     cfg = where_mod.WherePriorConfig()
     alive = jnp.ones((2, 4))
-    zw_small = jnp.zeros((2, 4, 3))
-    zw_big = zw_small.at[1].set(jnp.ones((4, 3)))
+    zw_small = jnp.zeros((2, 4, 5))
+    zw_big = zw_small.at[1].set(jnp.ones((4, 5)))
     lp_small = where_mod.log_prob(zw_small, alive, cfg)
     lp_big = where_mod.log_prob(zw_big, alive, cfg)
     assert float(lp_small) > float(lp_big)

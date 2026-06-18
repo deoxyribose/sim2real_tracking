@@ -19,6 +19,8 @@ from sim2real.sim.configs import FlagellaConfig
 from sim2real.sim.render_common import (
     add_observation_noise,
     composite_video_frame,
+    oriented_extent,
+    pack_zwhere,
     perlin_grayscale_bg,
 )
 from sim2real.sim.splines import render_polyline_segments_sdf
@@ -60,19 +62,18 @@ def _build_object_curves(params, t_norm: Array, n_points: int) -> Array:
 
 
 def _z_where_from_curves(curves: Array) -> Array:
-    """Derive z_where = (s_raw, tx_raw, ty_raw) from curve extents.
+    """Derive 5-dim oriented z_where from per-object curve point clouds.
 
-    - tx_raw, ty_raw = atanh of centroid (clipped to ±0.99).
-    - s_raw = logit of half-extent (clipped to (0, 0.95)).
+    Args:
+      curves: (N, P, 2) — per-object sampled curve points.
+    Returns:
+      (N, 5) of (sx_raw, sy_raw, theta_raw, tx_raw, ty_raw).
     """
-    centroid = jnp.mean(curves, axis=-2)                          # (N, 2)
-    half = 0.5 * (jnp.max(curves, axis=-2) - jnp.min(curves, axis=-2))  # (N, 2)
-    extent = jnp.max(half, axis=-1)                               # (N,)
-    txy = jnp.clip(centroid, -0.99, 0.99)
-    tx_raw, ty_raw = jnp.arctanh(txy[:, 0]), jnp.arctanh(txy[:, 1])
-    s = jnp.clip(extent, 1e-3, 0.95)
-    s_raw = jax.scipy.special.logit(s)
-    return jnp.stack([s_raw, tx_raw, ty_raw], axis=-1)            # (N, 3)
+    def per_obj(points):
+        centroid, theta, sx_half, sy_half = oriented_extent(points)
+        return pack_zwhere(sx_half, sy_half, theta, centroid[0], centroid[1])
+
+    return jax.vmap(per_obj)(curves)                              # (N, 5)
 
 
 def sample(key: jax.Array, cfg: FlagellaConfig) -> SimSample:
