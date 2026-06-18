@@ -10,7 +10,13 @@ import jax.numpy as jnp
 from sim2real.losses.kl import total_kl
 from sim2real.losses.matching import gather_along_slots, hungarian_per_frame
 from sim2real.losses.recon import recon_mse
-from sim2real.losses.supervised import bce_from_logits, mask_loss, masked_mse
+from sim2real.losses.supervised import (
+    bce_from_logits,
+    group_supervision_nll,
+    group_temporal_kl,
+    mask_loss,
+    masked_mse,
+)
 from sim2real.priors.registry import PriorConfig
 from sim2real.types import ModelOut, SimSample
 
@@ -26,6 +32,11 @@ class PretrainLossConfig:
     # KL is not used during supervised pretrain — the GT labels pin all latents directly.
     # Set >0 only if you want to lightly nudge posteriors toward the priors.
     lambda_kl: float = 0.0
+    # Group latent losses (only meaningful when ModelConfig.n_groups > 1).
+    # lambda_group: supervised NLL forcing slot_n → group_n (each instance its own group).
+    # lambda_group_temp: symmetric KL between consecutive frames' g_post per slot (coherence).
+    lambda_group: float = 0.0
+    lambda_group_temp: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -65,6 +76,15 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
     L_pres = bce_from_logits(z_pres_logit_matched, sample.z_pres)
     L_mask = mask_loss(masks_pred_matched, sample.masks, sample.z_pres)
 
+    g_post_raw = out.aux.get("g_post")
+    if g_post_raw is not None and g_post_raw.shape[-1] > 1:
+        g_post_matched = _apply_perm(g_post_raw, perm)
+        L_group = group_supervision_nll(g_post_matched, sample.z_pres)
+        L_group_temp = group_temporal_kl(g_post_matched, sample.z_pres)
+    else:
+        L_group = jnp.array(0.0)
+        L_group_temp = jnp.array(0.0)
+
     L_kl, kl_breakdown = total_kl(
         z_where_matched,
         z_pres_matched,
@@ -84,6 +104,8 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
         + cfg.lambda_pres * L_pres
         + cfg.lambda_mask * L_mask
         + cfg.lambda_kl * L_kl
+        + cfg.lambda_group * L_group
+        + cfg.lambda_group_temp * L_group_temp
     )
     metrics = {
         "loss": total,
@@ -91,6 +113,8 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
         "L_where": L_where,
         "L_pres": L_pres,
         "L_mask": L_mask,
+        "L_group": L_group,
+        "L_group_temp": L_group_temp,
         "L_kl": L_kl,
         **kl_breakdown,
     }

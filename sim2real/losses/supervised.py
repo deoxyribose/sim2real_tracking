@@ -46,6 +46,43 @@ def bce_two_sided(pred_pres: Array, gt_pres: Array, eps: float = 1e-6) -> Array:
     return -jnp.mean(gt_pres * jnp.log(pred) + (1.0 - gt_pres) * jnp.log(1.0 - pred))
 
 
+def group_supervision_nll(g_post_matched: Array, alive: Array) -> Array:
+    """Supervised cross-entropy: per Hungarian-matched slot n, target group = n.
+
+    Interpretation: with K ≥ N_max, this forces each slot to use a unique group id, i.e.
+    "each instance is its own group". At test time the model is expected to keep doing this
+    by inertia even when the supervision is removed.
+
+    Args:
+      g_post_matched: (T, N, K) — alignment via the matching permutation.
+      alive:          (T, N)    — GT z_pres mask.
+
+    Returns: scalar averaged over alive (T, N).
+    """
+    T, N, K = g_post_matched.shape
+    # gather q(g_n = n) along the slot axis
+    slot_idx = jnp.arange(N)
+    # g_post_matched[:, n, n] for each n
+    target_probs = g_post_matched[:, slot_idx, slot_idx]                              # (T, N)
+    nll = -jnp.log(jnp.clip(target_probs, 1e-8, 1.0))
+    return jnp.sum(nll * alive) / (jnp.sum(alive) + 1e-6)
+
+
+def group_temporal_kl(g_post_matched: Array, alive: Array) -> Array:
+    """Symmetric KL between consecutive frames' per-slot group posterior. Pulls each slot's
+    group_id to be stable across time (temporal coherence), independent of any supervision —
+    so this term remains useful at unsupervised adapt time.
+    """
+    eps = 1e-8
+    q_t = jnp.clip(g_post_matched[1:], eps, 1.0)                                       # (T-1, N, K)
+    q_tm1 = jnp.clip(g_post_matched[:-1], eps, 1.0)
+    kl_forward = jnp.sum(q_t * (jnp.log(q_t) - jnp.log(q_tm1)), axis=-1)               # (T-1, N)
+    kl_backward = jnp.sum(q_tm1 * (jnp.log(q_tm1) - jnp.log(q_t)), axis=-1)
+    sym_kl = 0.5 * (kl_forward + kl_backward)
+    a = jnp.minimum(alive[1:], alive[:-1])                                              # only when both frames alive
+    return jnp.sum(sym_kl * a) / (jnp.sum(a) + 1e-6)
+
+
 def mask_loss(pred_mask: Array, gt_mask: Array, alive: Array, dice_weight: float = 1.0) -> Array:
     """BCE over ALL slots + soft-Dice over ALIVE slots only.
 
