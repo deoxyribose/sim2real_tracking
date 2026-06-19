@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONPATH=.
 
-RUN_DIR=runs/unified_many_cells
+RUN_DIR=runs/unified_many_cells_v2
 STEPS=${STEPS:-100000}
 BATCH=${BATCH:-4}
 LR=${LR:-2e-4}
