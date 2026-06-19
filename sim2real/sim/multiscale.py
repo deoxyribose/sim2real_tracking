@@ -93,7 +93,9 @@ def sample(key: jax.Array, cfg: MultiScaleConfig) -> SimSample:
 
     radii_TN = jnp.broadcast_to(radii[None, :], (cm.T, n_max))
     theta_TN = jnp.zeros_like(radii_TN)
-    z_where = pack_zwhere(radii_TN, radii_TN, theta_TN, xy_traj[..., 0], xy_traj[..., 1])
+    z_where = pack_zwhere(
+        radii_TN, radii_TN, theta_TN, xy_traj[..., 0], xy_traj[..., 1], scale_factor=2.5
+    )
     z_pres = jnp.broadcast_to(
         jnp.concatenate([jnp.ones(n_active), jnp.zeros(n_max - n_active)])[None, :],
         (cm.T, n_max),

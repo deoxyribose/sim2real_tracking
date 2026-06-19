@@ -85,7 +85,12 @@ def sample(key: jax.Array, cfg: ManyCellsConfig) -> SimSample:
     # 5-dim z_where: round cells → sx = sy = radius, theta = 0.
     radii_TN = jnp.broadcast_to(radii[None, :], (cm.T, n_max))
     theta_TN = jnp.zeros_like(radii_TN)
-    z_where = pack_zwhere(radii_TN, radii_TN, theta_TN, xy_traj[..., 0], xy_traj[..., 1])
+    # Widen sx, sy by 2.5× so the glimpse window covers the full Gaussian tail (~3σ),
+    # not just the visible ~σ region. Without this, the per-slot glimpse mask is supervised
+    # only on the bright center and the model produces tight masks that miss the GT tails.
+    z_where = pack_zwhere(
+        radii_TN, radii_TN, theta_TN, xy_traj[..., 0], xy_traj[..., 1], scale_factor=2.5
+    )
     z_pres = jnp.broadcast_to(
         jnp.concatenate([jnp.ones(n_active), jnp.zeros(n_max - n_active)])[None, :],
         (cm.T, n_max),

@@ -111,7 +111,9 @@ def sample(key: jax.Array, cfg: WormsConfig) -> SimSample:
     # 5-dim z_where via oriented PCA on each per-frame curve.
     def zwhere_from_curves(points):
         centroid, theta, sx_half, sy_half = oriented_extent(points)
-        return pack_zwhere(sx_half, sy_half, theta, centroid[0], centroid[1])
+        return pack_zwhere(
+            sx_half, sy_half, theta, centroid[0], centroid[1], scale_factor=(1.1, 2.5),
+        )
 
     z_where = jax.vmap(jax.vmap(zwhere_from_curves))(curves)                                 # (T, N, 5)
     z_pres = jnp.broadcast_to(

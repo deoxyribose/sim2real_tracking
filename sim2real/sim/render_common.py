@@ -21,13 +21,29 @@ _T_CLIP = 0.97                # keeps arctanh finite
 _TH_CLIP = 0.97               # for theta / π
 
 
-def pack_zwhere(sx: Array, sy: Array, theta: Array, tx: Array, ty: Array) -> Array:
+def pack_zwhere(
+    sx: Array,
+    sy: Array,
+    theta: Array,
+    tx: Array,
+    ty: Array,
+    scale_factor: float | tuple[float, float] = 1.0,
+) -> Array:
     """Convert decoded values to the unconstrained raw form used by the model.
+
+    `scale_factor` widens (sx, sy) before packing — useful so that the slot's z_where window
+    covers the FULL mask extent (e.g., 3σ for a Gaussian) rather than just the visible center
+    (~σ). Passing a tuple `(fx, fy)` lets `sx` and `sy` get different factors (e.g., elongated
+    objects only need width padding, not length padding).
 
     All inputs broadcast; shapes preserved. Output last-dim is 5.
     """
-    sx_raw = jax.scipy.special.logit(jnp.clip(sx, _S_CLIP[0], _S_CLIP[1]))
-    sy_raw = jax.scipy.special.logit(jnp.clip(sy, _S_CLIP[0], _S_CLIP[1]))
+    if isinstance(scale_factor, tuple):
+        fx, fy = scale_factor
+    else:
+        fx = fy = scale_factor
+    sx_raw = jax.scipy.special.logit(jnp.clip(sx * fx, _S_CLIP[0], _S_CLIP[1]))
+    sy_raw = jax.scipy.special.logit(jnp.clip(sy * fy, _S_CLIP[0], _S_CLIP[1]))
     theta_raw = jnp.arctanh(jnp.clip(theta / jnp.pi, -_TH_CLIP, _TH_CLIP))
     tx_raw = jnp.arctanh(jnp.clip(tx, -_T_CLIP, _T_CLIP))
     ty_raw = jnp.arctanh(jnp.clip(ty, -_T_CLIP, _T_CLIP))

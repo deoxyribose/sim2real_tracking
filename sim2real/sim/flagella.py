@@ -71,7 +71,11 @@ def _z_where_from_curves(curves: Array) -> Array:
     """
     def per_obj(points):
         centroid, theta, sx_half, sy_half = oriented_extent(points)
-        return pack_zwhere(sx_half, sy_half, theta, centroid[0], centroid[1])
+        # Length (sx) is already the full curve extent — don't pad. Width (sy) comes from PCA
+        # on a 1D curve and is tiny; pad to cover the polyline render thickness (~3σ_line).
+        return pack_zwhere(
+            sx_half, sy_half, theta, centroid[0], centroid[1], scale_factor=(1.1, 2.5),
+        )
 
     return jax.vmap(per_obj)(curves)                              # (N, 5)
 
