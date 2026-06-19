@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--n-groups", type=int, default=1)
     ap.add_argument("--lambda-group", type=float, default=0.0)
     ap.add_argument("--lambda-group-temp", type=float, default=0.0)
+    ap.add_argument("--lambda-aux", type=float, default=0.0)
     ap.add_argument("--glimpse-size", type=int, default=16)
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--n-transformer-layers", type=int, default=2)
@@ -67,6 +68,7 @@ def main():
         lambda_kl=0.0,
         lambda_group=args.lambda_group,
         lambda_group_temp=args.lambda_group_temp,
+        lambda_aux=args.lambda_aux,
     )
     cfg = PretrainConfig(
         sim_kind=args.sim,

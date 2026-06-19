@@ -59,42 +59,39 @@ class SlotTransformer(nn.Module):
         residual_mask_pixel: Array | None = None,
     ):
         """
-        Args:
-          feat_grid: (H', W', d_model).
-          slot_h:    (N, d_model) — slot state carried from prior frame (zeros on frame 0).
-          residual_mask_pixel: optional (H', W') in [0,1] masking the unexplained signal for the
-            discovery pass. Higher = more "unexplained" = more attention-eligible.
-
         Returns:
-          q_prop:   (N, d_model)
-          q_disc:   (N, d_model)
-          memory:   (L, d_model) flattened feature tokens used as cross-attn keys/values.
+          q_prop:        (N, d_model)
+          q_disc:        (N, d_model)
+          memory:        (L, d_model) flattened feature tokens
+          q_prop_layers: list[(N, d_model)] of length n_layers — per-layer q from propagate pass
+          q_disc_layers: list[(N, d_model)] of length n_layers — per-layer q from discover pass
+                         (the last entry is q_disc itself; used for DETR-style deep supervision)
         """
         h, w, d = feat_grid.shape
         pe = sinusoidal_2d(h, w, d)
         memory = (feat_grid + pe).reshape(h * w, d)                                # (L, d)
 
-        # Learnable static slot embeddings, combined with the carried slot_h state.
         slot_emb = SlotTokens(self.n_max, self.d_model)()
         q = slot_emb + slot_h                                                       # (N, d)
 
-        # ---- Propagate pass: standard cross-attention to memory ----
         q_prop = q
+        q_prop_layers = []
         for _ in range(self.n_layers):
             q_prop = TransformerBlock(self.d_model, self.n_heads)(q_prop, memory)
+            q_prop_layers.append(q_prop)
 
-        # ---- Discover pass: cross-attention to memory weighted by residual_mask_pixel ----
         if residual_mask_pixel is None:
             disc_memory = memory
             cross_mask = None
         else:
-            # Use the residual mask as a multiplicative weight on the memory keys/values.
-            rm = residual_mask_pixel.reshape(h * w, 1)                              # (L, 1)
+            rm = residual_mask_pixel.reshape(h * w, 1)
             disc_memory = memory * rm
-            cross_mask = None  # could be a boolean mask; we use soft weighting via memory scaling
+            cross_mask = None
 
-        q_disc = q_prop  # start the discovery pass from the propagated state.
+        q_disc = q_prop
+        q_disc_layers = []
         for _ in range(self.n_layers):
             q_disc = TransformerBlock(self.d_model, self.n_heads)(q_disc, disc_memory, cross_mask)
+            q_disc_layers.append(q_disc)
 
-        return q_prop, q_disc, memory
+        return q_prop, q_disc, memory, q_prop_layers, q_disc_layers

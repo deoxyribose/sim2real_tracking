@@ -37,6 +37,9 @@ class PretrainLossConfig:
     # lambda_group_temp: symmetric KL between consecutive frames' g_post per slot (coherence).
     lambda_group: float = 0.0
     lambda_group_temp: float = 0.0
+    # DETR-style deep supervision: matched L_where + L_pres at each intermediate transformer
+    # layer of the discover pass, summed with this weight per layer. 0 disables.
+    lambda_aux: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,26 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
         L_group = jnp.array(0.0)
         L_group_temp = jnp.array(0.0)
 
+    # Deep supervision: same matched losses on each intermediate-layer prediction.
+    z_where_aux = out.aux.get("z_where_aux")        # (T, L_aux, N, 5) or None
+    z_pres_logit_aux = out.aux.get("z_pres_logit_aux")  # (T, L_aux, N) or None
+    if z_where_aux is not None and z_pres_logit_aux is not None and z_where_aux.shape[1] > 0:
+        # Apply the same permutation across layers (axis 0 is T, axis 1 is L_aux, axis 2 is N).
+        def gather_aux(arr):
+            # arr: (T, L_aux, N, ...). For each (t, l), index arr[t, l] by perm[t].
+            return jax.vmap(jax.vmap(lambda a, p: a[p], in_axes=(0, None)))(arr, perm)
+        zw_aux_m = gather_aux(z_where_aux)              # (T, L_aux, N, 5)
+        zp_logit_aux_m = gather_aux(z_pres_logit_aux)   # (T, L_aux, N)
+        L_where_aux = jnp.mean(
+            jax.vmap(lambda zwl: masked_mse(zwl, sample.z_where, sample.z_pres), in_axes=1)(zw_aux_m)
+        )
+        L_pres_aux = jnp.mean(
+            jax.vmap(lambda zpl: bce_from_logits(zpl, sample.z_pres), in_axes=1)(zp_logit_aux_m)
+        )
+    else:
+        L_where_aux = jnp.array(0.0)
+        L_pres_aux = jnp.array(0.0)
+
     L_kl, kl_breakdown = total_kl(
         z_where_matched,
         z_pres_matched,
@@ -106,6 +129,7 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
         + cfg.lambda_kl * L_kl
         + cfg.lambda_group * L_group
         + cfg.lambda_group_temp * L_group_temp
+        + cfg.lambda_aux * (L_where_aux + L_pres_aux)
     )
     metrics = {
         "loss": total,
@@ -113,6 +137,8 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
         "L_where": L_where,
         "L_pres": L_pres,
         "L_mask": L_mask,
+        "L_where_aux": L_where_aux,
+        "L_pres_aux": L_pres_aux,
         "L_group": L_group,
         "L_group_temp": L_group_temp,
         "L_kl": L_kl,

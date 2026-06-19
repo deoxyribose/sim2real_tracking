@@ -242,11 +242,31 @@ class SlotVideoModel(nn.Module):
             else:
                 residual_mask_pixel = None
 
-            q_prop, q_disc, _ = self.slot_transformer(feat_grid, slot_h, residual_mask_pixel)
+            q_prop, q_disc, _, q_prop_layers, q_disc_layers = self.slot_transformer(
+                feat_grid, slot_h, residual_mask_pixel
+            )
 
             # Choose tokens per slot: alive → q_prop; dormant → q_disc.
             alive = prev_zpres[:, None]
             q = alive * q_prop + (1.0 - alive) * q_disc
+
+            # DETR-style deep supervision: at each *intermediate* discover layer (i.e. all
+            # except the last, which is the main q), run the where + pres heads using the
+            # SAME head parameters, to be supervised by the loss. We mix prop and disc per
+            # layer the same way q is mixed for the main prediction.
+            aux_zwhere_layers = []
+            aux_zpres_logit_layers = []
+            if len(q_disc_layers) > 1:
+                k_dummy = jax.random.fold_in(k, 99)
+                k_dummy_per_slot = jax.random.split(k_dummy, cfg.n_max)
+                for li in range(len(q_disc_layers) - 1):
+                    q_li = alive * q_prop_layers[li] + (1.0 - alive) * q_disc_layers[li]
+                    zwhere_aux = jax.vmap(self._predict_zwhere)(q_li, prev_zwhere)  # (N, 3 or 5)
+                    _, zpres_logit_aux = jax.vmap(
+                        lambda q_, kk: self.pres_head(q_, kk, tau=cfg.pres_tau, straight_through=False)
+                    )(q_li, k_dummy_per_slot)
+                    aux_zwhere_layers.append(zwhere_aux)
+                    aux_zpres_logit_layers.append(zpres_logit_aux)
 
             # Heads + decoder per slot.
             k_p = jax.random.fold_in(k, 1)
@@ -316,6 +336,10 @@ class SlotVideoModel(nn.Module):
                 composite=composite,
                 g_post=g_post,
             )
+            if aux_zwhere_layers:
+                # Stack along a new layer axis → (L_aux, N, ...)
+                out["z_where_aux"] = jnp.stack(aux_zwhere_layers, axis=0)
+                out["z_pres_logit_aux"] = jnp.stack(aux_zpres_logit_layers, axis=0)
             return new_carry, out
 
         # NOTE: We use a Python-unrolled loop rather than `jax.lax.scan` because the slot
@@ -368,5 +392,13 @@ class SlotVideoModel(nn.Module):
                 lv_w=traj["lv_w"],
                 mask_appear_pred=traj["mask_appear_pred"],
                 g_post=traj["g_post"],                          # (T, N, K)
+                **(
+                    {
+                        "z_where_aux": traj["z_where_aux"],         # (T, L_aux, N, ...)
+                        "z_pres_logit_aux": traj["z_pres_logit_aux"],  # (T, L_aux, N)
+                    }
+                    if "z_where_aux" in traj
+                    else {}
+                ),
             ),
         )
