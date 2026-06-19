@@ -12,6 +12,7 @@ from sim2real.losses.matching import gather_along_slots, hungarian_per_frame
 from sim2real.losses.recon import recon_mse
 from sim2real.losses.supervised import (
     bce_from_logits,
+    glimpse_mask_mse,
     group_supervision_nll,
     group_temporal_kl,
     mask_loss,
@@ -40,6 +41,14 @@ class PretrainLossConfig:
     # DETR-style deep supervision: matched L_where + L_pres at each intermediate transformer
     # layer of the discover pass, summed with this weight per layer. 0 disables.
     lambda_aux: float = 0.0
+    # mask_loss internals (passed through; defaults reproduce prior behavior)
+    dice_weight: float = 1.0
+    focal_gamma: float = 0.0      # >0 enables focal weighting on the BCE term
+    focal_alpha: float = 0.5
+    # Glimpse-space mask MSE (cellulose recipe). When > 0, supervises sigmoid(mask_logit_patch)
+    # vs stn_read(GT mask, z_where) directly in glimpse coordinates. Use INSTEAD of canvas-space
+    # `lambda_mask` (set lambda_mask = 0 in that case) — they target the same prediction differently.
+    lambda_mask_glimpse: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -77,7 +86,23 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
     L_recon = recon_mse(out.composite, sample.video)
     L_where = masked_mse(z_where_matched, sample.z_where, sample.z_pres)
     L_pres = bce_from_logits(z_pres_logit_matched, sample.z_pres)
-    L_mask = mask_loss(masks_pred_matched, sample.masks, sample.z_pres)
+    L_mask = mask_loss(
+        masks_pred_matched, sample.masks, sample.z_pres,
+        dice_weight=cfg.dice_weight,
+        focal_gamma=cfg.focal_gamma,
+        focal_alpha=cfg.focal_alpha,
+    )
+
+    # Glimpse-space mask supervision (cellulose recipe). Reads GT mask at the slot's z_where
+    # into the glimpse coord system, then MSE against the decoder's mask patch directly.
+    mask_logit_patch_raw = out.aux.get("mask_logit_patch")
+    if mask_logit_patch_raw is not None and cfg.lambda_mask_glimpse > 0:
+        mask_logit_patch_matched = _apply_perm(mask_logit_patch_raw, perm)
+        L_mask_glimpse = glimpse_mask_mse(
+            mask_logit_patch_matched, sample.masks, sample.z_where, sample.z_pres
+        )
+    else:
+        L_mask_glimpse = jnp.array(0.0)
 
     g_post_raw = out.aux.get("g_post")
     if g_post_raw is not None and g_post_raw.shape[-1] > 1:
@@ -126,6 +151,7 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
         + cfg.lambda_where * L_where
         + cfg.lambda_pres * L_pres
         + cfg.lambda_mask * L_mask
+        + cfg.lambda_mask_glimpse * L_mask_glimpse
         + cfg.lambda_kl * L_kl
         + cfg.lambda_group * L_group
         + cfg.lambda_group_temp * L_group_temp
@@ -137,6 +163,7 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
         "L_where": L_where,
         "L_pres": L_pres,
         "L_mask": L_mask,
+        "L_mask_glimpse": L_mask_glimpse,
         "L_where_aux": L_where_aux,
         "L_pres_aux": L_pres_aux,
         "L_group": L_group,

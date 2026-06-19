@@ -167,6 +167,7 @@ class SlotVideoModel(nn.Module):
         return (
             zwhere_pred, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat,
             appear_canvas, mask_appear_canvas, mask_seg_canvas, g_post,
+            mask_logit_patch,
         )
 
     def __call__(self, video: Array, key, *, teacher_zwhere=None, teacher_zpres=None):
@@ -285,7 +286,8 @@ class SlotVideoModel(nn.Module):
             # use the model's predicted z_pres (computed inside _per_slot_head; until then we
             # use a placeholder of ones — _per_slot_head overwrites this when teacher is None).
             (zwhere, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat,
-             appear_canvas, mask_appear_canvas, mask_seg_canvas, g_post) = jax.vmap(
+             appear_canvas, mask_appear_canvas, mask_seg_canvas, g_post,
+             mask_logit_patch) = jax.vmap(
                 self._per_slot_head, in_axes=(0, 0, 0, 0, 0, 0, None)
             )(
                 q,
@@ -335,6 +337,7 @@ class SlotVideoModel(nn.Module):
                 mask_seg_pred=mask_seg_canvas,
                 composite=composite,
                 g_post=g_post,
+                mask_logit_patch=mask_logit_patch,
             )
             if aux_zwhere_layers:
                 # Stack along a new layer axis → (L_aux, N, ...)
@@ -392,6 +395,7 @@ class SlotVideoModel(nn.Module):
                 lv_w=traj["lv_w"],
                 mask_appear_pred=traj["mask_appear_pred"],
                 g_post=traj["g_post"],                          # (T, N, K)
+                mask_logit_patch=traj["mask_logit_patch"],      # (T, N, gh, gw, 1)
                 **(
                     {
                         "z_where_aux": traj["z_where_aux"],         # (T, L_aux, N, ...)

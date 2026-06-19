@@ -43,6 +43,9 @@ def main():
     ap.add_argument("--n-groups", type=int, default=1)
     ap.add_argument("--lambda-group", type=float, default=0.0)
     ap.add_argument("--lambda-group-temp", type=float, default=0.0)
+    ap.add_argument("--dice-weight", type=float, default=1.0)
+    ap.add_argument("--focal-gamma", type=float, default=0.0)
+    ap.add_argument("--focal-alpha", type=float, default=0.5)
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -87,6 +90,9 @@ def main():
                 lambda_mask=args.lambda_mask,
                 lambda_group=args.lambda_group,
                 lambda_group_temp=args.lambda_group_temp,
+                dice_weight=args.dice_weight,
+                focal_gamma=args.focal_gamma,
+                focal_alpha=args.focal_alpha,
             )
             totals, mts = jax.vmap(
                 lambda o, s: pretrain_loss(o, s, loss_cfg, PriorConfig())

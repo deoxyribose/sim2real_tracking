@@ -83,15 +83,56 @@ def group_temporal_kl(g_post_matched: Array, alive: Array) -> Array:
     return jnp.sum(sym_kl * a) / (jnp.sum(a) + 1e-6)
 
 
-def mask_loss(pred_mask: Array, gt_mask: Array, alive: Array, dice_weight: float = 1.0) -> Array:
-    """BCE over ALL slots + soft-Dice over ALIVE slots only.
+def glimpse_mask_mse(
+    mask_logit_patch: Array,   # (T, N, gh, gw, 1) — matched (already Hungarian-permuted)
+    gt_masks_canvas: Array,    # (T, N, H, W)       — full-canvas GT masks
+    gt_zwhere: Array,          # (T, N, 5)           — 5-dim affine
+    alive: Array,              # (T, N)
+) -> Array:
+    """Per-slot MSE between sigmoid(decoder mask patch) and the GT mask read into glimpse space.
 
-    Rationale:
-    - BCE is well-defined for empty targets: it pulls pred → 0 on padding slots, which is what
-      we want (no "red square over the canvas" failure).
-    - Dice on empty targets is degenerate — `1 − 2·0/(p+0+ε) ≈ 1` for any small p, adding a
-      constant ~`n_dead/n_total` floor to the loss with no useful gradient. So we only Dice on
-      alive slots.
+    Cellulose recipe (Kosiorek-derived). In glimpse coords the foreground/background pixel
+    counts are ~balanced (the slot's z_where scale matches the cell size), so the loss does
+    not get hijacked by the 1:500 imbalance that exists in canvas coords. This is what
+    avoids the "filled rectangle" attractor of canvas-space mask supervision.
+
+    GT masks are stn_read at the slot's z_where, giving each slot's local GT crop. Compared
+    to the decoder's directly-output mask patch (sigmoid'd) — no stn_write round-trip.
+    """
+    from sim2real.model.stn import stn_read
+    gh = mask_logit_patch.shape[-3]
+
+    def read_one(gt_m, zw):
+        # gt_m: (H, W). stn_read expects (H, W, C).
+        return stn_read(gt_m[..., None], zw, gh)                                          # (gh, gh, 1)
+
+    # vmap over (T, N).
+    gt_patches = jax.vmap(jax.vmap(read_one))(gt_masks_canvas, gt_zwhere)                 # (T, N, gh, gh, 1)
+    pred_patches = jax.nn.sigmoid(mask_logit_patch)
+    sq = jnp.mean((pred_patches - gt_patches) ** 2, axis=(-1, -2, -3))                    # (T, N)
+    return jnp.sum(sq * alive) / (jnp.sum(alive) + 1e-6)
+
+
+def mask_loss(
+    pred_mask: Array,
+    gt_mask: Array,
+    alive: Array,
+    dice_weight: float = 1.0,
+    focal_gamma: float = 0.0,
+    focal_alpha: float = 0.5,
+) -> Array:
+    """BCE (optionally focal) over ALL slots + soft-Dice over ALIVE slots only.
+
+    When `focal_gamma == 0`, the BCE term is the standard cross-entropy. When `focal_gamma > 0`,
+    each per-pixel loss is multiplied by `(1−p)^γ` for positive pixels and `p^γ` for negatives,
+    downweighting easy examples (Lin et al. 2017, "Focal Loss for Dense Object Detection").
+    `focal_alpha` is the positive-class weight in [0, 1].
+
+    Rationale for the split:
+    - BCE on ALL slots: pulls pred → 0 on padding slots (no "red rectangle" failure).
+    - Dice on ALIVE only: avoids the degenerate `1 − 2·0/(p+0+ε) ≈ 1` constant floor on dead slots.
+    - Focal: counters the "predict 0 everywhere" coasting trap on highly imbalanced masks where
+      most pixels are 0 — gradient on hard (cell-boundary) pixels stays loud as the model improves.
 
     Args:
       pred_mask: (T, N, H, W) in [0,1].
@@ -101,15 +142,21 @@ def mask_loss(pred_mask: Array, gt_mask: Array, alive: Array, dice_weight: float
     eps = 1e-6
     gt_effective = gt_mask * alive[..., None, None]                                   # zero out dead
     p = jnp.clip(pred_mask, eps, 1.0 - eps)
-    bce = -(gt_effective * jnp.log(p) + (1.0 - gt_effective) * jnp.log(1.0 - p))      # (T,N,H,W)
-    bce_per_slot = jnp.mean(bce, axis=(-1, -2))                                       # (T, N)
+
+    if focal_gamma > 0:
+        pos = focal_alpha * (1.0 - p) ** focal_gamma * jnp.log(p)
+        neg = (1.0 - focal_alpha) * (p ** focal_gamma) * jnp.log(1.0 - p)
+        bce = -(gt_effective * pos + (1.0 - gt_effective) * neg)
+    else:
+        bce = -(gt_effective * jnp.log(p) + (1.0 - gt_effective) * jnp.log(1.0 - p))   # (T,N,H,W)
+    bce_per_slot = jnp.mean(bce, axis=(-1, -2))                                        # (T, N)
 
     inter = jnp.sum(p * gt_effective, axis=(-1, -2))
     denom = jnp.sum(p + gt_effective, axis=(-1, -2)) + eps
-    dice_per_slot = 1.0 - 2.0 * inter / denom                                         # (T, N)
+    dice_per_slot = 1.0 - 2.0 * inter / denom                                          # (T, N)
 
-    L_bce = jnp.mean(bce_per_slot)                                                    # over ALL slots
+    L_bce = jnp.mean(bce_per_slot)
     L_dice_num = jnp.sum(dice_per_slot * alive)
     L_dice_den = jnp.sum(alive) + 1e-6
-    L_dice = L_dice_num / L_dice_den                                                  # alive only
+    L_dice = L_dice_num / L_dice_den
     return L_bce + dice_weight * L_dice
