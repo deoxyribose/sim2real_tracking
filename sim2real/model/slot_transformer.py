@@ -32,7 +32,7 @@ class SlotTokens(nn.Module):
         # Returns the static slot embedding table.
         emb = self.param(
             "slot_emb",
-            nn.initializers.normal(stddev=0.02),
+            nn.initializers.normal(stddev=0.2),
             (self.n_max, self.d_model),
         )
         return emb

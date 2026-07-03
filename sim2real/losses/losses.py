@@ -12,11 +12,13 @@ from sim2real.losses.matching import gather_along_slots, hungarian_per_frame
 from sim2real.losses.recon import recon_mse
 from sim2real.losses.supervised import (
     bce_from_logits,
+    glimpse_appear_mse,
     glimpse_mask_mse,
     group_supervision_nll,
     group_temporal_kl,
     mask_loss,
     masked_mse,
+    slot_contrast_loss,
 )
 from sim2real.priors.registry import PriorConfig
 from sim2real.types import ModelOut, SimSample
@@ -49,6 +51,19 @@ class PretrainLossConfig:
     # vs stn_read(GT mask, z_where) directly in glimpse coordinates. Use INSTEAD of canvas-space
     # `lambda_mask` (set lambda_mask = 0 in that case) — they target the same prediction differently.
     lambda_mask_glimpse: float = 0.0
+    # Glimpse-space appearance MSE: per-slot decoder patch vs GT image cropped at z_where,
+    # foreground-weighted by the GT mask patch. Replaces full-composite pixel MSE at pretrain
+    # time — no compositing → no mean-image / alpha-cancellation degeneracy.
+    lambda_appear_glimpse: float = 0.0
+    # SlotContrast temporal contrastive (Manasyan CVPR 2025): keep each slot's z_what consistent
+    # across consecutive frames vs other slots' z_what. Attacks anti-clustering of z_what.
+    lambda_slot_contrast: float = 0.0
+    slot_contrast_tau: float = 0.1
+    # Hungarian matching mode. 'per_frame' (default): match at every frame, permits temporal
+    # identity drift (slot n can represent different GT cells at different t). 'once': match on
+    # frame 0 only, use that permutation for every frame — forces slot n = GT slot k(n) across
+    # the whole video, so supervised losses on subsequent frames enforce temporal identity.
+    matching_mode: str = "per_frame"
 
 
 @dataclass(frozen=True)
@@ -57,14 +72,22 @@ class AdaptLossConfig:
     lambda_kl: float = 0.05
 
 
-def _match_video(out: ModelOut, sample: SimSample) -> Array:
-    """Per-frame Hungarian matching on z_where. Returns perm of shape (T, N)."""
+def _match_video(out: ModelOut, sample: SimSample, mode: str = "per_frame") -> Array:
+    """Hungarian matching between predicted and GT slots. Returns perm of shape (T, N).
+
+    - `per_frame`: independent Hungarian per frame — allows temporal identity drift.
+    - `once`: Hungarian at frame 0 only, broadcast to all frames — forces slot n = GT slot k(n)
+      for the whole video, so supervised losses on t≥1 enforce temporal identity.
+    """
     T, N, _ = out.z_where.shape
 
     def per_frame(pred_zw, gt_zw, gt_pres):
         return hungarian_per_frame(pred_zw, gt_zw, gt_pres)
 
-    return jax.vmap(per_frame)(out.z_where, sample.z_where, sample.z_pres)            # (T, N)
+    if mode == "once":
+        perm0 = per_frame(out.z_where[0], sample.z_where[0], sample.z_pres[0])         # (N,)
+        return jnp.broadcast_to(perm0[None, :], (T, N))                                 # (T, N)
+    return jax.vmap(per_frame)(out.z_where, sample.z_where, sample.z_pres)              # (T, N)
 
 
 def _apply_perm(arr: Array, perm: Array) -> Array:
@@ -75,7 +98,7 @@ def _apply_perm(arr: Array, perm: Array) -> Array:
 def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
                   prior_cfg: PriorConfig) -> tuple[Array, dict]:
     """Supervised pretrain loss. Single video (no batch dim)."""
-    perm = _match_video(out, sample)
+    perm = _match_video(out, sample, mode=cfg.matching_mode)
     z_where_matched = _apply_perm(out.z_where, perm)
     z_pres_matched = _apply_perm(out.z_pres, perm)
     z_pres_logit_matched = _apply_perm(out.aux["z_pres_logit"], perm)
@@ -103,6 +126,26 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
         )
     else:
         L_mask_glimpse = jnp.array(0.0)
+
+    # Glimpse-space appearance supervision. Read GT image at z_where, MSE vs decoder's
+    # appearance patch, weighted by GT mask patch (foreground only).
+    appear_patch_raw = out.aux.get("appear_patch")
+    if appear_patch_raw is not None and cfg.lambda_appear_glimpse > 0:
+        appear_patch_matched = _apply_perm(appear_patch_raw, perm)
+        L_appear_glimpse = glimpse_appear_mse(
+            appear_patch_matched, sample.video, sample.masks, sample.z_where, sample.z_pres
+        )
+    else:
+        L_appear_glimpse = jnp.array(0.0)
+
+    # SlotContrast: temporal contrastive on z_what. Uses UN-matched predictions since
+    # slot index is identity by construction under teacher_force_zpres + SAVi bootstrap.
+    if cfg.lambda_slot_contrast > 0:
+        L_slot_contrast = slot_contrast_loss(
+            out.z_what, sample.z_pres, tau=cfg.slot_contrast_tau,
+        )
+    else:
+        L_slot_contrast = jnp.array(0.0)
 
     g_post_raw = out.aux.get("g_post")
     if g_post_raw is not None and g_post_raw.shape[-1] > 1:
@@ -152,6 +195,8 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
         + cfg.lambda_pres * L_pres
         + cfg.lambda_mask * L_mask
         + cfg.lambda_mask_glimpse * L_mask_glimpse
+        + cfg.lambda_appear_glimpse * L_appear_glimpse
+        + cfg.lambda_slot_contrast * L_slot_contrast
         + cfg.lambda_kl * L_kl
         + cfg.lambda_group * L_group
         + cfg.lambda_group_temp * L_group_temp
@@ -164,6 +209,8 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
         "L_pres": L_pres,
         "L_mask": L_mask,
         "L_mask_glimpse": L_mask_glimpse,
+        "L_appear_glimpse": L_appear_glimpse,
+        "L_slot_contrast": L_slot_contrast,
         "L_where_aux": L_where_aux,
         "L_pres_aux": L_pres_aux,
         "L_group": L_group,

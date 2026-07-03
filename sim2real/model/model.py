@@ -110,11 +110,16 @@ class SlotVideoModel(nn.Module):
             )
 
         # Learned per-slot z_where init (used on frame 0 as the residual anchor).
-        # 5-dim affine: (sx_raw, sy_raw, theta_raw, tx_raw, ty_raw). Small random init.
-        self.z_where_init = self.param(
-            "z_where_init",
-            lambda key: jax.random.normal(key, (c.n_max, 5)) * 0.1,
-        )
+        # 5-dim affine: (sx_raw, sy_raw, theta_raw, tx_raw, ty_raw). Larger init on the
+        # translation channels so slots start spread across the image rather than bunched
+        # at center (symmetry-breaking; tanh(0.5) ~ 0.46 covers ~half-image radius).
+        def _zwhere_init(key):
+            k_scale, k_theta, k_pos = jax.random.split(key, 3)
+            scale = jax.random.normal(k_scale, (c.n_max, 2)) * 0.1     # (sx_raw, sy_raw) small
+            theta = jax.random.normal(k_theta, (c.n_max, 1)) * 0.1     # theta small
+            pos = jax.random.normal(k_pos, (c.n_max, 2)) * 0.5         # (tx_raw, ty_raw) spread
+            return jnp.concatenate([scale, theta, pos], axis=-1)
+        self.z_where_init = self.param("z_where_init", _zwhere_init)
 
     def _predict_zwhere(self, q, prev_zwhere):
         return self.where_head(q, prev_zwhere)
@@ -167,10 +172,11 @@ class SlotVideoModel(nn.Module):
         return (
             zwhere_pred, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat,
             appear_canvas, mask_appear_canvas, mask_seg_canvas, g_post,
-            mask_logit_patch,
+            mask_logit_patch, appear_patch,
         )
 
-    def __call__(self, video: Array, key, *, teacher_zwhere=None, teacher_zpres=None):
+    def __call__(self, video: Array, key, *, teacher_zwhere=None, teacher_zpres=None,
+                 bootstrap_zwhere0=None):
         """Forward one video.
 
         Args:
@@ -205,7 +211,11 @@ class SlotVideoModel(nn.Module):
 
         # 3) Scan over time.
         slot_h0 = jnp.zeros((cfg.n_max, cfg.d_model))
-        prev_zwhere0 = self.z_where_init                                              # (N, 3)
+        # Frame-0 residual anchor: bootstrap on GT z_where[0] if provided (SAVi-style
+        # symmetry-breaking bootstrap), else use the learned per-slot z_where_init.
+        prev_zwhere0 = (
+            bootstrap_zwhere0 if bootstrap_zwhere0 is not None else self.z_where_init
+        )                                                                              # (N, 5)
         prev_zpres0 = jnp.zeros((cfg.n_max,))                                         # all dormant
         prev_zwhat0 = jnp.zeros((cfg.n_max, cfg.z_what_dim))
 
@@ -287,7 +297,7 @@ class SlotVideoModel(nn.Module):
             # use a placeholder of ones — _per_slot_head overwrites this when teacher is None).
             (zwhere, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat,
              appear_canvas, mask_appear_canvas, mask_seg_canvas, g_post,
-             mask_logit_patch) = jax.vmap(
+             mask_logit_patch, appear_patch) = jax.vmap(
                 self._per_slot_head, in_axes=(0, 0, 0, 0, 0, 0, None)
             )(
                 q,
@@ -338,6 +348,7 @@ class SlotVideoModel(nn.Module):
                 composite=composite,
                 g_post=g_post,
                 mask_logit_patch=mask_logit_patch,
+                appear_patch=appear_patch,
             )
             if aux_zwhere_layers:
                 # Stack along a new layer axis → (L_aux, N, ...)
@@ -396,6 +407,7 @@ class SlotVideoModel(nn.Module):
                 mask_appear_pred=traj["mask_appear_pred"],
                 g_post=traj["g_post"],                          # (T, N, K)
                 mask_logit_patch=traj["mask_logit_patch"],      # (T, N, gh, gw, 1)
+                appear_patch=traj["appear_patch"],              # (T, N, gh, gw, 1) — raw glimpse-space appearance
                 **(
                     {
                         "z_where_aux": traj["z_where_aux"],         # (T, L_aux, N, ...)

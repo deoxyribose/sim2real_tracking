@@ -53,6 +53,16 @@ class PretrainConfig:
     t_curriculum: bool = False
     t_start: int = 3
     t_curriculum_steps: int = 25_000
+    # Held-out eval hook. `eval_every=0` disables. Samples one fixed batch at init with
+    # `eval_seed` (distinct from `seed`) and forwards through it every `eval_every` steps at
+    # native T. Logs eval/recon, eval/psnr, eval/seg_iou, eval/silhouette_zwhat.
+    eval_every: int = 0
+    eval_batch_size: int = 4
+    eval_seed: int = 424242
+    # Matching curriculum. When > 0, switch loss_cfg.matching_mode to "once" at this step by
+    # rebuilding train_step (one JIT recompile). Lets z_where descend under per-frame matching
+    # first, then locks in temporal identity via match-once.
+    match_once_after: int = 0
 
 
 def train_step_factory(model, loss_cfg, prior_cfg, optimizer,
@@ -64,16 +74,19 @@ def train_step_factory(model, loss_cfg, prior_cfg, optimizer,
     predicted latents are still produced and supervised by the losses.
     """
 
-    def model_forward_one(params, video, key, t_zw, t_zp):
-        return model.apply(params, video, key, teacher_zwhere=t_zw, teacher_zpres=t_zp)
+    def model_forward_one(params, video, key, t_zw, t_zp, boot0):
+        return model.apply(params, video, key,
+                           teacher_zwhere=t_zw, teacher_zpres=t_zp,
+                           bootstrap_zwhere0=boot0)
 
     def loss_fn(params, batch, key):
         keys = jax.random.split(key, batch.video.shape[0])
         t_zw = batch.z_where if teacher_force_zwhere else None
         t_zp = batch.z_pres if teacher_force_zpres else None
+        # No SAVi bootstrap: model must learn its own z_where_init and residual head dynamics.
 
         def fwd_one(v, k, t_zw_i, t_zp_i):
-            return model_forward_one(params, v, k, t_zw_i, t_zp_i)
+            return model_forward_one(params, v, k, t_zw_i, t_zp_i, None)
 
         if t_zw is None and t_zp is None:
             outs = jax.vmap(lambda v, k: fwd_one(v, k, None, None))(batch.video, keys)
@@ -168,6 +181,63 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
     logger = Logger(cfg.run_dir)
     os.makedirs(os.path.join(cfg.run_dir, "ckpts"), exist_ok=True)
 
+    # ---------------- Held-out eval hook ----------------
+    eval_batch_m = None
+    eval_forward = None
+    if cfg.eval_every > 0:
+        from sim2real.eval.recon import psnr as _psnr, ssim_simple as _ssim
+        from sim2real.eval.seg_iou import matched_seg_iou as _matched_iou
+        from sim2real.eval.disentangle import silhouette_zwhat as _silhouette
+        import numpy as _np
+
+        eval_batcher = SimBatcher(cfg.sim_kind, cfg.eval_batch_size, cfg.sim_cfg)
+        eval_key = jax.random.key(cfg.eval_seed)
+        eval_batch = eval_batcher.jit_sample()(eval_key)
+        eval_batch_m = slice_to_model(eval_batch)
+
+        @jax.jit
+        def _eval_forward(params_now, video, key):
+            keys = jax.random.split(key, video.shape[0])
+            def one(v, k):
+                return model.apply(params_now, v, k)
+            return jax.vmap(one)(video, keys)
+        eval_forward = _eval_forward
+
+        def run_eval(params_now, step):
+            k = jax.random.key(cfg.eval_seed + step)
+            outs = eval_forward(params_now, eval_batch_m.video, k)
+            # Recon
+            mse = float(jnp.mean((outs.composite - eval_batch_m.video) ** 2))
+            psnr_val = float(_np.mean([_psnr(outs.composite[i], eval_batch_m.video[i])
+                                       for i in range(cfg.eval_batch_size)]))
+            ssim_val = float(_np.mean([_ssim(outs.composite[i], eval_batch_m.video[i])
+                                       for i in range(cfg.eval_batch_size)]))
+            # Seg IoU (Hungarian per-sample, host-side)
+            iou_val = float(_np.mean([
+                float(_matched_iou(
+                    outs.z_where[i], outs.masks_pred[i],
+                    eval_batch_m.z_where[i], eval_batch_m.masks[i], eval_batch_m.z_pres[i],
+                )) for i in range(cfg.eval_batch_size)
+            ]))
+            # Silhouette on z_what (slot index = identity)
+            pred_zwhat = _np.asarray(outs.z_what).reshape(-1, *outs.z_what.shape[2:])
+            gt_pres = _np.asarray(eval_batch_m.z_pres).reshape(-1, *eval_batch_m.z_pres.shape[2:])
+            Nm_local = eval_batch_m.z_pres.shape[-1]
+            gt_ids = _np.broadcast_to(_np.arange(Nm_local)[None, None, :], eval_batch_m.z_pres.shape)
+            gt_ids = gt_ids.reshape(-1, Nm_local)
+            sil = _silhouette(pred_zwhat, gt_pres, gt_ids)
+            logger.scalar("eval/recon_mse", mse, step)
+            logger.scalar("eval/psnr", psnr_val, step)
+            logger.scalar("eval/ssim", ssim_val, step)
+            logger.scalar("eval/seg_iou", iou_val, step)
+            logger.scalar("eval/silhouette_zwhat", float(sil) if sil == sil else 0.0, step)
+            print(
+                f"[eval] step {step:6d}  recon_mse {mse:.4f}  psnr {psnr_val:.2f}  "
+                f"ssim {ssim_val:.3f}  iou {iou_val:.3f}  silhouette {sil:.3f}",
+                flush=True,
+            )
+    # ---------------------------------------------------
+
     def current_T(step: int) -> int:
         """SQAIR-style frame curriculum. Returns the current sequence length."""
         if not cfg.t_curriculum:
@@ -196,12 +266,27 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
     last_metrics = None
     last_T = -1
     skipped_nan = 0
+    matching_switched = False
     for step in range(1, cfg.n_steps + 1):
         rng_iter, k_batch, k_step = jax.random.split(rng_iter, 3)
         batch = jit_sample(k_batch)
         batch_m = slice_to_model(batch)
         T_now = current_T(step)
         batch_m = slice_T(batch_m, T_now)
+
+        # Matching curriculum: at step cfg.match_once_after, switch to match-once by
+        # rebuilding train_step with a new loss_cfg. Triggers one JIT recompile.
+        if (cfg.match_once_after > 0 and step == cfg.match_once_after
+                and not matching_switched):
+            new_loss_cfg = dataclasses.replace(cfg.loss_cfg, matching_mode="once")
+            train_step = train_step_factory(
+                model, new_loss_cfg, cfg.prior_cfg, optimizer,
+                teacher_force_zwhere=cfg.teacher_force_zwhere,
+                teacher_force_zpres=cfg.teacher_force_zpres,
+            )
+            matching_switched = True
+            print(f"[matching-curriculum] step {step}: switched to match-once "
+                  f"(rebuilding train_step)", flush=True)
         if T_now != last_T:
             print(f"[curriculum] step {step}: T = {T_now}", flush=True)
             last_T = T_now
@@ -218,6 +303,8 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
                 f"step {step:6d}  T={T_now:2d}  loss {float(loss):.4f}  recon {float(metrics['L_recon']):.4f}  "
                 f"where {float(metrics['L_where']):.4f}  pres {float(metrics['L_pres']):.4f}  "
                 f"mask {float(metrics['L_mask']):.4f}  "
+                f"appearG {float(metrics.get('L_appear_glimpse', 0.0)):.4f}  "
+                f"contr {float(metrics.get('L_slot_contrast', 0.0)):.3f}  "
                 f"gnorm {float(metrics['grad_norm']):.2f}  nan_skips {skipped_nan}  "
                 f"({elapsed:.1f}s)",
                 flush=True,
@@ -227,6 +314,9 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
             logger.scalar("train/lr", float(lr_schedule(step)), step)
             logger.scalar("train/T", T_now, step)
             logger.scalar("train/skipped_nan", skipped_nan, step)
+
+        if cfg.eval_every > 0 and (step % cfg.eval_every == 0 or step == 1):
+            run_eval(params, step)
 
         if step % cfg.ckpt_every == 0 or step == cfg.n_steps:
             ckpt_save(

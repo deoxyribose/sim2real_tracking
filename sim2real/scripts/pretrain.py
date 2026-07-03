@@ -37,9 +37,26 @@ def main():
     ap.add_argument("--lambda-group-temp", type=float, default=0.0)
     ap.add_argument("--lambda-aux", type=float, default=0.0)
     ap.add_argument("--lambda-mask-glimpse", type=float, default=0.0)
+    ap.add_argument("--lambda-appear-glimpse", type=float, default=0.0,
+                    help="Per-slot glimpse-space appearance MSE, foreground-weighted by GT mask. "
+                         "Replaces full-composite pixel MSE at pretrain time.")
+    ap.add_argument("--lambda-slot-contrast", type=float, default=0.0,
+                    help="SlotContrast temporal contrastive on z_what (CVPR 2025).")
+    ap.add_argument("--slot-contrast-tau", type=float, default=0.1)
+    ap.add_argument("--matching-mode", default="per_frame", choices=["per_frame", "once"],
+                    help="Hungarian mode. 'once' matches on frame 0 only and reuses the "
+                         "permutation for the whole video (forces temporal identity).")
+    ap.add_argument("--match-once-after", type=int, default=0,
+                    help="If >0, start with per-frame matching then switch to match-once at "
+                         "this step (one JIT recompile). Combines a clean early z_where "
+                         "gradient with late-training identity enforcement.")
     ap.add_argument("--glimpse-size", type=int, default=16)
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--n-transformer-layers", type=int, default=2)
+    ap.add_argument("--eval-every", type=int, default=0,
+                    help="Held-out eval every N steps (0 = disabled). Logs eval/{recon_mse,psnr,ssim,seg_iou,silhouette_zwhat}.")
+    ap.add_argument("--eval-batch", type=int, default=4)
+    ap.add_argument("--eval-seed", type=int, default=424242)
     args = ap.parse_args()
 
     # Pick a reasonable model n_max per sim (must be ≤ sim n_max).
@@ -71,6 +88,10 @@ def main():
         lambda_group_temp=args.lambda_group_temp,
         lambda_aux=args.lambda_aux,
         lambda_mask_glimpse=args.lambda_mask_glimpse,
+        lambda_appear_glimpse=args.lambda_appear_glimpse,
+        lambda_slot_contrast=args.lambda_slot_contrast,
+        slot_contrast_tau=args.slot_contrast_tau,
+        matching_mode=args.matching_mode,
     )
     cfg = PretrainConfig(
         sim_kind=args.sim,
@@ -88,6 +109,10 @@ def main():
         t_curriculum=args.t_curriculum,
         t_start=args.t_start,
         t_curriculum_steps=args.t_curriculum_steps,
+        eval_every=args.eval_every,
+        eval_batch_size=args.eval_batch,
+        eval_seed=args.eval_seed,
+        match_once_after=args.match_once_after,
     )
     train_pretrain(cfg)
 

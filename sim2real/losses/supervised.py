@@ -11,6 +11,7 @@ All operate on (T, N, ...) tensors already aligned by the matching perm.
 
 from __future__ import annotations
 
+import jax
 import jax.nn
 import jax.numpy as jnp
 
@@ -111,6 +112,70 @@ def glimpse_mask_mse(
     pred_patches = jax.nn.sigmoid(mask_logit_patch)
     sq = jnp.mean((pred_patches - gt_patches) ** 2, axis=(-1, -2, -3))                    # (T, N)
     return jnp.sum(sq * alive) / (jnp.sum(alive) + 1e-6)
+
+
+def slot_contrast_loss(
+    z_what: Array,     # (T, N, Zw) — predicted (unmatched — slot index IS identity here)
+    alive: Array,      # (T, N)
+    tau: float = 0.1,
+) -> Array:
+    """SlotContrast temporal contrastive on z_what (Manasyan et al., CVPR 2025).
+
+    Positive pair: (z_what[t, n], z_what[t+1, n]) — same slot across consecutive frames.
+    Negatives: {z_what[t+1, m] : m != n} — other slots at same target frame.
+    InfoNCE at temperature tau. Only counted for slots alive at BOTH t and t+1.
+
+    Uses the predicted z_what without Hungarian matching, because slot index IS identity by
+    construction (teacher-forced z_pres + SAVi frame-0 bootstrap keep slot n aligned to GT
+    slot n across the video).
+    """
+    z = z_what / (jnp.linalg.norm(z_what, axis=-1, keepdims=True) + 1e-6)                  # (T, N, Zw)
+    z_t = z[:-1]                                                                            # (T-1, N, Zw)
+    z_tp1 = z[1:]                                                                           # (T-1, N, Zw)
+    sim = jnp.einsum('tnd,tmd->tnm', z_t, z_tp1) / tau                                       # (T-1, N, N)
+    log_softmax = jax.nn.log_softmax(sim, axis=-1)                                           # (T-1, N, N)
+    # Positive is diagonal (n == m)
+    diag = jnp.diagonal(log_softmax, axis1=-2, axis2=-1)                                     # (T-1, N)
+    a = alive[:-1] * alive[1:]                                                              # (T-1, N)
+    return -jnp.sum(diag * a) / (jnp.sum(a) + 1e-6)
+
+
+def glimpse_appear_mse(
+    appear_patch: Array,       # (T, N, gh, gw, 1) — matched (Hungarian-permuted); values in [0,1]
+    gt_video: Array,           # (T, H, W, C)      — same video for all slots (single-video call)
+    gt_masks_canvas: Array,    # (T, N, H, W)      — foreground weighting
+    gt_zwhere: Array,          # (T, N, 5)         — GT z_where
+    alive: Array,              # (T, N)
+) -> Array:
+    """Per-slot MSE between the decoder's raw appearance glimpse and the GT image cropped at
+    the same z_where, weighted by the GT mask patch (foreground only).
+
+    This is the appearance analog of `glimpse_mask_mse`. Trains the glimpse decoder and z_what
+    from a per-slot, per-glimpse target — no compositing, so the alpha-average / mean-image
+    degeneracies of full-composite pixel MSE cannot apply.
+    """
+    from sim2real.model.stn import stn_read
+    gh = appear_patch.shape[-3]
+
+    def read_v(v, zw):     # v: (H, W, C), zw: (5,)
+        return stn_read(v, zw, gh)
+
+    def read_m(m, zw):     # m: (H, W), zw: (5,)
+        return stn_read(m[..., None], zw, gh)
+
+    def per_frame(v_t, zw_t, m_t):
+        gt_appear_p = jax.vmap(lambda zw: read_v(v_t, zw))(zw_t)                          # (N, gh, gh, C)
+        gt_mask_p = jax.vmap(read_m)(m_t, zw_t)                                           # (N, gh, gh, 1)
+        return gt_appear_p, gt_mask_p
+
+    gt_appear, gt_mask = jax.vmap(per_frame)(gt_video, gt_zwhere, gt_masks_canvas)        # (T, N, gh, gh, {C,1})
+
+    err = (appear_patch - gt_appear) ** 2                                                 # (T, N, gh, gh, C)
+    fg = gt_mask                                                                          # (T, N, gh, gh, 1)
+    num = jnp.sum(err * fg, axis=(-1, -2, -3))                                            # (T, N)
+    den = jnp.sum(fg, axis=(-1, -2, -3)) + 1e-6                                           # (T, N)
+    per_slot = num / den
+    return jnp.sum(per_slot * alive) / (jnp.sum(alive) + 1e-6)
 
 
 def mask_loss(
