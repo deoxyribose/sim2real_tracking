@@ -1,7 +1,7 @@
 # sim2real_tracking — notes for future Claude sessions
 
 ## Project goal
-Test whether an object-centric video model can be pretrained (supervised) on a simulator with prior setting A, then adapted (unsupervised reconstruction) to prior setting B, and still produce semantically meaningful latents. The full plan is at `/home/frans/.claude/plans/i-m-starting-a-new-purring-lemon.md`.
+Test whether an object-centric video model can be pretrained (supervised) on a simulator with prior setting A, then adapted (unsupervised reconstruction) to prior setting B, and still produce semantically meaningful latents. There is no single overall plan doc; the living record of goals, experiments, and status is `experiments.md`, and per-feature design docs live in `docs/plans/`.
 
 ## Framework
 JAX + Flax (linen). Optax for optim. Orbax for checkpointing. interpax for splines. numpyro is allowed inside simulators only (probabilistic sampling), never inside the model or training loop.
@@ -29,7 +29,7 @@ Public tensors are batch-first with leading `(B, T, ...)`. Model internals scan 
 - Don't bypass the priors with hard regularizers. Use the `Prior.kl()` API so everything is principled and ablatable.
 
 ## Build order
-See plan §"Build order". Each task in `TaskList` corresponds to one step.
+Each feature's design doc in `docs/plans/` carries its own build order / task list; work through those steps in order.
 
 ## Running tests
 ```bash
