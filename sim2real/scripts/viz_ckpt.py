@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--n-transformer-layers", type=int, default=2)
     ap.add_argument("--bg-base-res", type=int, default=4)
     ap.add_argument("--bg-channels", type=int, nargs="+", default=[8])
+    ap.add_argument("--stem-strides", type=int, nargs="+", default=[2, 2, 2])
     args = ap.parse_args()
 
     ck = ckpt_load(args.ckpt)
@@ -51,6 +52,7 @@ def main():
         z_style_dim=args.z_style_dim,
         glimpse_size=args.glimpse_size,
         stem_channels=(16, 32, 64),
+        stem_strides=tuple(args.stem_strides),
         n_groups=args.n_groups,
         use_background=True,
         bg_base_res=args.bg_base_res,

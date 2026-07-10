@@ -59,14 +59,14 @@ if [ -n "$LAST_CKPT" ]; then
     $PY -m sim2real.scripts.viz_ckpt \
         --ckpt "$RUN_DIR/ckpts/$LAST_CKPT" \
         --sim many_cells --n-max "$N_MAX" \
-        --glimpse-size "$GLIMPSE" --n-transformer-layers "$LAYERS" \
+        --glimpse-size "$GLIMPSE" --n-transformer-layers "$LAYERS" --stem-strides 2 2 1 \
         --out "$RUN_DIR/final_viz.png" || echo "viz failed"
 
     echo "=== Eval ==="
     $PY -m sim2real.scripts.eval_ckpt \
         --ckpt "$RUN_DIR/ckpts/$LAST_CKPT" \
         --sim many_cells --n-max "$N_MAX" \
-        --glimpse-size "$GLIMPSE" --n-transformer-layers "$LAYERS" \
+        --glimpse-size "$GLIMPSE" --n-transformer-layers "$LAYERS" --stem-strides 2 2 1 \
         --out "$RUN_DIR/eval_metrics.json" || echo "eval failed"
 fi
 date
