@@ -10,10 +10,10 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONPATH=.
-PY=/home/frans/algae/.venv/bin/python
+PY=/home/frans/jaxup_venv/bin/python
 
-RUN_DIR=runs/match_curriculum
-STEPS=2000
+RUN_DIR=runs/scale_fix_jax010
+STEPS=10000
 BATCH=4
 LR=2e-4
 N_MAX=48
@@ -37,7 +37,7 @@ $PY -m sim2real.scripts.pretrain \
     --glimpse-size "$GLIMPSE" \
     --n-transformer-layers "$LAYERS" \
     --lambda-recon 2.0 \
-    --lambda-where 1.0 \
+    --lambda-where 5.0 \
     --lambda-pres 1.0 \
     --lambda-mask 0.0 \
     --lambda-mask-glimpse 10.0 \

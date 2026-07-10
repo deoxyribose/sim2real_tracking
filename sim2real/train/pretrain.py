@@ -109,20 +109,19 @@ def train_step_factory(model, loss_cfg, prior_cfg, optimizer,
     def train_step(params, opt_state, batch, key):
         (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch, key)
         # Compute gradient norm BEFORE skipping — useful diagnostic even on bad batches.
+        # If any grad element is non-finite, gnorm is non-finite, so a single scalar check
+        # replaces the per-leaf tree-map/cond in the earlier version.
         gnorm = optax.global_norm(grads)
-        # NaN guard: if any grad leaf is non-finite, skip the update entirely.
-        finite_per_leaf = jax.tree.map(lambda x: jnp.all(jnp.isfinite(x)), grads)
-        all_finite = jax.tree.reduce(jnp.logical_and, finite_per_leaf)
+        all_finite = jnp.isfinite(gnorm)
 
-        def good_update(_):
-            updates, new_st = optimizer.update(grads, opt_state, params)
-            new_params = optax.apply_updates(params, updates)
-            return new_params, new_st
+        # Always compute the update; discard it via pytree-wide `where` if non-finite. This
+        # collapses the previous lax.cond into a single graph, avoiding per-step dispatch
+        # overhead observed on some JAX/XLA versions.
+        updates, new_st = optimizer.update(grads, opt_state, params)
+        candidate_params = optax.apply_updates(params, updates)
+        new_params = jax.tree.map(lambda n, o: jnp.where(all_finite, n, o), candidate_params, params)
+        new_opt_state = jax.tree.map(lambda n, o: jnp.where(all_finite, n, o), new_st, opt_state)
 
-        def skip_update(_):
-            return params, opt_state
-
-        new_params, new_opt_state = jax.lax.cond(all_finite, good_update, skip_update, operand=None)
         metrics["grad_norm"] = gnorm
         metrics["skipped_nan"] = (~all_finite).astype(jnp.float32)
         return new_params, new_opt_state, loss, metrics

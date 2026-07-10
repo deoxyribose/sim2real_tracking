@@ -110,14 +110,16 @@ class SlotVideoModel(nn.Module):
             )
 
         # Learned per-slot z_where init (used on frame 0 as the residual anchor).
-        # 5-dim affine: (sx_raw, sy_raw, theta_raw, tx_raw, ty_raw). Larger init on the
-        # translation channels so slots start spread across the image rather than bunched
-        # at center (symmetry-breaking; tanh(0.5) ~ 0.46 covers ~half-image radius).
+        # 5-dim affine: (sx_raw, sy_raw, theta_raw, tx_raw, ty_raw).
+        # Scale channels biased toward sigmoid ~0.10 (logit -2.2) — the empirical mean of
+        # many_cells GT scale. Without this, sigmoid(N(0, 0.1)) ≈ 0.50 (5× too big) and the
+        # mask decoder trains to output a mostly-empty patch inside the too-large region.
+        # Translation channels spread (stddev 0.5) so slots start across the image.
         def _zwhere_init(key):
             k_scale, k_theta, k_pos = jax.random.split(key, 3)
-            scale = jax.random.normal(k_scale, (c.n_max, 2)) * 0.1     # (sx_raw, sy_raw) small
-            theta = jax.random.normal(k_theta, (c.n_max, 1)) * 0.1     # theta small
-            pos = jax.random.normal(k_pos, (c.n_max, 2)) * 0.5         # (tx_raw, ty_raw) spread
+            scale = -2.2 + jax.random.normal(k_scale, (c.n_max, 2)) * 0.3   # sigmoid ~ 0.10
+            theta = jax.random.normal(k_theta, (c.n_max, 1)) * 0.1
+            pos = jax.random.normal(k_pos, (c.n_max, 2)) * 0.5
             return jnp.concatenate([scale, theta, pos], axis=-1)
         self.z_where_init = self.param("z_where_init", _zwhere_init)
 

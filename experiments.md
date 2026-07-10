@@ -10,7 +10,51 @@ Running log of what we've tried and what we learned. Newest at the top.
 
 ## 2026-07-02 — session: fix pretrain decomposition
 
-### Exp 10: `match_curriculum` (2026-07-03, **in progress**)
+### Exp 12: `scale_fix_jax010` — **JAX 0.5.0 → 0.10.2 gives 100× speedup + IoU 0.105 in 16 min** (2026-07-10)
+
+Rebuilt venv at `/home/frans/jaxup_venv` with JAX 0.10.2 (was JAX 0.5.0, installed Feb 2025). Same config as Exp 11.
+
+**Speedup:** 1663 ms/step → 16.2 ms/step (**103× faster**). Historical June baseline was ~23 ms/step; we're now faster than that. The whole "70× slowdown vs. historical" throughput regression was **stale JAX** (0.5.0 is over a year old and lacks proper Blackwell 5090 dispatch).
+
+**Bonus:** T=8 CUDA_ERROR_ILLEGAL_ADDRESS crash that broke Exps 5, 7, 8 is *also gone*. Run reached T=12 (native) with no error. That was another JAX 0.5.0 bug.
+
+**Results (10k steps, 16.4 min wall time):**
+| step  | eval IoU | silhouette | PSNR  | train where |
+|-------|----------|------------|-------|-------------|
+| 1     | 0.029    | -0.035     | 20.28 | 0.47        |
+| 500   | 0.039    | 0.543      | 21.62 | —           |
+| 1000  | 0.040    | 0.721      | 21.65 | 0.23        |
+| 3000  | 0.068    | 0.781      | 21.80 | —           |
+| 5000  | 0.085    | 0.744      | 21.84 | —           |
+| **10000** | **0.105** | **0.692** | **21.91** | **0.12** |
+
+**IoU 0.105 at step 10000 vs historical 0.127 at step 100000** — 82% of historical converged IoU in 10% of the compute, and still climbing. If we run to 100k (~35 min), likely exceed historical.
+
+**Files touched:** `scripts/rebalance_many_cells.sh` (PY=/home/frans/jaxup_venv/bin/python, STEPS=10000). NaN-guard was also rewritten in `sim2real/train/pretrain.py` (gnorm-based instead of tree.map + lax.cond) but this change contributes negligibly compared to the JAX upgrade.
+
+---
+
+### Exp 11: `scale_fix` — scale-init bias + `lambda-where 5` (2026-07-10, killed at step 1600 for JAX upgrade)
+
+Fixed the scale problem identified by Exp 10.5 diagnostic. `z_where_init` scale channels re-biased near sigmoid 0.10 (empirical GT mean) via a `-2.2` bias. `--lambda-where 1.0 → 5.0`.
+
+**Confirmed scale is now correct at step 1000:**
+- pred sx/sy mean 0.10 vs GT 0.10 — exact match
+- Position error 0.137 (unchanged) — position still ~9 pixels off from cells
+
+**Broke the 0.02 IoU ceiling** that had held for Exps 3-10: reached IoU 0.041 at step 1500. Silhouette climbed to 0.79 without needing the curriculum switch (per-frame Hungarian with proper scale init gave SlotContrast enough traction).
+
+---
+
+### Exp 10.5: mask + z_where diagnostic on Exp 10 step-1600 ckpt
+
+Killed the "diffuse blob" hypothesis. Per-slot masks are already **sharp compact dots** at distinct locations, `p=1.00`. The illusion of a "diffuse blob" in the summary panel was just 45 sharp dots summed.
+
+Actual problem: **pred scale is 3× too large** (pred sx 0.33 vs GT 0.10), so each sharp dot is inside a mostly-empty large STN write area. And **position error is ~9 pixels** (0.137 in tanh space) ~ a full cell diameter — pred dots are close to cells but often not overlapping. Motivated Exp 11's scale-init fix.
+
+---
+
+### Exp 10: `match_curriculum` (2026-07-03, **partial success — silhouette flipped, IoU stuck**)
 
 Per-frame Hungarian for the first 500 steps (let z_where descend on the best per-frame supervised signal), then rebuild `train_step` with `matching_mode='once'` to lock in temporal identity for the remaining 1500 steps. One JIT recompile at the transition.
 
@@ -21,6 +65,17 @@ Motivation: Exp 9 (match_once from step 1) hurt short-term z_where descent becau
 - `sim2real/scripts/pretrain.py`: `--match-once-after N` CLI flag.
 
 **Config:** All Exp 8b config (recon+appearG+mask_glimpse+slotcontrast, no bootstrap, no teacher-force-zpres, T-curriculum-steps=5000) + `--matching-mode per_frame --match-once-after 500`.
+
+**Results so far:**
+| step | contr | where | eval IoU | eval silhouette |
+|------|-------|-------|----------|-----------------|
+| 500 (pre-switch)  | 3.87  | 2.96 | 0.020    | -0.223 |
+| 750 (post-switch) | —     | —    | 0.017    | -0.049 |
+| **1000 (post)**   | **0.072** | **1.94** | 0.020 | **+0.611** |
+
+**Curriculum matching worked.** `contr` collapsed 53× (uniform → 0.072) in 500 post-switch steps. Silhouette flipped from -0.223 to **+0.611**. Temporal identity is now enforced; z_what strongly clusters by GT identity.
+
+**But IoU is stuck at 0.020.** Even though z_where is descending (2.96 → 1.94), IoU has been flat since step 500. Diagnosis: masks are still diffuse blobs — the mask decoder isn't producing sharp per-cell shapes. `train mask` metric plateaued at 0.95 for hundreds of steps. Options: (1) longer training, (2) mask entropy penalty, (3) bigger decoder.
 
 ---
 
