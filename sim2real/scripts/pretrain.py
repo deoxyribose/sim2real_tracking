@@ -53,6 +53,9 @@ def main():
     ap.add_argument("--glimpse-size", type=int, default=16)
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--n-transformer-layers", type=int, default=2)
+    ap.add_argument("--stem-strides", type=int, nargs="+", default=[2, 2, 2],
+                    help="Per-stage CNN strides. Default (2,2,2) gives total stride 8 → 16x16 grid. "
+                         "Use (2,2,1) for stride 4 → 32x32 grid (halved pixel quantum).")
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Held-out eval every N steps (0 = disabled). Logs eval/{recon_mse,psnr,ssim,seg_iou,silhouette_zwhat}.")
     ap.add_argument("--eval-batch", type=int, default=4)
@@ -72,6 +75,7 @@ def main():
         z_style_dim=4,
         glimpse_size=args.glimpse_size,
         stem_channels=(16, 32, 64),
+        stem_strides=tuple(args.stem_strides),
         n_groups=args.n_groups,
         use_background=True,
         bg_base_res=4,

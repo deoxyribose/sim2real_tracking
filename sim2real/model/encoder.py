@@ -17,16 +17,21 @@ Array = jnp.ndarray
 class ConvStem(nn.Module):
     channels: tuple[int, ...] = (32, 64, 128)
     d_model: int = 256
+    # Per-stage strides. Length must match `channels`. Default is all stride-2 (total stride 8).
+    # Use e.g. (2, 2, 1) for total stride 4 → 32x32 feature grid on 128 input (halves pixel
+    # quantum from 8 to 4, matching SLATE/STEVE/SlotFormer).
+    strides: tuple[int, ...] = (2, 2, 2)
 
     @nn.compact
     def __call__(self, x):
         # x: (H, W, C)
-        for c in self.channels:
-            x = nn.Conv(c, (3, 3), strides=(2, 2), padding="SAME")(x)
+        assert len(self.strides) == len(self.channels), "strides must match channels"
+        for c, s in zip(self.channels, self.strides):
+            x = nn.Conv(c, (3, 3), strides=(s, s), padding="SAME")(x)
             x = nn.GroupNorm(num_groups=8 if c >= 8 else c)(x)
             x = nn.gelu(x)
         x = nn.Conv(self.d_model, (1, 1))(x)
-        return x  # (H/8, W/8, d_model)
+        return x  # (H/prod(strides), W/prod(strides), d_model)
 
 
 class ViTBlock(nn.Module):
@@ -62,10 +67,11 @@ class FrameEncoder(nn.Module):
     d_model: int = 256
     n_vit_layers: int = 2
     stem_channels: tuple[int, ...] = (32, 64, 128)
+    stem_strides: tuple[int, ...] = (2, 2, 2)
 
     @nn.compact
     def __call__(self, image):
-        feat = ConvStem(self.stem_channels, self.d_model)(image)                  # (h', w', d)
+        feat = ConvStem(self.stem_channels, self.d_model, self.stem_strides)(image)  # (h', w', d)
         h, w, d = feat.shape
         pe = sinusoidal_2d(h, w, d)
         tokens = (feat + pe).reshape(h * w, d)

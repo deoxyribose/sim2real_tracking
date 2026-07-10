@@ -48,6 +48,7 @@ class ModelConfig:
     glimpse_size: int = 16
     n_vit_layers: int = 1
     stem_channels: tuple = (16, 32, 64)
+    stem_strides: tuple = (2, 2, 2)
     where_scale: float = 0.5
     pres_init_bias: float = -1.0
     pres_tau: float = 0.5
@@ -74,7 +75,9 @@ class SlotVideoModel(nn.Module):
     def setup(self):
         c = self.cfg
         self.encoder = FrameEncoder(
-            d_model=c.d_model, n_vit_layers=c.n_vit_layers, stem_channels=tuple(c.stem_channels)
+            d_model=c.d_model, n_vit_layers=c.n_vit_layers,
+            stem_channels=tuple(c.stem_channels),
+            stem_strides=tuple(c.stem_strides),
         )
         self.slot_transformer = SlotTransformer(
             n_max=c.n_max, d_model=c.d_model, n_heads=c.n_heads, n_layers=c.n_transformer_layers

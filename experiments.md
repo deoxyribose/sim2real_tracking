@@ -10,6 +10,32 @@ Running log of what we've tried and what we learned. Newest at the top.
 
 ## 2026-07-02 — session: fix pretrain decomposition
 
+### Exp 13: `stride4` — **IoU 0.115 in 18 min via stride-4 encoder (32×32 grid)** (2026-07-10)
+
+Halve the encoder's total stride (2,2,2 → 2,2,1) so the final feature grid is 32×32 instead of 16×16. Halves the pixel quantum from 8 → 4 px/token, matching SLATE/STEVE/SlotFormer. No other changes.
+
+**Files touched:**
+- `sim2real/model/encoder.py`: added `strides` param to `ConvStem` and `FrameEncoder` (default (2,2,2) preserves prior behavior).
+- `sim2real/model/model.py`: `ModelConfig.stem_strides` field.
+- `sim2real/scripts/pretrain.py`: `--stem-strides` CLI flag.
+
+**Results (10k steps, 17.7 min wall time — barely slower than Exp 12):**
+| step  | Exp 12 IoU | **Exp 13 IoU** | Exp 12 sil | Exp 13 sil |
+|-------|-----------|-----------|-----------|-----------|
+| 1000  | 0.040 | 0.045 | 0.721 | 0.767 |
+| 3000  | 0.068 | 0.078 | 0.781 | 0.750 |
+| 5000  | 0.082 | 0.093 | 0.744 | 0.750 |
+| 7500  | —     | 0.111 | —     | 0.746 |
+| **10000** | **0.105** | **0.115** | 0.692 | 0.743 |
+
+**Position error dropped 42%** (0.137 → 0.079 in tanh space, ~9 px → ~5 px — at the stride-4 quantum floor). Scale stayed accurate (pred 0.107 vs GT 0.109). Train `L_where` dropped 15% (0.117 → 0.099).
+
+**Wall-time surprise:** theoretical 4× cross-attention cost translated to only +8% wall time. The GPU was 2% utilized at 16×16; adding 4× tokens uses the headroom, not more clock time.
+
+**Vs historical baseline (100k steps, IoU 0.127):** now at 91% of historical performance in 10% of the compute, still monotonically climbing at step 10000.
+
+---
+
 ### Exp 12: `scale_fix_jax010` — **JAX 0.5.0 → 0.10.2 gives 100× speedup + IoU 0.105 in 16 min** (2026-07-10)
 
 Rebuilt venv at `/home/frans/jaxup_venv` with JAX 0.10.2 (was JAX 0.5.0, installed Feb 2025). Same config as Exp 11.

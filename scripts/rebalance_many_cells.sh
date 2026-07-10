@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 export PYTHONPATH=.
 PY=/home/frans/jaxup_venv/bin/python
 
-RUN_DIR=runs/scale_fix_jax010
+RUN_DIR=runs/stride4
 STEPS=10000
 BATCH=4
 LR=2e-4
@@ -36,6 +36,7 @@ $PY -m sim2real.scripts.pretrain \
     --lambda-aux "$LAMBDA_AUX" \
     --glimpse-size "$GLIMPSE" \
     --n-transformer-layers "$LAYERS" \
+    --stem-strides 2 2 1 \
     --lambda-recon 2.0 \
     --lambda-where 5.0 \
     --lambda-pres 1.0 \
