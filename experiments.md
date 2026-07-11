@@ -10,6 +10,32 @@ Running log of what we've tried and what we learned. Newest at the top.
 
 ## 2026-07-02 — session: fix pretrain decomposition
 
+### Exp 14: `long_all_sims` — **Beats the June baseline on every sim** (2026-07-10 → 2026-07-11, 23.7h wall)
+
+200k steps × 6 configs. The Exp 13 recipe on all four sims, with two extra n_groups=1 variants for flagella and worms to ablate the grouped decoder against SlotContrast + match-once.
+
+| sim | our IoU | historical (100k) | × | our silhouette | historical | our PSNR |
+|-----|---------|-------------------|---|-----------------|------------|----------|
+| flagella_grp1 | **0.187** | 0.078 | **2.4×** | 0.472 | 0.028 | 19.64 |
+| flagella_grp8 | 0.183 | 0.078 | 2.3× | 0.499 | 0.028 | 19.68 |
+| worms_grp1 | **0.228** | 0.129 | **1.8×** | 0.578 | -0.015 | 21.19 |
+| worms_grp12 | 0.228 | 0.129 | 1.8× | 0.576 | -0.015 | 21.45 |
+| multiscale | 0.062 | 0.018 | **3.4×** | 0.374 | -0.090 | 22.87 |
+| many_cells | 0.184 | 0.127 | 1.4× | **0.743** | -0.034 | 22.98 |
+
+**Every sim above the June baseline on IoU (1.4–3.4×). Silhouette flipped from negative/zero to strongly positive on every sim.**
+
+**n_groups ablation:**
+- **flagella**: groups helped identity (id_switches 42 → **19**, -55%) but did not change IoU or silhouette.
+- **worms**: groups changed nothing measurably (both IoU 0.228, both silhouette 0.58).
+- Interpretation: groups matter when instances look alike (thin filaments) but are redundant when each instance is visually distinctive.
+
+**many_cells** is the smallest gain (1.4×) and the only sim where PSNR/SSIM regressed vs historical (22.98/0.30 vs 24.16/0.52). This is the densest, most homogeneous sim — the composite pixel-MSE we replaced with glimpse-space per-slot losses may have been contributing more here than elsewhere. Worth revisiting the recon weighting for many_cells specifically.
+
+**Config:** stride-4 encoder (32×32 grid), matching-mode curriculum (per_frame → once at step 500), no teacher-force-zpres, no SAVi bootstrap, scale-init bias, lambda_where=5, SlotContrast + glimpse-space appearance + glimpse-space mask + composite recon. Full script at `scripts/long_all_sims.sh`. Summary plot at `runs/long_all_sims/summary.png`.
+
+---
+
 ### Exp 13: `stride4` — **IoU 0.115 in 18 min via stride-4 encoder (32×32 grid)** (2026-07-10)
 
 Halve the encoder's total stride (2,2,2 → 2,2,1) so the final feature grid is 32×32 instead of 16×16. Halves the pixel quantum from 8 → 4 px/token, matching SLATE/STEVE/SlotFormer. No other changes.
