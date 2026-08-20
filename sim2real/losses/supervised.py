@@ -27,13 +27,47 @@ def masked_mse(pred: Array, gt: Array, alive: Array) -> Array:
     return num / den
 
 
-def bce_from_logits(logit: Array, gt_pres: Array) -> Array:
-    """Two-sided BCE computed directly on logits — numerically stable at saturation.
+def bce_from_logits(
+    logit: Array,
+    gt_pres: Array,
+    focal_gamma: float = 0.0,
+    focal_alpha: float = 0.5,
+) -> Array:
+    """Two-sided BCE (optionally focal) computed on logits, numerically stable at saturation.
 
-    L = mean( logsumexp(0, -z) + (1 - gt) · z ) i.e. mean over (T, N) of:
-        log(1 + exp(z)) - gt · z
+    Plain BCE (focal_gamma=0):
+        L = mean( softplus(logit) - gt · logit )
+    Focal BCE (focal_gamma>0, Lin et al 2017):
+        L = mean( alpha_t · (1-pt)^gamma · -log(pt) )
+    where pt = sigmoid(z) if gt=1 else 1-sigmoid(z), and alpha_t = alpha if gt=1 else 1-alpha.
+    Numerically stable via softplus/sigmoid on ±z.
+
+    focal_alpha in [0,1] is the positive-class weight (up-weight positives with alpha>0.5).
     """
-    return jnp.mean(jax.nn.softplus(logit) - gt_pres * logit)
+    if focal_gamma <= 0.0 and focal_alpha == 0.5:
+        return jnp.mean(jax.nn.softplus(logit) - gt_pres * logit)
+    # -log(pt): softplus(-z) for pos, softplus(z) for neg.
+    neg_log_pt = jnp.where(gt_pres > 0.5, jax.nn.softplus(-logit), jax.nn.softplus(logit))
+    # (1 - pt)^gamma: sigmoid(-z)^g for pos, sigmoid(z)^g for neg.
+    if focal_gamma > 0.0:
+        mod = jnp.where(gt_pres > 0.5, jax.nn.sigmoid(-logit), jax.nn.sigmoid(logit)) ** focal_gamma
+    else:
+        mod = jnp.ones_like(logit)
+    alpha_t = jnp.where(gt_pres > 0.5, focal_alpha, 1.0 - focal_alpha)
+    return jnp.mean(alpha_t * mod * neg_log_pt)
+
+
+def pres_temporal_smooth(pres_logit: Array) -> Array:
+    """Penalize frame-to-frame variation of per-slot pres. Sim guarantees GT pres is constant
+    across T (cells never appear/disappear), so any temporal variation is a model artifact.
+
+    MSE in probability space: strongest gradient exactly when the slot is flipping between
+    confident classes (which is the pathology we're targeting).
+
+    pres_logit: (T, N).
+    """
+    pres = jax.nn.sigmoid(pres_logit)
+    return jnp.mean((pres[1:] - pres[:-1]) ** 2)
 
 
 def bce_one_sided(pred_pres: Array, gt_pres: Array, eps: float = 1e-6) -> Array:

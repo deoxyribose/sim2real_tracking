@@ -39,6 +39,23 @@ def main():
     ap.add_argument("--bg-base-res", type=int, default=4)
     ap.add_argument("--bg-channels", type=int, nargs="+", default=[8])
     ap.add_argument("--stem-strides", type=int, nargs="+", default=[2, 2, 2])
+    ap.add_argument("--pres-hidden", type=int, default=128)
+    ap.add_argument("--pres-depth", type=int, default=1)
+    ap.add_argument("--pres-image-attn", action="store_true")
+    ap.add_argument("--slot-competing-cross", action="store_true")
+    ap.add_argument("--anchor-slots", action="store_true")
+    ap.add_argument("--use-slot-attention", action="store_true")
+    ap.add_argument("--use-neural-em", action="store_true")
+    ap.add_argument("--use-isa", action="store_true")
+    ap.add_argument("--isa-abs-pe-weight", type=float, default=0.0)
+    ap.add_argument("--isa-anchor-init", action="store_true")
+    ap.add_argument("--anchor-init-fixed", action="store_true")
+    ap.add_argument("--z-what-init-std", type=float, default=0.2)
+    ap.add_argument("--nem-attn-temp", type=float, default=1.0)
+    ap.add_argument("--nem-use-bg-slot", action="store_true")
+    ap.add_argument("--savi-bootstrap", action="store_true",
+                    help="Pass GT z_where[:, 0] as slot init per video. Required if the model "
+                         "was trained with --savi-bootstrap.")
     args = ap.parse_args()
 
     ck = ckpt_load(args.ckpt)
@@ -57,6 +74,20 @@ def main():
         use_background=True,
         bg_base_res=args.bg_base_res,
         bg_channels=tuple(args.bg_channels),
+        pres_hidden=args.pres_hidden,
+        pres_depth=args.pres_depth,
+        pres_image_attn=args.pres_image_attn,
+        slot_competing_cross=args.slot_competing_cross,
+        anchor_slots=args.anchor_slots,
+        use_slot_attention=args.use_slot_attention,
+        use_neural_em=args.use_neural_em,
+        use_isa=args.use_isa,
+        isa_abs_pe_weight=args.isa_abs_pe_weight,
+        isa_anchor_init=args.isa_anchor_init,
+        anchor_init_fixed=args.anchor_init_fixed,
+        z_what_init_std=args.z_what_init_std,
+        nem_attn_temp=args.nem_attn_temp,
+        nem_use_bg_slot=args.nem_use_bg_slot,
     )
     model = SlotVideoModel(cfg=model_cfg)
 
@@ -65,11 +96,13 @@ def main():
     batch = batch_fn(key, 1)
     batch = slice_to_model(batch, args.n_max)
 
-    @jax.jit
-    def fwd(video, k):
-        return model.apply(params, video, k)
+    boot0 = batch.z_where[0, 0] if args.savi_bootstrap else None
 
-    out = fwd(batch.video[0], key)
+    @jax.jit
+    def fwd(video, k, b):
+        return model.apply(params, video, k, bootstrap_zwhere0=b)
+
+    out = fwd(batch.video[0], key, boot0)
 
     import matplotlib.pyplot as plt
 
@@ -79,8 +112,20 @@ def main():
 
     gt_video = np.asarray(batch.video[0])               # (T, H, W, 1)
     pred_composite = np.asarray(out.composite)          # (T, H, W, 1)
-    gt_masks_sum = np.clip(np.asarray(batch.masks[0]).sum(1), 0, 1)  # (T, H, W)
-    pred_masks_sum = np.clip(np.asarray(out.masks_pred).sum(1), 0, 1)
+    # Threshold at 0.7 + gate dead slots by z_pres. The sim generates masks for ALL n_max
+    # slots including padding; only alive ones actually render. Without the gate, the sum
+    # includes ~2-3x extra phantom masks from dead slots (bug seen 2026-08-13).
+    THR = 0.7
+    gt_masks = np.asarray(batch.masks[0])                                        # (T, N, H, W)
+    gt_alive = np.asarray(batch.z_pres[0])[..., None, None]                      # (T, N, 1, 1)
+    gt_masks_sum = np.clip(
+        ((gt_masks > THR) * gt_alive).astype(np.float32).sum(1), 0, 1
+    )                                                                             # (T, H, W)
+    pred_masks = np.asarray(out.masks_pred)                                       # (T, N, H, W)
+    pred_alive = np.asarray(out.z_pres)[..., None, None]                          # (T, N, 1, 1)
+    pred_masks_sum = np.clip(
+        ((pred_masks > THR) * pred_alive).astype(np.float32).sum(1), 0, 1
+    )
 
     for t in range(cols):
         axes[0, t].imshow(gt_video[t, ..., 0], cmap="gray", vmin=0, vmax=1)

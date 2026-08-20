@@ -44,15 +44,34 @@ class WhereHead(nn.Module):
 
 
 class PresHead(nn.Module):
-    """z_pres head — Bernoulli logit, sampled via Gumbel-sigmoid with straight-through."""
+    """z_pres head — Bernoulli logit, sampled via Gumbel-sigmoid with straight-through.
+
+    When `image_attn=True`, does a cross-attention from `q` over the image feature grid,
+    concatenates the resulting context with `q`, and feeds through the MLP. Motivation: the
+    slot query alone is a compressed d=128 summary — this gives pres a direct look at the
+    image so it can answer "is there really an object at my slot's location?" with pixel evidence.
+    """
 
     hidden: int = 64
+    depth: int = 1
     init_bias: float = -1.0   # prior bias toward "not present"
+    image_attn: bool = False
+    n_heads: int = 4
 
     @nn.compact
-    def __call__(self, q, key, *, tau: float = 0.5, straight_through: bool = True):
-        x = nn.Dense(self.hidden)(q)
-        x = nn.gelu(x)
+    def __call__(self, q, key, *, tau: float = 0.5, straight_through: bool = True, image_feats=None):
+        x = q
+        if self.image_attn and image_feats is not None:
+            # image_feats: (h, w, d). Flatten spatial → sequence for attention.
+            h, w, d = image_feats.shape
+            kv = image_feats.reshape(h * w, d)
+            # q: (d,) → (1, d) for MHA
+            attn = nn.MultiHeadDotProductAttention(num_heads=self.n_heads, qkv_features=d)
+            ctx = attn(q[None, :], kv).squeeze(0)                                        # (d,)
+            x = jnp.concatenate([q, ctx], axis=-1)
+        for _ in range(self.depth):
+            x = nn.Dense(self.hidden)(x)
+            x = nn.gelu(x)
         logit = nn.Dense(
             1,
             kernel_init=nn.initializers.lecun_normal(),

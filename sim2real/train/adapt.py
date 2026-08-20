@@ -18,7 +18,9 @@ import jax
 import jax.numpy as jnp
 import optax
 
+from sim2real.losses.feat_recon import FeatDecoder, feat_recon_mse
 from sim2real.losses.losses import AdaptLossConfig, adapt_loss
+from sim2real.model.encoder import FrameEncoder
 from sim2real.model.model import ModelConfig, SlotVideoModel
 from sim2real.priors.registry import PriorConfig
 from sim2real.train.batch import SimBatcher
@@ -47,6 +49,11 @@ class AdaptConfig:
     ckpt_every: int = 500
     run_dir: str = "runs/adapt"
     seed: int = 0
+    savi_bootstrap: bool = False
+    # DINOSAUR-lite: replace pixel MSE with per-pixel-feature MSE against a frozen target
+    # encoder snapshot. Prevents STN opt-out collapse (target features have per-pixel structure).
+    use_feat_recon: bool = False
+    lambda_feat_recon: float = 1.0
 
 
 def train_adapt(cfg: AdaptConfig) -> dict:
@@ -82,6 +89,43 @@ def train_adapt(cfg: AdaptConfig) -> dict:
         params = model.init(init_key, sample_m.video[0], init_key)
         print("no pretrain ckpt; starting from random init")
 
+    # Feat-recon: freeze a snapshot of the encoder params for target-feature computation,
+    # and instantiate a new FeatDecoder module for the broadcast decode.
+    if cfg.use_feat_recon:
+        target_encoder = FrameEncoder(
+            d_model=cfg.model_cfg.d_model,
+            n_vit_layers=cfg.model_cfg.n_vit_layers,
+            stem_channels=tuple(cfg.model_cfg.stem_channels),
+            stem_strides=tuple(cfg.model_cfg.stem_strides),
+        )
+        # Encoder subtree of the loaded params — frozen snapshot, never trained.
+        target_encoder_params = {"params": {"encoder": params["params"]["encoder"]}}
+        # Wrap encoder call to match apply signature: apply(params, video[t]) -> (feat_grid, pooled)
+        def target_encode(v):
+            # v: (T, H, W, C) → (T, h, w, d)
+            feats, _pools = jax.vmap(lambda vt: target_encoder.apply(
+                {"params": target_encoder_params["params"]["encoder"]}, vt
+            ))(v)
+            return feats
+
+        # Add feat_decoder params into `params` under a new top-level 'feat_decoder' key.
+        # If loaded ckpt already contains it (warm restart), keep those params.
+        feat_decoder = FeatDecoder(
+            z_what_dim=cfg.model_cfg.z_what_dim, feat_dim=cfg.model_cfg.d_model,
+        )
+        if "feat_decoder" in params:
+            print(f"reusing feat_decoder params from ckpt")
+        else:
+            rng_fd = jax.random.fold_in(init_key, 42)
+            dummy_zwhat = jnp.zeros((cfg.model_cfg.n_max, cfg.model_cfg.z_what_dim))
+            dummy_zwhere = jnp.zeros((cfg.model_cfg.n_max, 5))
+            dummy_zpres = jnp.zeros((cfg.model_cfg.n_max,))
+            fd_params = feat_decoder.init(rng_fd, dummy_zwhat, dummy_zwhere, dummy_zpres, 8, 8)
+            params = {**params, "feat_decoder": fd_params}
+    else:
+        target_encode = None
+        feat_decoder = None
+
     base_opt, lr_schedule = adamw_cosine(cfg.lr_peak, cfg.n_steps, cfg.warmup_steps)
     optimizer, mask = make_optimizer_with_freeze(base_opt, params, cfg.freeze_patterns)
     opt_state = optimizer.init(params)
@@ -93,13 +137,64 @@ def train_adapt(cfg: AdaptConfig) -> dict:
         total, m = adapt_loss(out, smp, cfg.loss_cfg, cfg.prior_cfg)
         return total, m
 
+    savi_bootstrap = cfg.savi_bootstrap
+
+    use_feat = cfg.use_feat_recon
+    lambda_feat = cfg.lambda_feat_recon
+
     @jax.jit
     def train_step(p, st, b, k):
         def loss_fn(p):
             keys = jax.random.split(k, b.video.shape[0])
-            outs = jax.vmap(lambda v, kk: model.apply(p, v, kk))(b.video, keys)
-            totals, metrics = jax.vmap(per_video)(outs, b)
-            return jnp.mean(totals), jax.tree.map(jnp.mean, metrics)
+            boot0 = b.z_where[:, 0] if savi_bootstrap else None
+
+            def one(v, kk, boot):
+                # Extract model params (without feat_decoder subtree) for the SlotVideoModel.
+                if use_feat:
+                    p_model = {k_: v_ for k_, v_ in p.items() if k_ != "feat_decoder"}
+                else:
+                    p_model = p
+                return model.apply(p_model, v, kk, bootstrap_zwhere0=boot)
+
+            in_axes = (0, 0, 0 if boot0 is not None else None)
+            outs = jax.vmap(one, in_axes=in_axes)(b.video, keys, boot0)
+
+            if use_feat:
+                # Feat-recon added on top of standard pixel-MSE recon.
+                # target_feats: (B, T, h, w, d) via frozen target encoder
+                target_feats_all = jax.vmap(target_encode)(b.video)                        # (B, T, h, w, d)
+                H_feat, W_feat = target_feats_all.shape[2], target_feats_all.shape[3]
+
+                def decode_one_video(z_what, z_where, z_pres):
+                    def one_frame(zw, zh, zp):
+                        return feat_decoder.apply(p["feat_decoder"], zw, zh, zp, H_feat, W_feat)
+                    return jax.vmap(one_frame)(z_what, z_where, z_pres)
+
+                pred_feats_all = jax.vmap(decode_one_video)(
+                    outs.z_what, outs.z_where, outs.z_pres
+                )                                                                          # (B, T, h, w, d)
+
+                L_feat = feat_recon_mse(pred_feats_all, target_feats_all)
+                mean_pres = jnp.mean(outs.z_pres)
+                L_pres_alive = jnp.square(
+                    jnp.maximum(cfg.loss_cfg.target_alive_rate - mean_pres, 0.0)
+                )
+
+                # Base pixel-MSE recon (via existing adapt_loss). lambda_recon may be 0 to use
+                # feat-recon only.
+                totals_base, metrics_base = jax.vmap(per_video)(outs, b)
+                L_recon_pix = jnp.mean(totals_base)
+
+                total = L_recon_pix + lambda_feat * L_feat + cfg.loss_cfg.lambda_alive * L_pres_alive
+                metrics = {
+                    "loss": total, "L_recon": jnp.mean(metrics_base["L_recon"]),
+                    "L_feat": L_feat, "L_kl": jnp.mean(metrics_base["L_kl"]),
+                    "L_alive": L_pres_alive, "mean_pres": mean_pres,
+                }
+                return total, metrics
+            else:
+                totals, metrics = jax.vmap(per_video)(outs, b)
+                return jnp.mean(totals), jax.tree.map(jnp.mean, metrics)
 
         (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
         updates, st = optimizer.update(grads, st, p)
@@ -119,9 +214,12 @@ def train_adapt(cfg: AdaptConfig) -> dict:
 
         if step % cfg.log_every == 0 or step == 1:
             elapsed = time.time() - t0
+            alive_metric = metrics.get("L_alive", 0.0)
+            feat_metric = metrics.get("L_feat", 0.0)
             print(
                 f"adapt step {step:6d}  loss {float(loss):.4f}  recon {float(metrics['L_recon']):.4f}  "
-                f"KL {float(metrics['L_kl']):.4f}  gnorm {float(metrics['grad_norm']):.2f}  ({elapsed:.1f}s)"
+                f"feat {float(feat_metric):.4f}  KL {float(metrics['L_kl']):.4f}  alive {float(alive_metric):.4f}  "
+                f"gnorm {float(metrics['grad_norm']):.2f}  ({elapsed:.1f}s)"
             )
             for k, v in metrics.items():
                 logger.scalar(f"adapt/{k}", v, step)

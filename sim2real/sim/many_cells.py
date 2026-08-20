@@ -76,7 +76,9 @@ def sample(key: jax.Array, cfg: ManyCellsConfig) -> SimSample:
         frame = composite_video_frame(masks, appear, bg, z_pres_t)
         return frame, masks
 
-    bg = perlin_grayscale_bg(k_bg, cm.res, channels=1)
+    bg = perlin_grayscale_bg(
+        k_bg, cm.res, channels=1, contrast=cm.bg_contrast, baseline=cm.bg_baseline
+    )
     keys_n = jax.random.split(k_noise, cm.T)
     t_idx = jnp.arange(cm.T)
     frames, masks = jax.vmap(render_frame)(t_idx, keys_n)                                   # (T, ...) , (T, N, H, W)

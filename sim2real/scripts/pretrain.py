@@ -14,9 +14,15 @@ from sim2real.train.pretrain import PretrainConfig, train_pretrain
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sim", default="flagella", choices=["flagella", "many_cells", "multiscale", "worms"])
+    ap.add_argument("--sim", default="flagella",
+                    choices=["flagella", "many_cells", "many_cells_fast", "many_cells_small",
+                             "easy_cells", "two_cells", "multiscale", "worms"])
     ap.add_argument("--steps", type=int, default=500)
     ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--grad-accum-steps", type=int, default=1,
+                    help="Accumulate gradients over N micro-batches before applying update. "
+                         "Effective batch = batch * grad_accum_steps. Enables large effective "
+                         "batch when per-step memory is limited (e.g., stride 2 at 128x128).")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--run-dir", default=None)
     ap.add_argument("--n-max", type=int, default=None)
@@ -43,6 +49,76 @@ def main():
     ap.add_argument("--lambda-slot-contrast", type=float, default=0.0,
                     help="SlotContrast temporal contrastive on z_what (CVPR 2025).")
     ap.add_argument("--slot-contrast-tau", type=float, default=0.1)
+    ap.add_argument("--lambda-slot-repel", type=float, default=0.0,
+                    help="Gaussian repulsion penalty between alive slots. Attacks "
+                         "'phantom slot in inter-cell region' failure. Try 1.0 or 5.0.")
+    ap.add_argument("--slot-repel-sigma", type=float, default=0.1,
+                    help="Repulsion kernel sigma in normalized [-1,1] position space. "
+                         "0.1 ≈ 3px in 64x64. Should be roughly cell diameter.")
+    ap.add_argument("--lambda-pres-smooth", type=float, default=0.0,
+                    help="Temporal smoothness on z_pres (MSE between sigmoid(logit) at "
+                         "consecutive frames). Sim GT is constant across T, so this attacks "
+                         "the pres-flicker / marginal-prediction failure mode directly.")
+    ap.add_argument("--pres-focal-gamma", type=float, default=0.0,
+                    help="Focal BCE gamma on z_pres. >0 pushes the classifier out of the "
+                         "marginal minimum where alive/dead logits overlap. Try 2.0.")
+    ap.add_argument("--pres-focal-alpha", type=float, default=0.5,
+                    help="Positive-class weight for focal BCE on z_pres. Lower = upweight dead "
+                         "slots. With ~83%% positives, try 0.25.")
+    ap.add_argument("--match-pres-weight", type=float, default=0.0,
+                    help="DETR-style: add -w * p̂_pres(i) to Hungarian cost on alive GT columns. "
+                         "Encourages the matcher to send confident-alive predictions to alive GT slots.")
+    ap.add_argument("--stop-grad-zwhat", action="store_true",
+                    help="Fully decouple recognition from generation: call decoder twice per slot, "
+                         "one with stop_grad(zwhat) for the composite so recon can't corrupt zwhat.")
+    ap.add_argument("--pres-hidden", type=int, default=128,
+                    help="Hidden units in PresHead MLP. Default 128 matches d_model.")
+    ap.add_argument("--pres-depth", type=int, default=1,
+                    help="Number of hidden MLP layers in PresHead.")
+    ap.add_argument("--pres-image-attn", action="store_true",
+                    help="Give PresHead direct image access via cross-attention to encoder feature grid.")
+    ap.add_argument("--slot-competing-cross", action="store_true",
+                    help="Slot Attention-style cross-attention: softmax over slot axis instead of "
+                         "key axis, forcing slots to compete for image regions.")
+    ap.add_argument("--anchor-slots", action="store_true",
+                    help="Replace learnable per-slot embeddings with a fixed grid of sinusoidal-encoded "
+                         "anchor positions. Ties slot identity to spatial location.")
+    ap.add_argument("--use-slot-attention", action="store_true",
+                    help="Use proper iterative Slot Attention (Locatello 2020) instead of DETR-style "
+                         "cross-attention. n_transformer_layers reinterpreted as SA iterations.")
+    ap.add_argument("--use-neural-em", action="store_true",
+                    help="Use Neural EM refiner: structured latents (z_where, z_pres, z_what) as "
+                         "iteration state. Replaces slot_transformer + heads.")
+    ap.add_argument("--use-isa", action="store_true",
+                    help="Use Invariant Slot Attention (Biza et al 2302.04973): equivariant "
+                         "per-slot position encoding (pose-rotated + scaled pixel offsets) inside "
+                         "the attention. Structured latents like --use-neural-em.")
+    ap.add_argument("--isa-abs-pe-weight", type=float, default=0.0,
+                    help="Mix in absolute PE into ISA's K_base with this weight (default 0 = "
+                         "strict equivariance). Try 0.1 as a fallback when equivariant PE fails.")
+    ap.add_argument("--isa-anchor-init", action="store_true",
+                    help="Initialize ISA slot positions to a fixed grid (breaks attention<->pose "
+                         "chicken-and-egg at t=0).")
+    ap.add_argument("--anchor-init-fixed", action="store_true",
+                    help="Use a FIXED (non-learned) grid of slot positions as z_where_init. "
+                         "Provides consistent cross-video symmetry breaking. Works for both NEM "
+                         "and ISA paths.")
+    ap.add_argument("--z-what-init-std", type=float, default=0.2,
+                    help="Std of the learned z_what_init random init. Wider = more per-slot "
+                         "identity discrimination at frame 0. Default 0.2, try 1.0.")
+    ap.add_argument("--nem-attn-temp", type=float, default=1.0,
+                    help="Softmax temperature in NEM E-step. <1 = sharper responsibility, "
+                         "less slot-collapse-to-means. Try 0.5 or 0.25.")
+    ap.add_argument("--nem-use-bg-slot", action="store_true",
+                    help="Add a phantom 'background' slot to NEM softmax competition. "
+                         "Prevents real slots from absorbing background mass (which "
+                         "contaminates their centroids). DETR-style null-slot.")
+    ap.add_argument("--savi-bootstrap", action="store_true",
+                    help="SAVi-style frame-0 conditioning: pass GT z_where[:, 0] as slot init per video, "
+                         "removing inter-video permutation randomness on the slot queries.")
+    ap.add_argument("--density-curriculum", action="store_true",
+                    help="many_cells only: ramp n_objects 10 -> 20 -> 30 -> 40 at steps 0, 25k, 50k, 75k. "
+                         "Rebuilds the training batcher at each boundary; eval batcher stays at full density.")
     ap.add_argument("--matching-mode", default="per_frame", choices=["per_frame", "once"],
                     help="Hungarian mode. 'once' matches on frame 0 only and reuses the "
                          "permutation for the whole video (forces temporal identity).")
@@ -50,6 +126,11 @@ def main():
                     help="If >0, start with per-frame matching then switch to match-once at "
                          "this step (one JIT recompile). Combines a clean early z_where "
                          "gradient with late-training identity enforcement.")
+    ap.add_argument("--hard-pres-gate", action="store_true",
+                    help="Forbid dead-pred slots (z_pres≈0) from winning alive-GT columns in "
+                         "the Hungarian matcher (train side). Adds a 1e6 penalty on "
+                         "(1-pred_pres)*gt_pres pairings. Fixes the mechanism where a dead "
+                         "slot's z_where drifts near a real cell and steals its assignment.")
     ap.add_argument("--glimpse-size", type=int, default=16)
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--n-transformer-layers", type=int, default=2)
@@ -63,7 +144,9 @@ def main():
     args = ap.parse_args()
 
     # Pick a reasonable model n_max per sim (must be ≤ sim n_max).
-    default_n_max = {"flagella": 8, "many_cells": 48, "multiscale": 16, "worms": 12}
+    default_n_max = {"flagella": 8, "many_cells": 48, "many_cells_fast": 24,
+                     "many_cells_small": 48, "easy_cells": 8, "two_cells": 4,
+                     "multiscale": 16, "worms": 12}
     n_max = args.n_max if args.n_max is not None else default_n_max[args.sim]
 
     model_cfg = ModelConfig(
@@ -80,6 +163,21 @@ def main():
         use_background=True,
         bg_base_res=4,
         bg_channels=(8,),
+        stop_grad_recon_zwhat=args.stop_grad_zwhat,
+        pres_hidden=args.pres_hidden,
+        pres_depth=args.pres_depth,
+        pres_image_attn=args.pres_image_attn,
+        slot_competing_cross=args.slot_competing_cross,
+        anchor_slots=args.anchor_slots,
+        use_slot_attention=args.use_slot_attention,
+        use_neural_em=args.use_neural_em,
+        use_isa=args.use_isa,
+        isa_abs_pe_weight=args.isa_abs_pe_weight,
+        isa_anchor_init=args.isa_anchor_init,
+        anchor_init_fixed=args.anchor_init_fixed,
+        z_what_init_std=args.z_what_init_std,
+        nem_attn_temp=args.nem_attn_temp,
+        nem_use_bg_slot=args.nem_use_bg_slot,
     )
     from sim2real.losses.losses import PretrainLossConfig
     loss_cfg = PretrainLossConfig(
@@ -95,13 +193,21 @@ def main():
         lambda_appear_glimpse=args.lambda_appear_glimpse,
         lambda_slot_contrast=args.lambda_slot_contrast,
         slot_contrast_tau=args.slot_contrast_tau,
+        lambda_slot_repel=args.lambda_slot_repel,
+        slot_repel_sigma=args.slot_repel_sigma,
+        lambda_pres_smooth=args.lambda_pres_smooth,
+        pres_focal_gamma=args.pres_focal_gamma,
+        pres_focal_alpha=args.pres_focal_alpha,
+        match_pres_weight=args.match_pres_weight,
         matching_mode=args.matching_mode,
+        hard_pres_gate=args.hard_pres_gate,
     )
     cfg = PretrainConfig(
         sim_kind=args.sim,
         model_cfg=model_cfg,
         loss_cfg=loss_cfg,
         batch_size=args.batch,
+        grad_accum_steps=args.grad_accum_steps,
         n_steps=args.steps,
         lr_peak=args.lr,
         log_every=args.log_every,
@@ -117,6 +223,8 @@ def main():
         eval_batch_size=args.eval_batch,
         eval_seed=args.eval_seed,
         match_once_after=args.match_once_after,
+        density_curriculum=args.density_curriculum,
+        savi_bootstrap=args.savi_bootstrap,
     )
     train_pretrain(cfg)
 

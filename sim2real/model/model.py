@@ -28,6 +28,8 @@ from sim2real.model.background import BackgroundRenderer
 from sim2real.model.encoder import FrameEncoder
 from sim2real.model.glimpse import GlimpseDecoder, GlimpseEncoder, GroupedDecoder
 from sim2real.model.heads import PresHead, WhatHead, WhereHead
+from sim2real.model.isa import ISAStack
+from sim2real.model.neural_em import NeuralEMStack
 from sim2real.model.slot_transformer import SlotTransformer
 from sim2real.model.stn import stn_read, stn_write
 from sim2real.model.style import StyleEncoder
@@ -58,6 +60,58 @@ class ModelConfig:
     # is trained exclusively by L_where, the pres head by L_pres, the seg head by L_mask.
     # See cellulose/sqair_cells/train_mixed.py:662-663 for the original pattern.
     stop_grad_recon_path: bool = True
+    # When True, ALSO stop gradient on z_what along the composite recon path — decoder is called
+    # twice: once with gradient (for L_appear_glimpse / L_mask_glimpse), once with stop_grad(zwhat)
+    # (for the composite). Cleanly decouples recognition from generation: z_what is trained only
+    # by supervised losses, and the composite recon loss trains only decoder weights, not the
+    # slot-transformer that produced z_what.
+    stop_grad_recon_zwhat: bool = False
+    # PresHead capacity + optional cross-attention to image features.
+    pres_hidden: int = 128           # was hard-coded to d_model. Bump to 256 to fatten pres head.
+    pres_depth: int = 1              # number of hidden MLP layers before the logit projection.
+    pres_image_attn: bool = False    # if True, PresHead cross-attends to encoder feature grid.
+    # Slot Attention-style softmax-OVER-SLOTS in the transformer's cross-attention layers.
+    # Turns DETR-style attention (each slot independently attends to keys) into Slot Attention
+    # competition (each key claimed by one slot), targeting the "duplicate slots on same object"
+    # failure mode where our current standard cross-attention lets two slots collapse to one cell.
+    slot_competing_cross: bool = False
+    # Anchor-based slot queries: replace learnable per-slot embeddings with a fixed grid of
+    # anchor positions encoded via sinusoidal features. Ties slot identity to spatial location,
+    # avoiding the permutation-averaged-gradient collapse of learnable queries.
+    anchor_slots: bool = False
+    # Proper iterative Slot Attention (Locatello 2020) as replacement for the DETR-style
+    # slot transformer. Uses softmax-over-slots + GRU update + n_transformer_layers iterations
+    # of shared-weight refinement. Turns the model into SAVi-with-our-heads.
+    use_slot_attention: bool = False
+    # Neural EM: iterate structured latents (z_where, z_pres, z_what) directly. Replaces
+    # the slot_transformer + heads with NeuralEMStack. Slot state IS the structured
+    # object parameters — no opaque hidden vector. See sim2real/model/neural_em.py.
+    use_neural_em: bool = False
+    # Invariant Slot Attention (Biza et al 2302.04973). Extends Neural EM with per-slot
+    # equivariant position encoding — the attention key sees pixel offsets in the SLOT's frame
+    # (rotated + scaled), so a translated / rotated / scaled object is picked up by the same
+    # slot regardless of image location. See sim2real/model/isa.py.
+    use_isa: bool = False
+    # ISA-specific knobs (ignored when use_isa=False).
+    #   isa_abs_pe_weight: > 0 mixes absolute PE into K_base (fallback signal when
+    #                      equivariant PE fails from bad slot pose init).
+    #   isa_anchor_init:   initialize z_where_init to a fixed grid of slot positions
+    #                      (breaks the chicken-and-egg between attention & pose).
+    isa_abs_pe_weight: float = 0.0
+    isa_anchor_init: bool = False
+    # Anchor init for NEM path (analogous to isa_anchor_init but always fixed, not learned).
+    #   anchor_init_fixed: use a fixed grid of slot positions as z_where_init, NOT a learned
+    #                      param. Provides consistent cross-video symmetry breaking.
+    #   z_what_init_std:   std of the learned z_what_init random init. Wider = more per-slot
+    #                      identity discrimination at frame 0.
+    #   nem_attn_temp:     softmax temperature in NEM E-step. <1 = sharper responsibility.
+    #                      Addresses "slot collapse to means" where slots drift between cells.
+    anchor_init_fixed: bool = False
+    z_what_init_std: float = 0.2
+    nem_attn_temp: float = 1.0
+    # DETR-style bg slot: phantom "null slot" added to softmax competition. Prevents real
+    # slots from becoming background sinks (which contaminates their centroid).
+    nem_use_bg_slot: bool = False
     # When True, a per-video background field is rendered from z_style and slots composite OVER
     # it. Removes the L_recon = 0.21 floor caused by "unexplained pixels → composite=0".
     use_background: bool = True
@@ -80,10 +134,16 @@ class SlotVideoModel(nn.Module):
             stem_strides=tuple(c.stem_strides),
         )
         self.slot_transformer = SlotTransformer(
-            n_max=c.n_max, d_model=c.d_model, n_heads=c.n_heads, n_layers=c.n_transformer_layers
+            n_max=c.n_max, d_model=c.d_model, n_heads=c.n_heads, n_layers=c.n_transformer_layers,
+            slot_competing_cross=c.slot_competing_cross,
+            anchor_slots=c.anchor_slots,
+            use_slot_attention=c.use_slot_attention,
         )
         self.where_head = WhereHead(scale=c.where_scale, hidden=c.d_model)
-        self.pres_head = PresHead(hidden=c.d_model, init_bias=c.pres_init_bias)
+        self.pres_head = PresHead(
+            hidden=c.pres_hidden, depth=c.pres_depth, init_bias=c.pres_init_bias,
+            image_attn=c.pres_image_attn,
+        )
         self.what_head = WhatHead(z_what_dim=c.z_what_dim, hidden=c.d_model)
         self.glimpse_encoder = GlimpseEncoder(feat_dim=c.z_what_dim, channels=(16, 32))
         if c.n_groups > 1:
@@ -118,18 +178,93 @@ class SlotVideoModel(nn.Module):
         # many_cells GT scale. Without this, sigmoid(N(0, 0.1)) ≈ 0.50 (5× too big) and the
         # mask decoder trains to output a mostly-empty patch inside the too-large region.
         # Translation channels spread (stddev 0.5) so slots start across the image.
-        def _zwhere_init(key):
-            k_scale, k_theta, k_pos = jax.random.split(key, 3)
-            scale = -2.2 + jax.random.normal(k_scale, (c.n_max, 2)) * 0.3   # sigmoid ~ 0.10
-            theta = jax.random.normal(k_theta, (c.n_max, 1)) * 0.1
-            pos = jax.random.normal(k_pos, (c.n_max, 2)) * 0.5
-            return jnp.concatenate([scale, theta, pos], axis=-1)
-        self.z_where_init = self.param("z_where_init", _zwhere_init)
+        # With isa_anchor_init: replace random pos with a fixed grid so ISA has a good bootstrap
+        # pose (avoids attention <-> pose chicken-and-egg failure).
+        # With anchor_init_fixed: skip the learned param entirely — z_where_init is computed
+        # inline as a fixed grid at forward time (see __call__).
+        if not c.anchor_init_fixed:
+            def _zwhere_init(key):
+                k_scale, k_theta, k_pos = jax.random.split(key, 3)
+                scale = -2.2 + jax.random.normal(k_scale, (c.n_max, 2)) * 0.3   # sigmoid ~ 0.10
+                theta = jax.random.normal(k_theta, (c.n_max, 1)) * 0.1
+                if c.isa_anchor_init:
+                    # Grid of anchor positions covering [-0.7, 0.7]^2. Tile to n_max.
+                    import math
+                    side = int(math.ceil(math.sqrt(c.n_max)))
+                    lin = jnp.linspace(-0.7, 0.7, side)
+                    gy, gx = jnp.meshgrid(lin, lin, indexing="ij")
+                    pts = jnp.stack([gx.reshape(-1), gy.reshape(-1)], axis=-1)[:c.n_max]        # (n_max, 2)
+                    pos = jnp.arctanh(jnp.clip(pts, -0.98, 0.98))                              # (n_max, 2)
+                else:
+                    pos = jax.random.normal(k_pos, (c.n_max, 2)) * 0.5
+                return jnp.concatenate([scale, theta, pos], axis=-1)
+            self.z_where_init = self.param("z_where_init", _zwhere_init)
+
+        if c.use_neural_em:
+            # NeuralEMStack runs n_transformer_layers iterations of E+M steps.
+            self.neural_em = NeuralEMStack(
+                n_max=c.n_max, d_model=c.d_model, z_what_dim=c.z_what_dim,
+                n_iters=c.n_transformer_layers, d_pos=32,
+                attn_temp=c.nem_attn_temp,
+                use_bg_slot=c.nem_use_bg_slot,
+            )
+            # Per-slot initial z_what — small learned tensor, one row per slot. Provides the
+            # symmetry-breaking bias for slot identity at t=0 (analogous to slot_init_bias in
+            # Slot Attention).
+            self.z_what_init = self.param(
+                "z_what_init",
+                nn.initializers.normal(stddev=c.z_what_init_std),
+                (c.n_max, c.z_what_dim),
+            )
+
+        if c.use_isa:
+            self.isa = ISAStack(
+                n_max=c.n_max, d_model=c.d_model, z_what_dim=c.z_what_dim,
+                n_iters=c.n_transformer_layers, d_pos=32,
+                abs_pe_weight=c.isa_abs_pe_weight,
+            )
+            self.z_what_init_isa = self.param(
+                "z_what_init_isa",
+                nn.initializers.normal(stddev=c.z_what_init_std),
+                (c.n_max, c.z_what_dim),
+            )
 
     def _predict_zwhere(self, q, prev_zwhere):
         return self.where_head(q, prev_zwhere)
 
-    def _per_slot_head(self, q, key_p, key_w, zwhere_pred, render_zwhere, render_zpres, image):
+    def _per_slot_decode_only(self, zwhat, zwhere, zpres, image):
+        """Decoder + STN + per-slot canvases for the Neural EM path.
+
+        Skips all head calls (pres_head/what_head/where_head) — latents are supplied by
+        the Neural EM refiner. Returns per-slot canvases used by the composite.
+        """
+        cfg = self.cfg
+        glimpse = stn_read(image, zwhere, cfg.glimpse_size)
+        glimpse_feat = self.glimpse_encoder(glimpse)
+
+        if cfg.n_groups > 1:
+            raise NotImplementedError("n_groups>1 not supported with use_neural_em")
+        appear_patch, mask_logit_patch = self.glimpse_decoder(zwhat)                    # (g, g, 1) each
+
+        mask_prob_patch = nn.sigmoid(mask_logit_patch)                                  # (g, g, 1)
+
+        if cfg.stop_grad_recon_path:
+            recon_zwhere = jax.lax.stop_gradient(zwhere)
+            recon_zpres = jax.lax.stop_gradient(zpres)
+        else:
+            recon_zwhere = zwhere
+            recon_zpres = zpres
+
+        appear_canvas = stn_write(appear_patch, recon_zwhere, image.shape[0])           # (R, R, 1)
+        mask_appear_canvas = stn_write(
+            mask_prob_patch * recon_zpres, recon_zwhere, image.shape[0]
+        )[..., 0]                                                                        # (R, R)
+        mask_seg_canvas = stn_write(mask_prob_patch, zwhere, image.shape[0])[..., 0]    # (R, R)
+
+        return (appear_canvas, mask_appear_canvas, mask_seg_canvas,
+                mask_logit_patch, appear_patch, glimpse_feat)
+
+    def _per_slot_head(self, q, key_p, key_w, zwhere_pred, render_zwhere, render_zpres, image, feat_grid):
         """Apply heads + decoder + STN for one slot.
 
         Args:
@@ -144,13 +279,28 @@ class SlotVideoModel(nn.Module):
         cfg = self.cfg
         glimpse = stn_read(image, render_zwhere, cfg.glimpse_size)
         glimpse_feat = self.glimpse_encoder(glimpse)
-        zpres, zpres_logit = self.pres_head(q, key_p, tau=cfg.pres_tau, straight_through=True)
+        zpres, zpres_logit = self.pres_head(
+            q, key_p, tau=cfg.pres_tau, straight_through=True,
+            image_feats=feat_grid if cfg.pres_image_attn else None,
+        )
         zwhat, mu_w, lv_w = self.what_head(q, glimpse_feat, key_w)
         if self.cfg.n_groups > 1:
             appear_patch, mask_logit_patch, g_post = self.glimpse_decoder(zwhat, q)
         else:
             appear_patch, mask_logit_patch = self.glimpse_decoder(zwhat)
             g_post = jnp.ones((1,))
+
+        # Optional second decoder call with stop_grad(zwhat), used only for the composite recon.
+        # Decoder params still get gradient from this path (they're leaves); zwhat does not.
+        if cfg.stop_grad_recon_zwhat:
+            zwhat_recon = jax.lax.stop_gradient(zwhat)
+            if self.cfg.n_groups > 1:
+                appear_patch_recon, mask_logit_patch_recon, _ = self.glimpse_decoder(zwhat_recon, q)
+            else:
+                appear_patch_recon, mask_logit_patch_recon = self.glimpse_decoder(zwhat_recon)
+        else:
+            appear_patch_recon = appear_patch
+            mask_logit_patch_recon = mask_logit_patch
 
         if cfg.stop_grad_recon_path:
             recon_zwhere = jax.lax.stop_gradient(render_zwhere)
@@ -165,10 +315,11 @@ class SlotVideoModel(nn.Module):
         # Recon-side: gate by recon_zpres (stop_grad if configured).
         # Seg-side: same mask, no zpres gate, full gradient through stn_write.
         mask_prob_patch = nn.sigmoid(mask_logit_patch)                                  # (g, g, 1)
+        mask_prob_patch_recon = nn.sigmoid(mask_logit_patch_recon)
 
-        appear_canvas = stn_write(appear_patch, recon_zwhere, image.shape[0])           # (R, R, 1)
+        appear_canvas = stn_write(appear_patch_recon, recon_zwhere, image.shape[0])     # (R, R, 1)
         mask_appear_canvas = stn_write(
-            mask_prob_patch * recon_zpres, recon_zwhere, image.shape[0]
+            mask_prob_patch_recon * recon_zpres, recon_zwhere, image.shape[0]
         )[..., 0]                                                                       # (R, R)
         # mask_seg_canvas keeps the original (non-stopped) render_zwhere so L_mask's gradient
         # can flow into pose if stop_grad_recon_path is False later; today render_zwhere is
@@ -216,11 +367,24 @@ class SlotVideoModel(nn.Module):
 
         # 3) Scan over time.
         slot_h0 = jnp.zeros((cfg.n_max, cfg.d_model))
-        # Frame-0 residual anchor: bootstrap on GT z_where[0] if provided (SAVi-style
-        # symmetry-breaking bootstrap), else use the learned per-slot z_where_init.
-        prev_zwhere0 = (
-            bootstrap_zwhere0 if bootstrap_zwhere0 is not None else self.z_where_init
-        )                                                                              # (N, 5)
+        # Frame-0 residual anchor. Precedence:
+        #   1. bootstrap_zwhere0 (SAVi-style GT bootstrap) if provided
+        #   2. Fixed anchor grid if `anchor_init_fixed` is set (NOT a learned param)
+        #   3. Learned self.z_where_init
+        if bootstrap_zwhere0 is not None:
+            prev_zwhere0 = bootstrap_zwhere0
+        elif cfg.anchor_init_fixed:
+            import math
+            side = int(math.ceil(math.sqrt(cfg.n_max)))
+            lin = jnp.linspace(-0.7, 0.7, side)
+            gy, gx = jnp.meshgrid(lin, lin, indexing="ij")
+            pts = jnp.stack([gx.reshape(-1), gy.reshape(-1)], axis=-1)[:cfg.n_max]
+            pos_raw = jnp.arctanh(jnp.clip(pts, -0.98, 0.98))
+            scale_raw = jnp.full((cfg.n_max, 2), -2.2)                                 # sigmoid ~0.10
+            theta_raw = jnp.zeros((cfg.n_max, 1))
+            prev_zwhere0 = jnp.concatenate([scale_raw, theta_raw, pos_raw], axis=-1)   # (N, 5)
+        else:
+            prev_zwhere0 = self.z_where_init                                            # (N, 5)
         prev_zpres0 = jnp.zeros((cfg.n_max,))                                         # all dormant
         prev_zwhat0 = jnp.zeros((cfg.n_max, cfg.z_what_dim))
 
@@ -279,7 +443,11 @@ class SlotVideoModel(nn.Module):
                     q_li = alive * q_prop_layers[li] + (1.0 - alive) * q_disc_layers[li]
                     zwhere_aux = jax.vmap(self._predict_zwhere)(q_li, prev_zwhere)  # (N, 3 or 5)
                     _, zpres_logit_aux = jax.vmap(
-                        lambda q_, kk: self.pres_head(q_, kk, tau=cfg.pres_tau, straight_through=False)
+                        lambda q_, kk: self.pres_head(
+                            q_, kk, tau=cfg.pres_tau, straight_through=False,
+                            image_feats=feat_grid if cfg.pres_image_attn else None,
+                        ),
+                        in_axes=(0, 0),
                     )(q_li, k_dummy_per_slot)
                     aux_zwhere_layers.append(zwhere_aux)
                     aux_zpres_logit_layers.append(zpres_logit_aux)
@@ -303,7 +471,7 @@ class SlotVideoModel(nn.Module):
             (zwhere, zpres, zpres_logit, zwhat, mu_w, lv_w, glimpse_feat,
              appear_canvas, mask_appear_canvas, mask_seg_canvas, g_post,
              mask_logit_patch, appear_patch) = jax.vmap(
-                self._per_slot_head, in_axes=(0, 0, 0, 0, 0, 0, None)
+                self._per_slot_head, in_axes=(0, 0, 0, 0, 0, 0, None, None)
             )(
                 q,
                 keys_p,
@@ -312,6 +480,7 @@ class SlotVideoModel(nn.Module):
                 render_zwhere,
                 render_zpres_teacher if render_zpres_teacher is not None else jnp.ones(cfg.n_max),
                 image,
+                feat_grid,
             )
             # When no teacher, swap in the predicted z_pres for the gate (we passed ones above
             # so _per_slot_head's mask_appear_canvas used 1.0; recompute with the real prediction).
@@ -361,37 +530,102 @@ class SlotVideoModel(nn.Module):
                 out["z_pres_logit_aux"] = jnp.stack(aux_zpres_logit_layers, axis=0)
             return new_carry, out
 
+        def step_structured(carry_s, inputs, refiner_module):
+            """One-frame step for Neural EM / ISA — bypasses slot_transformer + heads.
+
+            `refiner_module` is a callable (feat_grid, prev_z_where, prev_z_pres, prev_z_what)
+            -> (z_where, z_pres, z_what) — i.e. NeuralEMStack or ISAStack (same signature).
+            The per-slot decoder + STN + composite pipeline is unchanged. No teacher forcing.
+            """
+            prev_zwhere_ne, prev_zpres_ne, prev_zwhat_ne = carry_s
+            feat_grid, image, _k_unused = inputs
+
+            z_where, z_pres, z_what = refiner_module(
+                feat_grid, prev_zwhere_ne, prev_zpres_ne, prev_zwhat_ne
+            )
+
+            (appear_canvas, mask_appear_canvas, mask_seg_canvas,
+             mask_logit_patch, appear_patch, glimpse_feat) = jax.vmap(
+                self._per_slot_decode_only, in_axes=(0, 0, 0, None)
+            )(z_what, z_where, z_pres, image)
+
+            num = jnp.sum(appear_canvas * mask_appear_canvas[..., None], axis=0)
+            den = jnp.sum(mask_appear_canvas, axis=0)[..., None] + 1e-6
+            fg = num / den
+            alpha_fg = jnp.clip(jnp.sum(mask_appear_canvas, axis=0), 0.0, 1.0)[..., None]
+            if cfg.use_background:
+                composite = jnp.clip(alpha_fg * fg + (1.0 - alpha_fg) * bg_frame, 0.0, 1.0)
+            else:
+                composite = jnp.clip(fg, 0.0, 1.0)
+
+            z_pres_logit = jax.scipy.special.logit(jnp.clip(z_pres, 1e-6, 1.0 - 1e-6))
+            mu_w = z_what
+            lv_w = jnp.full_like(z_what, -8.0)
+            g_post = jnp.ones((cfg.n_max, 1))
+
+            new_carry = (z_where, z_pres, z_what)
+            out = dict(
+                z_where=z_where, z_pres=z_pres, z_pres_logit=z_pres_logit,
+                z_what=z_what, mu_w=mu_w, lv_w=lv_w,
+                glimpse_feat=glimpse_feat,
+                appear_pred=appear_canvas,
+                mask_appear_pred=mask_appear_canvas,
+                mask_seg_pred=mask_seg_canvas,
+                composite=composite,
+                g_post=g_post,
+                mask_logit_patch=mask_logit_patch,
+                appear_patch=appear_patch,
+            )
+            return new_carry, out
+
         # NOTE: We use a Python-unrolled loop rather than `jax.lax.scan` because the slot
         # transformer's parameters are created inside `setup()` and we need linen's parameter
         # tracking, which doesn't compose with `jax.lax.scan` without `nn.scan`. For T ≤ ~30
         # the unrolled graph is small enough not to matter.
         keys_t = jax.random.split(jax.random.fold_in(key, 1), T)
-        carry = (slot_h0, prev_zwhere0, prev_zpres0, prev_zwhat0)
         outs = []
-        for t in range(T):
-            # Per-frame teacher slices (slot-index aligned to GT).
-            if teacher_zwhere is not None:
-                prev_zwhere_anchor = teacher_zwhere[t - 1] if t > 0 else teacher_zwhere[0]
-                render_zwhere_teacher = teacher_zwhere[t]
-            else:
-                prev_zwhere_anchor = None
-                render_zwhere_teacher = None
-            if teacher_zpres is not None:
-                prev_zpres_gate = teacher_zpres[t - 1] if t > 0 else teacher_zpres[0]
-                render_zpres_teacher = teacher_zpres[t]
-            else:
-                prev_zpres_gate = None
-                render_zpres_teacher = None
 
-            carry, out_t = step(
-                carry,
-                (feats[t], video[t], keys_t[t]),
-                prev_zwhere_anchor,
-                prev_zpres_gate,
-                render_zwhere_teacher,
-                render_zpres_teacher,
-            )
-            outs.append(out_t)
+        if cfg.use_neural_em or cfg.use_isa:
+            # z_pres init at 0.5 avoids log(0) deadlock in the E-step at t=0.
+            prev_zpres0_s = jnp.full((cfg.n_max,), 0.5)
+            if cfg.use_isa:
+                refiner_mod = self.isa
+                prev_zwhat0_s = self.z_what_init_isa
+            else:
+                refiner_mod = self.neural_em
+                prev_zwhat0_s = self.z_what_init
+            carry = (prev_zwhere0, prev_zpres0_s, prev_zwhat0_s)
+            for t in range(T):
+                carry, out_t = step_structured(
+                    carry, (feats[t], video[t], keys_t[t]), refiner_mod
+                )
+                outs.append(out_t)
+        else:
+            carry = (slot_h0, prev_zwhere0, prev_zpres0, prev_zwhat0)
+            for t in range(T):
+                # Per-frame teacher slices (slot-index aligned to GT).
+                if teacher_zwhere is not None:
+                    prev_zwhere_anchor = teacher_zwhere[t - 1] if t > 0 else teacher_zwhere[0]
+                    render_zwhere_teacher = teacher_zwhere[t]
+                else:
+                    prev_zwhere_anchor = None
+                    render_zwhere_teacher = None
+                if teacher_zpres is not None:
+                    prev_zpres_gate = teacher_zpres[t - 1] if t > 0 else teacher_zpres[0]
+                    render_zpres_teacher = teacher_zpres[t]
+                else:
+                    prev_zpres_gate = None
+                    render_zpres_teacher = None
+
+                carry, out_t = step(
+                    carry,
+                    (feats[t], video[t], keys_t[t]),
+                    prev_zwhere_anchor,
+                    prev_zpres_gate,
+                    render_zwhere_teacher,
+                    render_zpres_teacher,
+                )
+                outs.append(out_t)
 
         traj = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *outs)
 

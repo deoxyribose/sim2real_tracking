@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sim2real.eval.disentangle import linear_probe_zwhere_from_zwhat, silhouette_zwhat
+from sim2real.eval.fg_ari import fg_ari
 from sim2real.eval.recon import psnr, ssim_simple
 from sim2real.eval.seg_iou import matched_seg_iou
 from sim2real.eval.tra import id_switch_count
@@ -51,12 +52,33 @@ def main():
     ap.add_argument("--bg-base-res", type=int, default=4)
     ap.add_argument("--bg-channels", type=int, nargs="+", default=[8])
     ap.add_argument("--stem-strides", type=int, nargs="+", default=[2, 2, 2])
+    ap.add_argument("--pres-hidden", type=int, default=128)
+    ap.add_argument("--pres-depth", type=int, default=1)
+    ap.add_argument("--pres-image-attn", action="store_true")
+    ap.add_argument("--slot-competing-cross", action="store_true")
+    ap.add_argument("--anchor-slots", action="store_true")
+    ap.add_argument("--use-slot-attention", action="store_true")
+    ap.add_argument("--use-neural-em", action="store_true")
+    ap.add_argument("--use-isa", action="store_true",
+                    help="Invariant Slot Attention (see pretrain.py --use-isa).")
+    ap.add_argument("--isa-abs-pe-weight", type=float, default=0.0)
+    ap.add_argument("--isa-anchor-init", action="store_true")
+    ap.add_argument("--anchor-init-fixed", action="store_true")
+    ap.add_argument("--z-what-init-std", type=float, default=0.2)
+    ap.add_argument("--nem-attn-temp", type=float, default=1.0)
+    ap.add_argument("--nem-use-bg-slot", action="store_true")
+    ap.add_argument("--hard-pres-gate", action="store_true",
+                    help="Forbid dead-pred slots from winning alive-GT columns in the eval "
+                         "matcher. Use if the model was trained with hard_pres_gate.")
+    ap.add_argument("--savi-bootstrap", action="store_true",
+                    help="Pass GT z_where[:, 0] as slot init per video. REQUIRED if the model "
+                         "was trained with --savi-bootstrap, else it scores as untrained.")
     args = ap.parse_args()
 
     ck = ckpt_load(args.ckpt)
     params = ck["params"]
 
-    default_n_max = {"flagella": 8, "many_cells": 48, "multiscale": 16, "worms": 12}
+    default_n_max = {"flagella": 8, "many_cells": 48, "many_cells_fast": 24, "many_cells_small": 48, "easy_cells": 8, "two_cells": 4, "multiscale": 16, "worms": 12}
     n_max = args.n_max if args.n_max is not None else default_n_max[args.sim]
     model_cfg = ModelConfig(
         n_max=n_max,
@@ -72,6 +94,20 @@ def main():
         use_background=True,
         bg_base_res=args.bg_base_res,
         bg_channels=tuple(args.bg_channels),
+        pres_hidden=args.pres_hidden,
+        pres_depth=args.pres_depth,
+        pres_image_attn=args.pres_image_attn,
+        slot_competing_cross=args.slot_competing_cross,
+        anchor_slots=args.anchor_slots,
+        use_slot_attention=args.use_slot_attention,
+        use_neural_em=args.use_neural_em,
+        use_isa=args.use_isa,
+        isa_abs_pe_weight=args.isa_abs_pe_weight,
+        isa_anchor_init=args.isa_anchor_init,
+        anchor_init_fixed=args.anchor_init_fixed,
+        z_what_init_std=args.z_what_init_std,
+        nem_attn_temp=args.nem_attn_temp,
+        nem_use_bg_slot=args.nem_use_bg_slot,
     )
     model = SlotVideoModel(cfg=model_cfg)
     batch_fn, _ = build_sim(args.sim)
@@ -79,20 +115,38 @@ def main():
     batch = batch_fn(key, args.batch)
     batch = slice_to_model(batch, n_max)
 
-    forward = jax.jit(lambda v, k: model.apply(params, v, k))
+    boot0 = batch.z_where[:, 0] if args.savi_bootstrap else None
+
+    @jax.jit
+    def forward(v, k, b):
+        return model.apply(params, v, k, bootstrap_zwhere0=b)
+
     keys = jax.random.split(key, args.batch)
-    outs = jax.vmap(forward)(batch.video, keys)
+    in_axes = (0, 0, 0 if boot0 is not None else None)
+    outs = jax.vmap(forward, in_axes=in_axes)(batch.video, keys, boot0)
 
     # Recon metrics
     psnr_vals = [psnr(outs.composite[i], batch.video[i]) for i in range(args.batch)]
     ssim_vals = [ssim_simple(outs.composite[i], batch.video[i]) for i in range(args.batch)]
 
-    # Seg IoU
+    # FG-ARI (primary segmentation metric — Locatello 2020 / SAVi standard).
+    pred_masks_np = np.asarray(outs.masks_pred)
+    gt_masks_np = np.asarray(batch.masks)
+    gt_pres_np = np.asarray(batch.z_pres)
+    ari_vals = []
+    for i in range(args.batch):
+        v = fg_ari(pred_masks_np[i], gt_masks_np[i], gt_pres_np[i])
+        if v == v:  # skip NaN
+            ari_vals.append(v)
+
+    # Legacy matched-seg-IoU (kept for continuity; see memory feedback-metric-fg-ari).
     iou_vals = []
     for i in range(args.batch):
         v = matched_seg_iou(
             outs.z_where[i], outs.masks_pred[i],
             batch.z_where[i], batch.masks[i], batch.z_pres[i],
+            pred_pres=outs.z_pres[i],
+            hard_pres_gate=args.hard_pres_gate,
         )
         iou_vals.append(float(v))
 
@@ -122,7 +176,8 @@ def main():
         "sim": args.sim,
         "psnr": float(np.mean(psnr_vals)),
         "ssim": float(np.mean(ssim_vals)),
-        "seg_iou": float(np.mean(iou_vals)),
+        "fg_ari": float(np.mean(ari_vals)) if ari_vals else float("nan"),
+        "seg_iou_legacy": float(np.mean(iou_vals)),
         "silhouette_zwhat": silhouette,
         "linear_probe_r2_zwhere_from_zwhat": probe_r2,
         "id_switches_total": id_switches,

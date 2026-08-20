@@ -2,9 +2,357 @@
 
 Running log of what we've tried and what we learned. Newest at the top.
 
+---
+
+## 2026-08-18 (evening) — session: literature-inspired architectures + sim2real adaptation
+
+### Exp 25: NEM iter-state GRU bug fix (headline result)
+
+Found a real bug in `sim2real/model/neural_em.py`: the refiner's GRU was always called with
+`prev_z_what` (frame-boundary carry) as cell state, resetting each iteration. Only the last
+iteration's `what_pre` mattered. Fixed to use the current-iteration state, matching Locatello
+Slot Attention 2020. Also added residual MLP after the GRU (Locatello has it, we didn't).
+Same fix applied to `sim2real/model/isa.py`.
+
+Result on `many_cells_fast` (64×64 × 2 frames, 15 cells) at 100k, unsupervised (no bootstrap):
+
+| metric | orig NEM 50k | fixed NEM 50k | fixed NEM 100k |
+|---|---|---|---|
+| FG-ARI | 0.669 | 0.670 | **0.710** |
+| IoU (legacy) | 0.185 | 0.220 | **0.251** |
+| SSIM | 0.438 | 0.450 | 0.508 |
+| PSNR | 20.69 | 20.80 | 21.31 |
+| Switch rate | 0.061 | 0.073 | **0.041** |
+| Silhouette z_what | 0.49 | 0.55 | 0.51 |
+
+Params went from 428k to 505k (added residual MLP). Fixed NEM 100k is the strongest fully
+unsupervised ckpt to date. Ckpt: `runs/nem_fixed_100k/ckpts/step_100000.pkl`.
+
+### Exp 26: ISA (Invariant Slot Attention, Biza et al 2302.04973)
+
+Implemented per-slot equivariant PE (pixel offsets in rotated + scaled slot frame). Three
+ablations at 10k on `many_cells_fast`:
+
+| variant | FG-ARI | where loss | notes |
+|---|---|---|---|
+| base | 0.509 | 0.120 | plateau at 5k |
+| n_iters=7 | 0.437 | 5.25 | grad explosion, gnorm 91M |
+| anchor init | 0.547 | 0.119 | marginal |
+| abs_pe=0.1 | 0.518 | 0.124 | marginal |
+
+All hit same ~0.55 ceiling — ISA has an attention-vs-pose chicken-and-egg failure that small
+tweaks don't fix. Ruled out for this platform.
+
+### Exp 27: Unsupervised sim2real adaptation (many_cells_fast → many_cells_fast_small, 40% smaller cells)
+
+Zero-shot transfer of fixed NEM 100k: FG-ARI 0.71 → **0.65** (preserved 92%), silhouette 0.55
+preserved. Pred masks correct positions but wrong (too big) scale — archetypal adapt setup.
+
+Adaptation attempts:
+- **Pixel MSE @ LR≥1e-5**: collapse in 500 steps (STN opt-out — model outputs bg to minimize MSE)
+- **Pixel MSE @ LR=5e-6, 10k steps**: preserves but no adaptation
+- **Pixel MSE @ LR=1e-6, 10k steps**: still slowly collapses
+- **Freeze more layers**: doesn't help (encoder alone drives collapse)
+- **Anti-collapse penalty on mean(z_pres)**: z_pres stays high but decoder finds other shortcut
+- **DINOSAUR-lite (feat-recon)**: implemented `sim2real/losses/feat_recon.py`. Two-phase
+  (warm feat_decoder first, then unfreeze encoder). Result: silhouette CLIMBS (0.55 → 0.64)
+  but FG-ARI DEGRADES (0.65 → 0.34). Latents become more distinct but no longer aligned
+  with cell positions.
+- **Combined pixel + feat @ 15k steps**: stabilizes but doesn't recover geometry (silhouette
+  0.63, FG-ARI 0.34, IoU 0.017).
+
+**Diagnosis**: STN + z_pres architecture allows too many "opt-out" solutions. Feat-recon
+prevents the fully-collapse-to-bg failure but doesn't anchor z_where to actual cell locations.
+See memory `project_adaptation_stn_optout.md`. Future work: z_where drift penalty (needs
+frozen model copy) or Locatello alpha-softmax composition (architectural).
+
+
+
 **Held-out eval metrics** are computed by the in-loop eval hook on a fixed 4-video batch sampled at `eval_seed=424242`. Metrics: pixel MSE, PSNR, SSIM, matched IoU (Hungarian on `z_where`), and silhouette score on `z_what` clustered by GT slot identity. Silhouette ranges [-1, 1] — negative means slots for different cells are closer in `z_what` space than slots for the same cell (anti-clustered).
 
 **Historical baseline** (`runs/unified_many_cells_v2`, 100k steps, June 2026): PSNR 24.16, SSIM 0.52, IoU 0.127, silhouette -0.034, id_switches 363.
+
+---
+
+## 2026-08-13 to 2026-08-16 — session: architectural changes
+
+### Exp 23: `slot_attention_test` — proper iterative Slot Attention (Locatello 2020) on easy_cells @ 100k
+
+Full arch swap: replace DETR-style `SlotTransformer` with `SlotAttentionStack` (softmax-over-slots
++ value normalization + GRU update + 3 shared-weight iterations, SAVi-style recurrent carry).
+Kept everything else: encoder, per-slot heads, glimpse decoder, Hungarian, all losses.
+`--lambda-aux 0.0` (no per-layer intermediate outputs in SA).
+
+Result @ 100k, easy_cells (4 large cells, uniform bg):
+
+| metric | baseline (DETR-style) | SA | Δ |
+|---|---|---|---|
+| IoU | 0.268 | 0.246 | -0.022 |
+| silhouette | 0.645 | 0.648 | +0.003 |
+| PSNR | 23.78 | 23.80 | ≈ |
+| SSIM | 0.685 | 0.700 | +0.015 |
+| linear_probe R² (z_what → z_where) | 0.832 | **0.860** | **+0.028** |
+| id_switches | 70 | 87 | +17 |
+
+**No headline IoU improvement.** Adjacency-merging pathology visible in renders unchanged from
+baseline. The one real signal: linear_probe R² jumped +0.028 — z_what more strongly predicts
+z_where, suggesting SA produces cleaner internal representations even though the downstream
+z_where head can't fully exploit it. Fewer params (280k SA vs 1.6M DETR-style) at same
+compute-per-step budget.
+
+**Why SA didn't fix the failure mode**: SA attacks slot-vs-slot competition WITHIN a forward
+pass, but the diagnosed failure (permutation-averaged gradient on the learned per-slot init
+`slot_init_bias`) is upstream — it's about the learnable per-slot state, not the attention
+pattern. The two problems are orthogonal.
+
+Also broken during this run: three_fixes queue killed after A finished, so B_savi and C_anchor
+never ran. Queued in overnight_v2.
+
+Files touched: `sim2real/model/slot_attention.py` (new module), `sim2real/model/slot_transformer.py`
+(routing), `sim2real/model/model.py` (config), `sim2real/scripts/*.py` (CLI flags).
+Run dir: `runs/slot_attention_test/`, saved copy at `runs/slot_attention_test_saved/`.
+
+### Exp 24: `overnight_v2` — cross-product of SA + SAVi-bootstrap + anchor-slots on easy_cells
+
+Five 100k runs on easy_cells (4 large well-separated cells) exploring combinations of three
+noise/local-min fixes:
+
+| run | IoU | silhouette | PSNR | linprobe R² | id_switches |
+|---|---|---|---|---|---|
+| baseline (DETR) | 0.268 | 0.645 | 23.78 | 0.832 | 70 |
+| SA alone | 0.246 | 0.648 | 23.80 | **0.860** | 87 |
+| detr + savi | 0.247 | 0.614 | 24.25 | 0.447 | 84 |
+| detr + anchor | 0.261 | 0.665 | 24.18 | 0.719 | 66 |
+| sa + savi | 0.237 | 0.678 | 24.18 | 0.726 | 58 |
+| sa + anchor | 0.245 | 0.642 | 23.80 | — | **47** |
+| **sa + savi + anchor** | **0.270** | **0.707** | **24.78** | — | 65 |
+
+**All-three combo is the first thing to match/beat baseline on IoU AND improve silhouette + PSNR
+meaningfully.** The three fixes stack: SA (arch competition) + savi (init anchoring per video) +
+anchor (fixed spatial slot identity) address orthogonal issues. But even at best, IoU 0.270 on
+easy_cells is still bounded — none of the runs crossed 0.28.
+
+**In-loop eval bug detected**: SAVi-bootstrap runs showed spuriously low in-loop eval numbers
+(IoU 0.09-0.10 mid-training) but post-hoc eval_ckpt gave normal numbers (~0.24-0.27). Root
+cause: eval hook applies bootstrap but the model may have been trained to depend on bootstrap
+in a way the in-loop eval breaks. Post-hoc numbers are the ones to trust.
+
+Run dir: `runs/overnight_v2/`.
+
+### Exp 25: `overnight_v3` — density and scale tests
+
+Three follow-up runs after v2's ceiling finding on easy_cells:
+
+| run | IoU | silhouette | PSNR | id_switches |
+|---|---|---|---|---|
+| two_cells_baseline | 0.308 | 0.652 | 27.66 | 20 |
+| two_cells_sa | 0.283 | 0.629 | 28.47 | 45 |
+| **many_sa_anchor** | **0.212** | **0.709** | 22.30 | 549 |
+
+**Density-dependence is real but weak.** 2 cells: IoU 0.31, 4 cells: 0.27, 25 cells: 0.19-0.21.
+Ceiling scales but slowly with density — arch has a per-cell mask overlap floor around 0.25-0.30
+regardless of scene complexity.
+
+**many_cells finding: SA+anchor is a real win on the harder task.** many_sa_anchor at 100k gets
+IoU 0.212, beating Exp 14 baseline at 100k (0.171) by **+0.041** AND matching Exp 14 at 200k
+(0.184) by **+0.028**. So on many_cells the arch changes actually help. id_switches jumped to 549
+(much worse than Exp 14's ~40 at 200k) — tracking regressed even as IoU improved. Trade-off.
+
+Run dir: `runs/overnight_v3/`. Follow-up queue (`overnight_v4`): add savi_bootstrap on top,
+extend winning combo to 200k.
+
+### Exp 26: `overnight_v4` — extend the winner on many_cells
+
+Two follow-ups on the many_sa_anchor promising result from Exp 25:
+
+| run | IoU | silhouette | PSNR | id_switches |
+|---|---|---|---|---|
+| many_sa_anchor (Exp 25, 100k) | 0.212 | 0.709 | 22.30 | 549 |
+| many_sa_anchor_savi (100k, +savi) | 0.215 | 0.726 | 22.41 | 594 |
+| **many_sa_anchor_long (200k)** | **0.226** | **0.738** | 22.35 | 546 |
+
+Comparisons:
+- **vs Exp 14 baseline @ 200k (IoU 0.184)**: **+0.042 IoU (23% relative improvement)**, silhouette tied (0.738 vs 0.732), tracking meaningfully worse (546 vs ~40 id_switches).
+- **vs many_sa_anchor @ 100k**: +0.014 IoU with 2x compute — plateauing.
+
+**Load-bearing conclusion (session summary)**: SA (proper iterative Slot Attention) combined with
+anchor-based slot queries is the first architectural change to meaningfully improve IoU on
+many_cells (+0.042 vs baseline at 200k). Adding SAVi-bootstrap on top yields marginal silhouette
+gain but no IoU. Density-dependence weak (2 cells 0.31, 4 cells 0.27, 25 cells 0.23) —
+per-cell mask overlap ceiling ~0.25-0.30 regardless of scene.
+
+**Trade-off**: id_switches jumped ~10x vs Exp 14. Tracking got much worse even as detection
+improved. Consistent with the "SA competition + anchor" combo producing more crisp per-slot
+detection but weaker temporal identity binding — the Hungarian matching at eval must reshuffle
+slots more frequently.
+
+Run dir: `runs/overnight_v4/many_sa_anchor_long/`.
+
+---
+
+## 2026-08-12 — session: try harder — decoupling, curriculum, scale
+
+### Exp 18: `scale_up_test` — 2× d_model + 2× layers, Exp 14 losses, 100k many_cells
+
+Tests whether the plateau at IoU 0.184 (Exp 14 many_cells, 200k) is a capacity bottleneck. Bumped `d_model 128 → 256` and `n_transformer_layers 3 → 6`, kept everything else at Exp 14 baseline (plain BCE, n_max=48, no focal, no match-pres). ~2.75h wall.
+
+Final (step 100k):
+
+| metric | Exp 14 @ 200k | Exp 14 @ 100k | Scale-up @ 100k |
+|---|---|---|---|
+| IoU | 0.184 | 0.171 | 0.163 |
+| silhouette | 0.732 | 0.661 | **0.745** |
+| PSNR | 22.98 | 22.34 | 22.77 |
+| SSIM | 0.30 | 0.25 | 0.255 |
+| id_switches | ~40 | (n/a) | 342 |
+
+**Reading:** bigger model **improved silhouette meaningfully** (+0.08 vs Exp 14 at same 100k step count) but **slightly regressed IoU** (-0.008). Half-win on capacity. The consistent picture with the earlier pres-diagnosis: **more capacity helps z_what discrimination (silhouette) but doesn't fix z_pres discrimination (which caps IoU and drives id_switches)**. Scaling isn't the missing piece for the pres classifier — that's structural.
+
+`L_pres` stayed at 0.42 throughout (same marginal-minimum floor as small-model Exp 14). id_switches 342 vs 40 is a big regression, consistent with more capacity → more diverse slot representations → more matchable-to-many-cells → more per-frame switches (eval uses per-frame matching).
+
+Full trajectory shows continued climb (44k → 100k: IoU 0.134 → 0.163). Extrapolating to 200k would land near IoU 0.185 — matching but not beating Exp 14. **Capacity alone is not the bottleneck for IoU; other interventions are needed.**
+
+Script: `scripts/scale_up_test.sh`. Run dir: `runs/scale_up_test`.
+
+### Exp 19: `sg1_stopgrad` — stop_gradient on z_what along the recon composite path (many_cells, 100k)
+
+Added `stop_grad_recon_zwhat` config to `model.py`: the decoder is called twice per slot, one with gradient (feeds L_appear_glimpse / L_mask_glimpse) and one with `stop_gradient(zwhat)` (feeds the composite). Recognition (z_what content) is trained only by supervised losses; composite recon trains only decoder weights, not the slot-transformer producing z_what. Small model, Exp 14 losses otherwise. ~2h wall (stop_grad adds ~50% overhead from second decoder call).
+
+| metric | Exp 14 @ 100k | Scale-up @ 100k | **SG1 @ 100k** |
+|---|---|---|---|
+| IoU | 0.171 | 0.163 | 0.159 |
+| silhouette | 0.661 | 0.745 | **0.735** |
+| PSNR | 22.34 | 22.77 | 22.77 |
+| SSIM | 0.25 | 0.255 | 0.258 |
+| id_switches | (n/a) | 342 | 372 |
+
+**Reading:** the decoupling helped silhouette (+0.07) matching what scale-up did — z_what is cleaner when recon can't corrupt it. Slight IoU regression (-0.012). id_switches worse (much more than Exp 14's ~40, similar to scale-up's 342). Tradeoff: cleaner z_what at the cost of losing implicit recon-→-z_where feedback that was helping the matcher.
+
+**Not a clean win — silhouette-improvement territory only.** Combining with density curriculum (SG3) may yield more; capacity was already handled by scale-up, and stop_grad seems to do a subset of what capacity does.
+
+Files touched: `sim2real/model/model.py` (new `stop_grad_recon_zwhat` in ModelConfig, two-decoder-call in `_per_slot_head`), `sim2real/scripts/pretrain.py` (`--stop-grad-zwhat` flag). Run dir: `runs/overnight/sg1_stopgrad`.
+
+### Exp 20: `sg2_density` — density curriculum n_objects 10→20→30→40 at steps 0/25k/50k/75k (many_cells, 100k)
+
+Small model, Exp 14 losses otherwise. Trainer swaps `SimBatcher` at each schedule boundary; eval batcher stays at n_objects=40. ~2h wall (batcher rebuilds + JIT recompile at each boundary).
+
+| metric | Exp 14 @ 100k | Scale @ 100k | SG1 @ 100k | **SG2 @ 100k** |
+|---|---|---|---|---|
+| IoU | 0.171 | 0.163 | 0.159 | **0.147** |
+| silhouette | 0.661 | 0.745 | 0.735 | 0.699 |
+| PSNR | 22.34 | 22.77 | 22.77 | 22.66 |
+| id_switches | (n/a) | 342 | 372 | 358 |
+
+**Reading: curriculum hurt IoU (-0.024 vs Exp 14) with a modest silhouette bump (+0.04).** The intuition — "solve fewer objects first, then scale up" — didn't pay off in this configuration. Probable reasons:
+
+1. **Final density arrived too late.** The 25k steps at n_obj=40 (75k→100k) is not enough to catch up with a model that saw n_obj=40 from step 0.
+2. **Catastrophic-forgetting-adjacent dynamics.** Each curriculum step-up is a distribution shift; the model has to relearn dense-scene behavior it never saw. Silhouette-mid-training analysis showed a drop right at the 50k transition (n=20 → n=30).
+3. **Match-once curriculum triggered at step 500** on the *easy* task (n_obj=10) may have locked in weak identity assignments.
+
+The curriculum axis may still be worth pursuing with different schedules — smoother ramp, or `n_obj` as a batch-level random variable (data augmentation rather than curriculum). Not doing that automatically without user direction.
+
+Files touched: `sim2real/train/pretrain.py` (`density_curriculum` field on PretrainConfig, batcher-swap logic), `sim2real/scripts/pretrain.py` (`--density-curriculum` flag). Run dir: `runs/overnight/sg2_density`.
+
+### Exp 21: `sg3_both` — stop_grad_zwhat + density curriculum (many_cells, 100k)
+
+Combine SG1 + SG2. Same small model, Exp 14 losses otherwise. ~2h wall.
+
+| metric | Exp 14 | Scale | SG1 (stop_grad) | SG2 (density) | **SG3 (both)** |
+|---|---|---|---|---|---|
+| IoU | 0.171 | 0.163 | 0.159 | 0.147 | **0.152** |
+| silhouette | 0.661 | 0.745 | 0.735 | 0.699 | **0.717** |
+| PSNR | 22.34 | 22.77 | 22.77 | 22.66 | 22.66 |
+| SSIM | 0.25 | 0.255 | 0.258 | 0.233 | 0.232 |
+| id_switches | (~40 @ 200k) | 342 | 372 | 358 | 381 |
+
+**Reading: no synergy.** SG3 lands between SG1 and SG2 on every metric — neither intervention amplifies the other. The mid-training silhouette drop from the density curriculum (0.72 → 0.38 at n_obj=30 boundary) recovered by the final 25k steps, matching SG2's shape. Overall the combination is worse than the Exp 14 baseline on IoU (-0.019).
+
+**Conclusion so far (through Exp 21):** None of stop_grad, density curriculum, or their combination improved IoU vs Exp 14. All improved silhouette (+0.04 to +0.08). None fixed id_switches. Consistent story with pres-diagnosis: **the pres classifier is the remaining IoU cap and none of these interventions touch it.**
+
+Run dir: `runs/overnight/sg3_both`.
+
+### Exp 22: `sg4_both_scaled` — stop_grad_zwhat + density curriculum + 2× d_model + 2× layers (many_cells, 100k)
+
+All previous interventions combined with the scale-up. ~3.2h wall. Completed 01:53 the next day.
+
+**Full overnight comparison (all at 100k on many_cells, except Exp 14 baseline at 200k):**
+
+| metric | Exp 14 @ 200k | Exp 14 @ 100k | Scale (18) | SG1 stop_grad (19) | SG2 density (20) | SG3 both (21) | **SG4 all+scale (22)** |
+|---|---|---|---|---|---|---|---|
+| IoU | **0.184** | 0.171 | 0.163 | 0.159 | 0.147 | 0.152 | 0.150 |
+| silhouette | 0.732 | 0.661 | **0.745** | 0.735 | 0.699 | 0.717 | 0.738 |
+| PSNR | 22.98 | 22.34 | 22.77 | 22.77 | 22.66 | 22.66 | 22.69 |
+| SSIM | 0.30 | 0.25 | 0.255 | 0.258 | 0.233 | 0.232 | 0.236 |
+| id_switches | ~40 | (n/a) | 342 | 372 | 358 | 381 | **273** |
+
+**Overnight summary:**
+
+1. **Nothing beat Exp 14 on IoU** at matched (100k) compute. All new experiments regressed IoU by 0.01-0.02.
+2. **All interventions improved silhouette** vs Exp 14 baseline at same compute (+0.04 to +0.08). Scale-up (Exp 18) had the biggest silhouette bump.
+3. **SG4 wins on id_switches** among all 100k runs (273 vs 342-381), but still 6× worse than Exp 14 at 200k.
+4. **No synergy between interventions.** SG3 ≈ average of SG1 and SG2. SG4 ≈ SG3 (adding scale on top of both didn't add much).
+5. **Consistent pattern**: silhouette (z_what quality) is capacity-limited and improves with capacity or decoupling. IoU (which is dominated by z_where placement + z_pres alive/dead) is *not* helped by these interventions. Nothing here touched the z_pres marginal-minimum problem.
+
+**Verdict**: cheap architectural fixes (stop_grad, curriculum) don't unblock IoU on this sim. The remaining ceiling appears to sit on the pres discrimination problem, which needs a structural change (separate recognition head with its own capacity, or a different loss shape). Also plausible: **more training time** — Exp 14 climbed from 100k=0.171 to 200k=0.184; scale-up trajectory suggested continued climb past 100k; SG1-4 all stopped at 100k. A 200k rerun of SG4 or scale-up would tell us if any of them eventually cross 0.184.
+
+Run dirs: `runs/overnight/{sg1_stopgrad, sg2_density, sg3_both, sg4_both_scaled}`. Runner: `scripts/overnight_queue.sh`.
+
+---
+
+## 2026-08-11 — session: diagnose the many_cells plateau
+
+### Exp 15–17: `pres_smooth_test`, `pres_focal_test`, `pres_detr_test` — z_pres degeneracy attack (many_cells, 10k steps each)
+
+### Exp 15–17: `pres_smooth_test`, `pres_focal_test`, `pres_detr_test` — z_pres degeneracy attack (many_cells, 10k steps each)
+
+**Motivating diagnosis (probe of Exp 14 many_cells @ step 200k on eval seed 424242):**
+
+At the 200k plateau, the pres classifier had converged to a **degenerate marginal-prediction minimum**:
+
+```
+z_pres logits @ GT=1 (alive) medians: 1.79   sigmoid 0.86
+z_pres logits @ GT=0 (dead)  medians: 1.66   sigmoid 0.84   <-- statistically indistinguishable
+```
+
+Pred count (39.6 avg) matched GT count (40) only because we hit the class-marginal — the classifier itself was not identifying alive from dead. BCE was floored at 0.40, matching the algebraic BCE minimum of always-predicting-p≈0.85 with 40:8 class ratio. Additionally observed: **eval-time Gumbel-sigmoid noise** (`heads.py:61`) explains the "mask flicker" in the viz — the underlying logit sequence per slot is actually near-constant (variance 0.003), but Gumbel at eval samples in and out of the alive threshold.
+
+**Exp 15 — Add temporal-smoothness prior on z_pres.**
+`L_pres_smooth = MSE(sigmoid(logit)[t+1], sigmoid(logit)[t])`, weight 2.0. Also bumped `--lambda-pres 1 → 5`.
+
+Result at 10k: `L_pres_smooth → 0.0001` (trivially satisfied), but `L_pres` still 0.44, logit distributions still overlapping. **Fix targeted the wrong thing** — logits were already temporally stable. The flicker is 100% Gumbel-at-eval, not model instability. IoU 0.102, silhouette 0.71.
+
+**Exp 16 — Focal BCE on z_pres.** `--pres-focal-gamma 2.0 --pres-focal-alpha 0.25` (upweight the dead-slot minority class).
+
+Result at 10k: BCE dropped **0.44 → 0.05**, logit range collapsed from ~[0.6, 3.1] to ~[-0.1, 0.8], median alive/dead 0.21/0.20. Marginal-minimum escaped, but landed in a **second degenerate minimum** where focal's `(1-pt)^γ` modulator flattens gradient with everything near sigmoid(0.2)≈0.55. Recall on dead slots was 17% (TN=67 / (TN+FP)=384). IoU 0.112, silhouette 0.74.
+
+**Exp 17 — DETR-style triple fix.** Per Carion et al. 2020 §3.1 eq. (2), §4:
+1. Raise n_max 48 → **96** (ManyCellsConfig.n_max also bumped from 64 to 96). Positive fraction becomes 42% instead of 83% — real class imbalance now exists.
+2. Flip focal `α 0.25 → 0.75` (upweight positives = now-minority class, mirroring DETR's 10× down-weight of the majority ∅ class).
+3. Add `--match-pres-weight 2.0`: DETR-style `-w·p̂_pres(i)` term in the Hungarian cost on alive GT columns (matcher prefers confident-alive predictions for alive GTs).
+
+Files touched: `sim2real/losses/matching.py` (optional pres term in `build_cost_zwhere`/`hungarian_per_frame`), `sim2real/losses/losses.py` (`match_pres_weight` config), `sim2real/losses/supervised.py` (focal args in `bce_from_logits`), `sim2real/sim/configs.py` (ManyCellsConfig n_max 64 → 96), `sim2real/scripts/pretrain.py` (three CLI flags).
+
+Result at 10k:
+
+| metric              | Exp 15 (smooth) | Exp 16 (focal) | Exp 17 (DETR) |
+|---------------------|-----------------|----------------|---------------|
+| L_pres              | 0.44            | 0.05           | 0.03          |
+| IoU                 | 0.102           | 0.112          | 0.103         |
+| silhouette          | 0.711           | 0.745          | 0.719         |
+| **id_switches**     | 283             | 278            | **1628**      |
+| PSNR                | 22.27           | 22.32          | 22.34         |
+| logit range (alive) | [0.6, 3.1]      | [-0.1, 0.8]    | [-6.4, 1.1]   |
+| logit medians a/d   | 1.79 / 1.66     | 0.21 / 0.20    | 0.46 / 0.47   |
+| hard-thresh acc     | 0.83 (marginal) | 0.73           | 0.47          |
+| always-pos baseline | 0.83            | 0.83           | 0.42          |
+
+**Interpretation.** DETR-style setup *did* break the marginal floor — the logit range is now [-6, +1] with genuine bimodal structure, not collapsed near 0 like focal-only. But **discrimination did not follow**: alive vs dead percentiles are essentially identical (medians 0.46 vs 0.47), so the model has learned to be confidently wrong. Hard-threshold accuracy 47% vs always-positive baseline 42% — barely above chance.
+
+**id_switches regressed 5.8×** (283 → 1628) because eval computes id-switch with per-frame matching over 96 slots vs 48 — twice as many slots to reshuffle.
+
+Bottom line: the three-fix attempt validated that the problem is *not* loss shape or class imbalance alone. It's a **representational** issue — the pres head can't extract "does my slot correspond to a real cell" from the current slot-query features at any weighting we've tried. Candidate next directions (not tried yet): (a) turn off eval-time Gumbel to get clean predictions, (b) longer training now that the harder n_max=96 task might have finally had gradient to work with, (c) surgery on the slot-query → pres pathway (e.g. use attention-weight statistics as auxiliary features).
+
+Run dirs: `runs/pres_smooth_test`, `runs/pres_focal_test`, `runs/pres_detr_test`. Scripts: `scripts/pres_smooth_test.sh`, `scripts/pres_focal_test.sh`, `scripts/pres_detr_test.sh`.
 
 ---
 

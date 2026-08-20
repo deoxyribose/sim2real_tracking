@@ -107,9 +107,12 @@ def gaussian_blob_mask(res: int, cx: float, cy: float, sigma: float) -> Array:
     return gaussian_blob(xx, yy, cx, cy, sigma)
 
 
-def perlin_grayscale_bg(key: jax.Array, res: int, channels: int = 1) -> Array:
+def perlin_grayscale_bg(
+    key: jax.Array, res: int, channels: int = 1,
+    contrast: float = 0.3, baseline: float = 0.5,
+) -> Array:
     """Generate a grayscale background with shape (res, res, channels)."""
-    g = perlin_background(key, res)
+    g = perlin_background(key, res, contrast=contrast, baseline=baseline)
     if channels == 1:
         return g[..., None]
     return jnp.broadcast_to(g[..., None], (res, res, channels))

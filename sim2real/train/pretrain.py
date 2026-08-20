@@ -39,6 +39,10 @@ class PretrainConfig:
     lr_peak: float = 1e-4
     warmup_steps: int = 200
     grad_clip: float = 1.0
+    # Gradient accumulation: multiplies effective batch size while keeping per-step memory
+    # constant. `grad_accum_steps > 1` wraps the optimizer in optax.MultiSteps, applying
+    # updates every N micro-steps. Micro-batches are still sampled independently.
+    grad_accum_steps: int = 1
     log_every: int = 25
     ckpt_every: int = 500
     run_dir: str = "runs/pretrain"
@@ -63,39 +67,44 @@ class PretrainConfig:
     # rebuilding train_step (one JIT recompile). Lets z_where descend under per-frame matching
     # first, then locks in temporal identity via match-once.
     match_once_after: int = 0
+    # Density curriculum on many_cells: ramp n_objects 10 -> 20 -> 30 -> 40 at
+    # steps 0, 25k, 50k, 75k. Rebuilds training batcher at each step; eval batcher stays fixed.
+    density_curriculum: bool = False
+    # SAVi-style bootstrap: pass GT z_where[0] to model as initial slot positions per video.
+    # Anchors slot identity to a specific scene, avoiding centroid collapse from
+    # inter-video permutation noise on learnable queries. Used at both train and eval.
+    savi_bootstrap: bool = False
 
 
 def train_step_factory(model, loss_cfg, prior_cfg, optimizer,
-                       teacher_force_zwhere=False, teacher_force_zpres=False):
+                       teacher_force_zwhere=False, teacher_force_zpres=False,
+                       savi_bootstrap=False):
     """Build a jitted train_step closure.
 
     teacher_force_*: if True, pass the corresponding GT tensors from the batch into model.apply,
     so the residual anchor / discover gate / STN read are anchored on GT slot data while the
     predicted latents are still produced and supervised by the losses.
+    savi_bootstrap: if True, pass GT z_where[:, 0] as bootstrap_zwhere0 so per-video slot init
+    is anchored to that scene's frame-0 positions (removes inter-video permutation randomness).
     """
-
-    def model_forward_one(params, video, key, t_zw, t_zp, boot0):
-        return model.apply(params, video, key,
-                           teacher_zwhere=t_zw, teacher_zpres=t_zp,
-                           bootstrap_zwhere0=boot0)
 
     def loss_fn(params, batch, key):
         keys = jax.random.split(key, batch.video.shape[0])
         t_zw = batch.z_where if teacher_force_zwhere else None
         t_zp = batch.z_pres if teacher_force_zpres else None
-        # No SAVi bootstrap: model must learn its own z_where_init and residual head dynamics.
+        boot0 = batch.z_where[:, 0] if savi_bootstrap else None
 
-        def fwd_one(v, k, t_zw_i, t_zp_i):
-            return model_forward_one(params, v, k, t_zw_i, t_zp_i, None)
+        def fwd_one(v, k, t_zw_i, t_zp_i, boot0_i):
+            return model.apply(params, v, k, teacher_zwhere=t_zw_i,
+                               teacher_zpres=t_zp_i, bootstrap_zwhere0=boot0_i)
 
-        if t_zw is None and t_zp is None:
-            outs = jax.vmap(lambda v, k: fwd_one(v, k, None, None))(batch.video, keys)
-        elif t_zw is not None and t_zp is None:
-            outs = jax.vmap(lambda v, k, z: fwd_one(v, k, z, None))(batch.video, keys, t_zw)
-        elif t_zw is None and t_zp is not None:
-            outs = jax.vmap(lambda v, k, p: fwd_one(v, k, None, p))(batch.video, keys, t_zp)
-        else:
-            outs = jax.vmap(lambda v, k, z, p: fwd_one(v, k, z, p))(batch.video, keys, t_zw, t_zp)
+        # General vmap dispatch: per-video args pass with axis 0; None args broadcast.
+        in_axes = [0, 0]
+        args = [batch.video, keys]
+        for x in [t_zw, t_zp, boot0]:
+            in_axes.append(0 if x is not None else None)
+            args.append(x)
+        outs = jax.vmap(fwd_one, in_axes=tuple(in_axes))(*args)
 
         def per_video(out, smp):
             total, metrics = pretrain_loss(out, smp, loss_cfg, prior_cfg)
@@ -133,8 +142,21 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
     rng = jax.random.key(cfg.seed)
     rng, init_key, batch_key = jax.random.split(rng, 3)
 
-    # Sim
-    batcher = SimBatcher(cfg.sim_kind, cfg.batch_size, cfg.sim_cfg)
+    # Sim. If density_curriculum is on for many_cells, start at n_objects=10 and ramp up.
+    density_schedule = [(0, 10), (25_000, 20), (50_000, 30), (75_000, 40)]
+    def _batcher_for_density(n_obj: int):
+        if cfg.density_curriculum and cfg.sim_kind == "many_cells":
+            from sim2real.sim.configs import ManyCellsConfig
+            base = cfg.sim_cfg if cfg.sim_cfg is not None else ManyCellsConfig()
+            new_cfg = dataclasses.replace(base, n_objects=n_obj)
+            return SimBatcher(cfg.sim_kind, cfg.batch_size, new_cfg)
+        return SimBatcher(cfg.sim_kind, cfg.batch_size, cfg.sim_cfg)
+
+    if cfg.density_curriculum:
+        batcher = _batcher_for_density(density_schedule[0][1])
+        print(f"[density-curriculum] step 0: n_objects = {density_schedule[0][1]}", flush=True)
+    else:
+        batcher = SimBatcher(cfg.sim_kind, cfg.batch_size, cfg.sim_cfg)
     jit_sample = batcher.jit_sample()
     sample = jit_sample(batch_key)
 
@@ -166,15 +188,22 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
     optimizer, lr_schedule = adamw_cosine(
         cfg.lr_peak, cfg.n_steps, cfg.warmup_steps, grad_clip=cfg.grad_clip
     )
+    if cfg.grad_accum_steps > 1:
+        import optax as _optax
+        optimizer = _optax.MultiSteps(optimizer, every_k_schedule=cfg.grad_accum_steps)
+        print(f"gradient accumulation: {cfg.grad_accum_steps} micro-steps per optimizer update "
+              f"(effective batch size = {cfg.batch_size * cfg.grad_accum_steps})")
     opt_state = optimizer.init(params)
     train_step = train_step_factory(
         model, cfg.loss_cfg, cfg.prior_cfg, optimizer,
         teacher_force_zwhere=cfg.teacher_force_zwhere,
         teacher_force_zpres=cfg.teacher_force_zpres,
+        savi_bootstrap=cfg.savi_bootstrap,
     )
     print(
         f"teacher_force_zwhere={cfg.teacher_force_zwhere}  "
-        f"teacher_force_zpres={cfg.teacher_force_zpres}"
+        f"teacher_force_zpres={cfg.teacher_force_zpres}  "
+        f"savi_bootstrap={cfg.savi_bootstrap}"
     )
 
     logger = Logger(cfg.run_dir)
@@ -186,6 +215,7 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
     if cfg.eval_every > 0:
         from sim2real.eval.recon import psnr as _psnr, ssim_simple as _ssim
         from sim2real.eval.seg_iou import matched_seg_iou as _matched_iou
+        from sim2real.eval.fg_ari import fg_ari as _fg_ari
         from sim2real.eval.disentangle import silhouette_zwhat as _silhouette
         import numpy as _np
 
@@ -194,28 +224,43 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
         eval_batch = eval_batcher.jit_sample()(eval_key)
         eval_batch_m = slice_to_model(eval_batch)
 
+        eval_boot0 = eval_batch_m.z_where[:, 0] if cfg.savi_bootstrap else None
+
         @jax.jit
-        def _eval_forward(params_now, video, key):
+        def _eval_forward(params_now, video, key, boot0):
             keys = jax.random.split(key, video.shape[0])
-            def one(v, k):
-                return model.apply(params_now, v, k)
-            return jax.vmap(one)(video, keys)
+            def one(v, k, b):
+                return model.apply(params_now, v, k, bootstrap_zwhere0=b)
+            in_axes = (0, 0, 0 if boot0 is not None else None)
+            return jax.vmap(one, in_axes=in_axes)(video, keys, boot0)
         eval_forward = _eval_forward
 
         def run_eval(params_now, step):
             k = jax.random.key(cfg.eval_seed + step)
-            outs = eval_forward(params_now, eval_batch_m.video, k)
+            outs = eval_forward(params_now, eval_batch_m.video, k, eval_boot0)
             # Recon
             mse = float(jnp.mean((outs.composite - eval_batch_m.video) ** 2))
             psnr_val = float(_np.mean([_psnr(outs.composite[i], eval_batch_m.video[i])
                                        for i in range(cfg.eval_batch_size)]))
             ssim_val = float(_np.mean([_ssim(outs.composite[i], eval_batch_m.video[i])
                                        for i in range(cfg.eval_batch_size)]))
-            # Seg IoU (Hungarian per-sample, host-side)
+            # FG-ARI (primary segmentation metric — Locatello 2020 / SAVi standard).
+            pred_masks_np = _np.asarray(outs.masks_pred)
+            gt_masks_np = _np.asarray(eval_batch_m.masks)
+            gt_pres_np = _np.asarray(eval_batch_m.z_pres)
+            ari_per = [
+                _fg_ari(pred_masks_np[i], gt_masks_np[i], gt_pres_np[i])
+                for i in range(cfg.eval_batch_size)
+            ]
+            ari_per = [v for v in ari_per if v == v]  # drop NaN
+            ari_val = float(_np.mean(ari_per)) if ari_per else float("nan")
+            # Legacy matched-seg-IoU (kept for continuity; see memory feedback-metric-fg-ari).
             iou_val = float(_np.mean([
                 float(_matched_iou(
                     outs.z_where[i], outs.masks_pred[i],
                     eval_batch_m.z_where[i], eval_batch_m.masks[i], eval_batch_m.z_pres[i],
+                    pred_pres=outs.z_pres[i],
+                    hard_pres_gate=cfg.loss_cfg.hard_pres_gate,
                 )) for i in range(cfg.eval_batch_size)
             ]))
             # Silhouette on z_what (slot index = identity)
@@ -228,11 +273,13 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
             logger.scalar("eval/recon_mse", mse, step)
             logger.scalar("eval/psnr", psnr_val, step)
             logger.scalar("eval/ssim", ssim_val, step)
-            logger.scalar("eval/seg_iou", iou_val, step)
+            logger.scalar("eval/fg_ari", ari_val if ari_val == ari_val else 0.0, step)
+            logger.scalar("eval/seg_iou_legacy", iou_val, step)
             logger.scalar("eval/silhouette_zwhat", float(sil) if sil == sil else 0.0, step)
             print(
                 f"[eval] step {step:6d}  recon_mse {mse:.4f}  psnr {psnr_val:.2f}  "
-                f"ssim {ssim_val:.3f}  iou {iou_val:.3f}  silhouette {sil:.3f}",
+                f"ssim {ssim_val:.3f}  fg_ari {ari_val:.3f}  iou {iou_val:.3f}  "
+                f"silhouette {sil:.3f}",
                 flush=True,
             )
     # ---------------------------------------------------
@@ -290,6 +337,15 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
             print(f"[curriculum] step {step}: T = {T_now}", flush=True)
             last_T = T_now
 
+        # Density curriculum: swap training batcher at each schedule boundary.
+        if cfg.density_curriculum:
+            for _s, _n in density_schedule:
+                if step == _s and _s > 0:
+                    batcher = _batcher_for_density(_n)
+                    jit_sample = batcher.jit_sample()
+                    print(f"[density-curriculum] step {step}: n_objects = {_n}", flush=True)
+                    break
+
         params, opt_state, loss, metrics = train_step(params, opt_state, batch_m, k_step)
         if bool(metrics["skipped_nan"] > 0.5):
             skipped_nan += 1
@@ -304,6 +360,7 @@ def train_pretrain(cfg: PretrainConfig) -> dict:
                 f"mask {float(metrics['L_mask']):.4f}  "
                 f"appearG {float(metrics.get('L_appear_glimpse', 0.0)):.4f}  "
                 f"contr {float(metrics.get('L_slot_contrast', 0.0)):.3f}  "
+                f"presT {float(metrics.get('L_pres_smooth', 0.0)):.4f}  "
                 f"gnorm {float(metrics['grad_norm']):.2f}  nan_skips {skipped_nan}  "
                 f"({elapsed:.1f}s)",
                 flush=True,
