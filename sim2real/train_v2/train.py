@@ -32,7 +32,7 @@ from sim2real.data import (
     FlagellumSimConfig, sample_scene,
 )
 from sim2real.model_v2 import (
-    DETRSlotConfig, DETRSlotModel, compute_loss, hungarian_match, pack_gt_batch,
+    DETRSlotConfig, DETRSlotModel, compute_loss, pack_gt_batch, run_matches,
 )
 
 
@@ -78,23 +78,23 @@ def create_train_state(rng, cfg: DETRSlotConfig, batch_size: int, T: int, lr: fl
 def make_train_step(model):
     """Build a jit'd train step. Takes pre-computed Hungarian matches as auxiliary input."""
 
-    def loss_fn(params, batch, match, rng):
+    GT_KEYS = ("gt_pts", "gt_width", "gt_amp", "gt_polarity", "gt_mask",
+               "gt_cell_center", "gt_cell_radius", "gt_cell_amp", "gt_cell_mask")
+
+    def loss_fn(params, batch, match_flag, match_cell, rng):
         out = model.apply(params, batch["clip"], batch["energy"], rngs={"slots": rng})
-        gt = {"gt_pts": batch["gt_pts"], "gt_width": batch["gt_width"],
-              "gt_amp": batch["gt_amp"], "gt_polarity": batch["gt_polarity"],
-              "gt_mask": batch["gt_mask"]}
-        # Rebalance: class loss weight up so slot specialization can dominate early training
-        # (before pts loss becomes meaningful).
-        losses = compute_loss(out, gt, match,
+        gt = {k: batch[k] for k in GT_KEYS}
+        losses = compute_loss(out, gt, match_flag, match_cell,
                               class_weight=10.0,
                               pts_weight=1.0, width_weight=0.5,
-                              amp_weight=0.5, polarity_weight=0.5)
+                              amp_weight=0.5, polarity_weight=0.5,
+                              cell_pos_weight=1.0, cell_radius_weight=0.5, cell_amp_weight=0.5)
         return losses["total"], (losses, out)
 
     @jax.jit
-    def train_step(state, batch, match, rng):
+    def train_step(state, batch, match_flag, match_cell, rng):
         (total, (losses, out)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            state.params, batch, match, rng)
+            state.params, batch, match_flag, match_cell, rng)
         state = state.apply_gradients(grads=grads)
         return state, losses, out
 
@@ -135,19 +135,18 @@ def train(args):
     for step in range(1, args.steps + 1):
         batch_np = sample_batch(rng_np, sim_cfg, bg_patches, args.batch_size)
 
-        # Compute matches on host using a forward-only call
+        # Compute both matches on host using a forward-only call
         key, sub = jax.random.split(key)
-        with jax.disable_jit(False):
-            out = forward_only(state.params, {k: jnp.asarray(v) for k, v in batch_np.items()}, sub)
-        match_np = hungarian_match(
-            np.asarray(out["class_logits"]),
-            np.asarray(out["pts_mean"]),
-            batch_np["gt_pts"], batch_np["gt_mask"],
-        )
-        # Full train step with match as aux
-        key, sub2 = jax.random.split(key)
         batch_jax = {k: jnp.asarray(v) for k, v in batch_np.items()}
-        state, losses, _ = train_step(state, batch_jax, jnp.asarray(match_np), sub2)
+        out = forward_only(state.params, batch_jax, sub)
+        out_np = {k: np.asarray(v) for k, v in out.items()}
+        match_flag_np, match_cell_np = run_matches(out_np, batch_np)
+        # Full train step with matches as aux
+        key, sub2 = jax.random.split(key)
+        state, losses, _ = train_step(
+            state, batch_jax,
+            jnp.asarray(match_flag_np), jnp.asarray(match_cell_np), sub2,
+        )
 
         if step % args.log_every == 0 or step == 1:
             elapsed = time.time() - t0
@@ -161,13 +160,18 @@ def train(args):
                 width=float(losses["width"]),
                 amp=float(losses["amp"]),
                 polarity=float(losses["polarity"]),
-                n_matched=float(losses["n_matched"]),
+                cell_pos=float(losses["cell_pos"]),
+                cell_rad=float(losses["cell_rad"]),
+                cell_amp=float(losses["cell_amp"]),
+                n_matched_flag=float(losses["n_matched_flag"]),
+                n_matched_cell=float(losses["n_matched_cell"]),
             )
             log.append(entry)
-            print(f"  step {step:>5}/{args.steps}  total={entry['total']:.3f}  "
-                  f"class={entry['class_']:.3f}  pts={entry['pts']:.2f}  width={entry['width']:.2f}  "
-                  f"amp={entry['amp']:.2f}  pol={entry['polarity']:.3f}  matched={entry['n_matched']:.1f}  "
-                  f"({steps_per_sec:.2f} sps, eta={eta:.0f}s)")
+            print(f"  step {step:>5}/{args.steps}  total={entry['total']:.2f}  "
+                  f"cls={entry['class_']:.2f}  pts={entry['pts']:.1f}  "
+                  f"cell_pos={entry['cell_pos']:.1f} rad={entry['cell_rad']:.1f}  "
+                  f"nf={entry['n_matched_flag']:.0f} nc={entry['n_matched_cell']:.0f}  "
+                  f"({steps_per_sec:.1f} sps, eta={eta:.0f}s)")
 
         if step % args.save_every == 0 or step == args.steps:
             ckpt_path = out_dir / f"ckpt_step_{step}.pkl"

@@ -81,6 +81,70 @@ class FlagellumHead(nn.Module):
         )
 
 
+class CellHead(nn.Module):
+    """Predict cell body params + variances per slot.
+
+    Output dict:
+      cell_center_mean:  (B, S, 2) — canonical (y, x) px
+      cell_center_log_sigma: (B, S, 2)
+      cell_radius_mean:  (B, S)  canonical px
+      cell_radius_log_sigma: (B, S)
+      cell_amp_mean:     (B, S)  canonical σ-units
+      cell_amp_log_sigma: (B, S)
+    """
+    d_ff: int = 128
+
+    @nn.compact
+    def __call__(self, slots: jnp.ndarray) -> dict:
+        B, S, D = slots.shape
+        x = nn.Dense(self.d_ff, name="fc1")(slots)
+        x = jax.nn.gelu(x)
+
+        center_mean_raw = nn.Dense(2, name="center_mean")(x)
+        center_mean = jax.nn.sigmoid(center_mean_raw) * jnp.array([CANONICAL_H, CANONICAL_W])
+        center_log_sigma = nn.Dense(2, name="center_log_sigma")(x)
+        center_log_sigma = 2.0 + 4.0 * jax.nn.tanh(center_log_sigma)   # in [-2, 6]
+
+        radius_raw = nn.Dense(1, name="radius_mean")(x)[..., 0]
+        radius_mean = 8.0 + 70.0 * jax.nn.sigmoid(radius_raw)          # in [8, 78]
+        radius_log_sigma = nn.Dense(1, name="radius_log_sigma")(x)[..., 0]
+        radius_log_sigma = 1.0 + 3.0 * jax.nn.tanh(radius_log_sigma)    # in [-2, 4]
+
+        amp_raw = nn.Dense(1, name="amp_mean")(x)[..., 0]
+        amp_mean = 2.0 + 15.0 * jax.nn.sigmoid(amp_raw)                # in [2, 17]
+        amp_log_sigma = nn.Dense(1, name="amp_log_sigma")(x)[..., 0]
+        amp_log_sigma = 1.0 + 3.0 * jax.nn.tanh(amp_log_sigma)
+
+        return dict(
+            cell_center_mean=center_mean,
+            cell_center_log_sigma=center_log_sigma,
+            cell_radius_mean=radius_mean,
+            cell_radius_log_sigma=radius_log_sigma,
+            cell_amp_mean=amp_mean,
+            cell_amp_log_sigma=amp_log_sigma,
+        )
+
+
+def sample_cell_from_head(rng: jax.Array, head_out: dict, n_samples: int, temperature: float = 1.0) -> dict:
+    """Draw n_samples per slot from the cell head."""
+    B, S = head_out["cell_center_mean"].shape[:2]
+    keys = jax.random.split(rng, 3)
+    c_sigma = jnp.exp(head_out["cell_center_log_sigma"]) * temperature
+    c_noise = jax.random.normal(keys[0], (B, S, n_samples, 2))
+    center_samples = head_out["cell_center_mean"][:, :, None] + c_sigma[:, :, None] * c_noise
+    r_sigma = jnp.exp(head_out["cell_radius_log_sigma"]) * temperature
+    r_noise = jax.random.normal(keys[1], (B, S, n_samples))
+    radius_samples = head_out["cell_radius_mean"][:, :, None] + r_sigma[:, :, None] * r_noise
+    a_sigma = jnp.exp(head_out["cell_amp_log_sigma"]) * temperature
+    a_noise = jax.random.normal(keys[2], (B, S, n_samples))
+    amp_samples = head_out["cell_amp_mean"][:, :, None] + a_sigma[:, :, None] * a_noise
+    return dict(
+        center_samples=center_samples,
+        radius_samples=radius_samples,
+        amp_samples=amp_samples,
+    )
+
+
 def sample_flagellum_from_head(rng: jax.Array, head_out: dict, n_samples: int, temperature: float = 1.0) -> dict:
     """Draw n_samples per slot from the head's predicted Gaussians.
 

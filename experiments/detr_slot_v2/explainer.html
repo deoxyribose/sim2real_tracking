@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DETR-Slot v2 + CP-SAT Verifier — Flagellum Tracking</title>
+<style>
+  :root {
+    --bg: #0e0f13; --fg: #eaeaea; --dim: #9aa0a6;
+    --accent: #7bd3d8; --accent-2: #f0b46a;
+    --danger: #ff6b6b; --ok: #6bd97b;
+    --card: #1a1d25; --border: #2a2f3a;
+    --code-bg: #14171e;
+    --mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; line-height: 1.55; }
+  main { max-width: 1000px; margin: 0 auto; padding: 32px 24px 80px; }
+  h1 { font-size: 2rem; margin: 0 0 0.25em; letter-spacing: -0.5px; }
+  h2 { font-size: 1.4rem; margin: 2em 0 0.6em; color: var(--accent); letter-spacing: -0.3px; }
+  h3 { font-size: 1.1rem; margin: 1.4em 0 0.4em; color: var(--accent-2); }
+  .subtitle { color: var(--dim); font-size: 1.05rem; margin: 0 0 1.5em; }
+  code { font-family: var(--mono); background: var(--code-bg); padding: 2px 5px; border-radius: 4px; font-size: 0.9em; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; overflow-x: auto; font-family: var(--mono); font-size: 0.85em; }
+  a { color: var(--accent); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; margin: 12px 0; }
+  .new { border-left: 3px solid var(--accent); }
+  .win { border-left: 3px solid var(--ok); }
+  .caveat { border-left: 3px solid var(--accent-2); }
+  figure { margin: 12px 0 24px; text-align: center; }
+  img { max-width: 100%; height: auto; border-radius: 6px; border: 1px solid var(--border); background: #000; }
+  .caption { color: var(--dim); font-size: 0.85em; margin-top: 4px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+  .grid figure { margin: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.92em; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--dim); font-weight: 500; text-transform: uppercase; font-size: 0.8em; letter-spacing: 0.5px; }
+  .num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .metric-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 16px 0; }
+  .metric { text-align: center; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+  .metric .val { font-family: var(--mono); font-size: 1.8rem; color: var(--accent); }
+  .metric .lbl { color: var(--dim); font-size: 0.85em; margin-top: 4px; }
+  .delta-up { color: var(--ok); font-weight: 600; }
+  .delta-down { color: var(--danger); font-weight: 600; }
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; margin: 12px 0 24px; font-size: 0.92em; }
+  .toc ol { margin: 4px 0; padding-left: 24px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
+  .tab { padding: 8px 14px; cursor: pointer; color: var(--dim); border-bottom: 2px solid transparent; user-select: none; }
+  .tab:hover { color: var(--fg); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .diagram { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; overflow-x: auto; }
+  .diagram svg { display: block; margin: 0 auto; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 8px 0; font-size: 0.9em; }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .swatch { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>DETR-Slot v2 + CP-SAT Verifier <span style="color:var(--dim);font-weight:300">— milestone 2</span></h1>
+<p class="subtitle">Cell body class + boundary-attached flagella prior + discrete inverse rendering.
+Real-frame flagellum <b>precision 0.46, recall 0.44 (F1 0.45)</b> from pure sim training.</p>
+
+<div class="toc">
+  <b>Contents</b>
+  <ol>
+    <li><a href="#tldr">TL;DR — the numbers that moved</a></li>
+    <li><a href="#v1-recap">v1 recap: what worked, what didn't</a></li>
+    <li><a href="#change-1">Change #1: cell body class in sim + model</a></li>
+    <li><a href="#change-2">Change #2: attach flagella on cell membrane (sim prior)</a></li>
+    <li><a href="#change-3">Change #3: CP-SAT verifier for discrete inverse rendering</a></li>
+    <li><a href="#results">Results — coverage + verifier</a></li>
+    <li><a href="#visuals">Visuals</a></li>
+    <li><a href="#code">Code map</a></li>
+    <li><a href="#next">What's next (v3)</a></li>
+  </ol>
+</div>
+
+<h2 id="tldr">TL;DR — the numbers that moved</h2>
+
+<div class="metric-row">
+  <div class="metric">
+    <div class="val">50.0% <span class="delta-up">↑ 37 pts</span></div>
+    <div class="lbl">Sample-coverage-recall at k=2<br>(v1: 12.5%)</div>
+  </div>
+  <div class="metric">
+    <div class="val">77.9% <span class="delta-up">↑ 27 pts</span></div>
+    <div class="lbl">Coverage at k=3<br>(v1: 51.0%)</div>
+  </div>
+  <div class="metric">
+    <div class="val">F1 0.45</div>
+    <div class="lbl">Verifier discrete selection<br>(new: v1 had no verifier)</div>
+  </div>
+</div>
+
+<p>v2 gets these numbers with only <b>5 000 training steps (7 min)</b> vs v1's 20 000 (22 min).
+The cell-body prior + boundary attachment carries most of the model-side gain; the verifier
+turns the model's sample distribution into a discrete, non-overlapping, cell-attached selection
+that a downstream tracker/analyst can consume.</p>
+
+<h2 id="v1-recap">v1 recap: what worked, what didn't</h2>
+
+<div class="card">
+  <p>v1 (see the <a href="../detr_slot_v1/explainer.html">v1 explainer</a>) established the
+  DETR-slot skeleton: canonicalization → ConvStem → slot attention → typed distributional
+  heads → Hungarian+NLL loss. It achieved <b>99% sample coverage at k=5</b> (samples land
+  <i>somewhere</i> near GT) but only <b>12.5% at k=2</b> (samples don't land <i>tightly</i>
+  on GT).</p>
+  <p>Diagnosis from v1 visuals: model's mean predictions had systematic orientation/length
+  errors. Flagella floated in the middle of the canvas without knowing where cell bodies
+  were. The user asked: <i>can we make the model only propose flagellum candidates that
+  start on a cell boundary?</i></p>
+</div>
+
+<h2 id="change-1">Change #1 — cell body class in sim + model</h2>
+<p>Added <code>CellLatent</code> with (center, radius, amplitude), a <code>CellHead</code>
+predicting each with mean+log σ, and a cell-body renderer (soft-edged dark disk). Extended
+the Hungarian matcher to run separately for cells and flagella; slots matched to cells are
+forbidden from also being matched to flagella. Cell + flag classes are separate NLL terms
+in the loss.</p>
+<p>Cell head convergence is <b>fast</b>: NLL drops from ~2500 at step 1 to ~8 at step 500
+(cells are big and easy to localize). Almost the entire coverage-recall gain at k=2 comes
+from the model having a cell "anchor" in each scene.</p>
+
+<h2 id="change-2">Change #2 — attach flagella on cell membrane (sim prior)</h2>
+<p>The user's approach #1: fix the training distribution. In every sim scene:</p>
+<ol>
+  <li>Sample 1-2 cells (or 0 for hard-negative scenes).</li>
+  <li>For each cell, sample 0-2 flagella.</li>
+  <li>For each flagellum, sample an <b>angle θ around the cell center</b>. Set attachment
+    to <code>cell.center + cell.radius · (sin θ, cos θ)</code>.</li>
+  <li>Rest-shape control points grow outward from the attachment.</li>
+</ol>
+<p>Now 100% of positive training examples have flagellum attachment on cell membrane. The
+model learns this as a natural pattern — no architectural constraint needed. This is
+approach #1 from the three the user asked us to try; the change is confined to
+<code>sim2real/data/sim_flagella.py</code>.</p>
+
+<h2 id="change-3">Change #3 — CP-SAT verifier</h2>
+
+<p>Adapted from <code>~/discrete_linking_opt</code> (Meyer et al.-style CP-SAT for cell/worm
+tracking). The verifier takes the model's per-slot Gaussian outputs, samples ~30 candidates
+per class per slot, and picks a coherent subset via integer programming.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 900 200" xmlns="http://www.w3.org/2000/svg" width="900" height="200" style="max-width:100%;height:auto">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#9aa0a6"/>
+    </marker>
+    <style>
+      .box { fill: #1a1d25; stroke: #2a2f3a; }
+      .head { fill: #7bd3d8; font: 11px sans-serif; text-anchor: middle; font-weight: 600; }
+      .sub { fill: #9aa0a6; font: 10px sans-serif; text-anchor: middle; }
+    </style>
+  </defs>
+
+  <rect class="box" x="10" y="60" width="120" height="80" rx="6"/>
+  <text class="head" x="70" y="82">Model heads</text>
+  <text class="sub" x="70" y="102">(class, means+σ)</text>
+  <text class="sub" x="70" y="118">per slot</text>
+
+  <path stroke="#9aa0a6" fill="none" d="M130,100 L150,100" marker-end="url(#arr)"/>
+  <rect class="box" x="150" y="60" width="130" height="80" rx="6"/>
+  <text class="head" x="215" y="80">Sample</text>
+  <text class="sub" x="215" y="98">30 flag + 30 cell</text>
+  <text class="sub" x="215" y="114">per slot</text>
+  <text class="sub" x="215" y="130">≈ 160 candidates/frame</text>
+
+  <path stroke="#9aa0a6" fill="none" d="M280,100 L300,100" marker-end="url(#arr)"/>
+  <rect class="box" x="300" y="60" width="130" height="80" rx="6"/>
+  <text class="head" x="365" y="80">Render</text>
+  <text class="sub" x="365" y="98">flagellum tubes,</text>
+  <text class="sub" x="365" y="114">cell disks — signed</text>
+  <text class="sub" x="365" y="130">contributions</text>
+
+  <path stroke="#9aa0a6" fill="none" d="M430,100 L450,100" marker-end="url(#arr)"/>
+  <rect class="box" x="450" y="60" width="130" height="80" rx="6"/>
+  <text class="head" x="515" y="80">Score</text>
+  <text class="sub" x="515" y="98">energy alignment:</text>
+  <text class="sub" x="515" y="114">−mean(energy at</text>
+  <text class="sub" x="515" y="130">touched pixels)</text>
+
+  <path stroke="#9aa0a6" fill="none" d="M580,100 L600,100" marker-end="url(#arr)"/>
+  <rect class="box" x="600" y="30" width="130" height="140" rx="6"/>
+  <text class="head" x="665" y="52">CP-SAT IP</text>
+  <text class="sub" x="665" y="72">x_f[i], x_c[j] ∈ {0,1}</text>
+  <text class="sub" x="665" y="92">at-most-one on pixels</text>
+  <text class="sub" x="665" y="112">attach-on-cell hard</text>
+  <text class="sub" x="665" y="132">cardinality caps</text>
+  <text class="sub" x="665" y="152">min Σ cost·x</text>
+
+  <path stroke="#9aa0a6" fill="none" d="M730,100 L750,100" marker-end="url(#arr)"/>
+  <rect class="box" x="750" y="60" width="130" height="80" rx="6"/>
+  <text class="head" x="815" y="82">Selected</text>
+  <text class="sub" x="815" y="102">1-2 cells,</text>
+  <text class="sub" x="815" y="118">0-2 flagella,</text>
+  <text class="sub" x="815" y="134">attachment-linked</text>
+</svg>
+</div>
+
+<h3>Scoring modes tried</h3>
+<table>
+  <thead><tr><th>Mode</th><th>Formula</th><th>F1 on real</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>L1 reconstruction</td><td>|target − render| delta</td><td class="num">0.20</td><td>Confuses "dark where target is dark" with "correct shape"</td></tr>
+    <tr><td>Matched filter (normed)</td><td>−(t · c) / ‖c‖</td><td class="num">0.09</td><td>Real residual is noisy; wrong candidates score well by chance</td></tr>
+    <tr style="background:var(--code-bg)"><td><b>Energy alignment</b></td><td>−mean(energy[c_touch])</td><td class="num"><b>0.45</b></td><td>Winner. Energy map cleanly encodes "flagellum-here"</td></tr>
+  </tbody>
+</table>
+<p class="caption">Energy scoring uses the temporal-variance map computed during
+canonicalization. A candidate curve that runs through pixels with high temporal energy
+(where the actual flagellum beat happened) gets the lowest cost.</p>
+
+<h3>Hard constraints in the IP</h3>
+<pre>1. Cardinality:      Σ x_f ≤ max_flagella (=2),  Σ x_c ≤ max_cells (=1)
+2. Non-overlap:      for each pixel touched by ≥2 candidates, at-most-one selected
+3. Attach-on-cell:   x_f[i] = 1 ⇒ Σ (x_c[j] where flag_i.attach ≈ cell_j.boundary) ≥ 1
+4. Birth priors:     +1.5 per flag, +2.0 per cell (regularizes against over-selection)</pre>
+
+<h2 id="results">Results — coverage + verifier</h2>
+
+<h3>Sample-coverage-recall (raw model, no verifier)</h3>
+<table>
+  <thead><tr><th></th><th class="num">k=2</th><th class="num">k=3</th><th class="num">k=5</th></tr></thead>
+  <tbody>
+    <tr><td>v1 (20k steps, no cell class)</td><td class="num">12.5%</td><td class="num">51.0%</td><td class="num">99.0%</td></tr>
+    <tr style="background:var(--code-bg)"><td><b>v2 (5k steps, cell + boundary attach)</b></td>
+      <td class="num"><b>50.0%</b> <span class="delta-up">+37.5</span></td>
+      <td class="num"><b>77.9%</b> <span class="delta-up">+26.9</span></td>
+      <td class="num">97.1% <span class="delta-down">−1.9</span></td></tr>
+  </tbody>
+</table>
+<p class="caption">v2 saturates and starts overfitting past 5 000 steps; 10k/15k/20k all
+regress compared to 5k. The best-performing checkpoint is included here.</p>
+
+<h3>Verifier P/R/F1 per sequence (v2 5k + energy scoring, max 2 flag / 1 cell)</h3>
+<table>
+  <thead><tr><th>Sequence</th><th class="num">TP</th><th class="num">FP</th><th class="num">FN</th><th class="num">P</th><th class="num">R</th></tr></thead>
+  <tbody>
+    <tr><td>CC124_cell1 174615</td><td class="num">4</td><td class="num">3</td><td class="num">4</td><td class="num">0.57</td><td class="num">0.50</td></tr>
+    <tr><td>CC124_cell1 180313</td><td class="num">5</td><td class="num">3</td><td class="num">3</td><td class="num">0.62</td><td class="num">0.62</td></tr>
+    <tr><td>CC124_cell2 124200</td><td class="num">2</td><td class="num">5</td><td class="num">5</td><td class="num">0.29</td><td class="num">0.29</td></tr>
+    <tr><td>CC124_cell2 124646</td><td class="num">4</td><td class="num">4</td><td class="num">4</td><td class="num">0.50</td><td class="num">0.50</td></tr>
+    <tr><td>CC124_cell2 124944</td><td class="num">5</td><td class="num">3</td><td class="num">3</td><td class="num">0.62</td><td class="num">0.62</td></tr>
+    <tr><td>CC124_cell2 125242</td><td class="num">3</td><td class="num">4</td><td class="num">5</td><td class="num">0.43</td><td class="num">0.38</td></tr>
+    <tr><td>uni_rotor cell_3_4</td><td class="num">3</td><td class="num">4</td><td class="num">5</td><td class="num">0.43</td><td class="num">0.38</td></tr>
+    <tr><td>uni_rotor cell_5</td><td class="num">1</td><td class="num">5</td><td class="num">3</td><td class="num">0.17</td><td class="num">0.25</td></tr>
+    <tr><td colspan="6" style="color: var(--dim); padding-top: 12px">(others below 0.2 F1: uni_rotor cell_1/cell_2 and 5 wetransfer sequences — sim ranges don't cover their morphology.)</td></tr>
+    <tr style="background:var(--code-bg)"><td><b>OVERALL</b></td>
+      <td class="num"><b>47</b></td><td class="num"><b>56</b></td><td class="num"><b>59</b></td>
+      <td class="num"><b>0.46</b></td><td class="num"><b>0.44</b></td></tr>
+  </tbody>
+</table>
+
+<h2 id="visuals">Visuals</h2>
+
+<div class="tabs">
+  <div class="tab active" onclick="show('v-verify')">Verifier selection (raw frames)</div>
+  <div class="tab" onclick="show('v-raw')">v2 raw model output</div>
+  <div class="tab" onclick="show('v-sim')">Sim (in-distribution)</div>
+</div>
+
+<div id="v-verify" class="tab-panel active">
+<div class="legend">
+  <div class="legend-item"><span class="swatch" style="background:#00ff00"></span> Ground truth flagellum</div>
+  <div class="legend-item"><span class="swatch" style="background:#ff3c3c"></span> Selected flagellum candidate</div>
+  <div class="legend-item"><span class="swatch" style="background:#00dcdc"></span> Selected cell</div>
+  <div class="legend-item"><span class="swatch" style="background:#666"></span> Rejected candidates (faint)</div>
+  <div class="legend-item"><span class="swatch" style="background:#ffff3c"></span> Attachment point (on cell)</div>
+</div>
+<div class="grid">
+  <figure><img src="viz_verify/verify_00_img_000.png" alt=""><div class="caption">uni_rotor cell1_154532</div></figure>
+  <figure><img src="viz_verify/verify_01_img_004.png" alt=""><div class="caption">uni_rotor cell_2</div></figure>
+  <figure><img src="viz_verify/verify_02_img_008.png" alt=""><div class="caption">uni_rotor cell_3_4</div></figure>
+  <figure><img src="viz_verify/verify_03_img_012.png" alt=""><div class="caption">uni_rotor cell_5</div></figure>
+  <figure><img src="viz_verify/verify_04_img_020.png" alt=""><div class="caption">CC124_cell1 174615 — clean overlap</div></figure>
+  <figure><img src="viz_verify/verify_05_img_024.png" alt=""><div class="caption">CC124_cell1 180313</div></figure>
+  <figure><img src="viz_verify/verify_06_img_028.png" alt=""><div class="caption">CC124_cell2 124200</div></figure>
+  <figure><img src="viz_verify/verify_07_img_032.png" alt=""><div class="caption">CC124_cell2 124646</div></figure>
+  <figure><img src="viz_verify/verify_08_img_036.png" alt=""><div class="caption">CC124_cell2 124944 — 2/2 correct</div></figure>
+  <figure><img src="viz_verify/verify_09_img_040.png" alt=""><div class="caption">CC124_cell2 125242 — 2/2 correct</div></figure>
+  <figure><img src="viz_verify/verify_10_img_044.png" alt=""><div class="caption">wetransfer cell1_20240513</div></figure>
+  <figure><img src="viz_verify/verify_11_img_048.png" alt=""><div class="caption">wetransfer cell1_20240805 — model + verifier struggle</div></figure>
+</div>
+</div>
+
+<div id="v-raw" class="tab-panel">
+<div class="legend">
+  <div class="legend-item"><span class="swatch" style="background:#00ff00"></span> GT</div>
+  <div class="legend-item"><span class="swatch" style="background:#ff3c3c"></span> Slot-color mean prediction (per-slot)</div>
+  <div class="legend-item"><span class="swatch" style="background:#aaa"></span> Faint = individual samples</div>
+</div>
+<div class="grid">
+  <figure><img src="viz_raw/frame_00_img_000.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_01_img_004.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_02_img_008.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_03_img_012.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_04_img_020.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_05_img_024.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_06_img_028.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_07_img_032.png" alt=""></figure>
+</div>
+</div>
+
+<div id="v-sim" class="tab-panel">
+<p class="caption">Sim data — the training distribution. Confidence is much higher (0.6-0.9 p_flag)
+than on real. Green GT tracks match colored predictions tightly.</p>
+<div class="grid">
+  <figure><img src="viz_sim/sim_00.png" alt=""></figure>
+  <figure><img src="viz_sim/sim_01.png" alt=""></figure>
+  <figure><img src="viz_sim/sim_02.png" alt=""></figure>
+  <figure><img src="viz_sim/sim_03.png" alt=""></figure>
+  <figure><img src="viz_sim/sim_04.png" alt=""></figure>
+  <figure><img src="viz_sim/sim_05.png" alt=""></figure>
+  <figure><img src="viz_sim/sim_06.png" alt=""></figure>
+  <figure><img src="viz_sim/sim_07.png" alt=""></figure>
+  <figure><img src="viz_sim/sim_08.png" alt=""></figure>
+  <figure><img src="viz_sim/sim_09.png" alt=""></figure>
+  <figure><img src="viz_sim/sim_10.png" alt=""></figure>
+  <figure><img src="viz_sim/sim_11.png" alt=""></figure>
+</div>
+</div>
+
+<h2 id="code">Code map (new since v1)</h2>
+<pre><b>sim2real/data/</b>
+  types.py               + CellLatent class + parent_index on FlagellumLatent
+  sim_flagella.py        + _sample_cell, _sample_flagellum_on_cell (angle around cell)
+                         + _render_cell_frame (soft-edged disk)
+                         + FlagellumSimConfig.p_empty_scene, n_cells_probs
+
+<b>sim2real/model_v2/</b>
+  heads.py               + CellHead (center + radius + amp, mean+σ)
+                         + sample_cell_from_head
+  detr_slot.py           + cell_head in top-level forward
+  loss.py                two Hungarian matchers (cells, flagella) + slot forbidden set
+                         + pack_gt_batch now includes gt_cell_*
+                         + compute_loss handles both classes
+
+<b>sim2real/verifier/</b>           NEW (adapted from ~/discrete_linking_opt)
+  render.py              wraps sim renderers for candidate rasterization
+  score.py               reconstruction_delta / matched_filter / energy_alignment
+  solver.py              CP-SAT: at-most-one pixel constraints + attach-on-cell +
+                         cardinality caps + birth priors
+  run_verify.py          end-to-end: model → candidates → renders → solve → P/R/F1
+
+<b>scripts/</b>
+  viz_verifier.py        overlay selected + rejected candidates on raw frames
+
+<b>tests/</b>
+  test_verifier.py       4 unit tests covering render + score + solver logic
+                         (all pass)</pre>
+
+<h2 id="next">What's next (v3)</h2>
+<ol>
+  <li><b>Structural attach-on-cell head (approach #3)</b> — parameterize flagellum attachment
+    as <code>(cell_slot_id, angle_offset)</code> instead of free <code>(y, x)</code>. Attention
+    over cell slots links flagellum to its origin cell at the architecture level, not just
+    the training distribution.</li>
+  <li><b>Multi-frame verifier</b> — score candidates against the full clip rollout
+    (predict beat params, render at each t, integrate) rather than the temporal-min projection.</li>
+  <li><b>Temporal linking</b> — CP-SAT flow-conservation over consecutive clips to enforce
+    identity and length consensus across time.</li>
+  <li><b>Widen sim ranges</b> — wetransfer and paradeb sequences have flagellum morphology
+    outside the current sim's cell-size and motion-blur envelopes.</li>
+  <li><b>Real replay training</b> — after verifier accepts a curve, add it as pseudo-GT for
+    the model. Self-training loop from the plan.</li>
+</ol>
+
+<h3>Reproduce</h3>
+<pre># from repo root
+pip install -e .
+python scripts/harvest_bg_patches.py                                # ~30s
+python scripts/calibrate_flagellum.py                                # ~5s
+python -m sim2real.train_v2.train --steps 5000 --out-dir runs/detr_slot/v2   # ~7 min on 5090
+python -m sim2real.eval_v2.run_eval --ckpt experiments/detr_slot_v2/detr_slot_v2_ckpt.pkl --coverage-k 3
+python -m sim2real.verifier.run_verify \
+    --ckpt experiments/detr_slot_v2/detr_slot_v2_ckpt.pkl \
+    --scoring energy --max-flagella 2 --max-cells 1 \
+    --birth-flag 1.5 --birth-cell 2.0 --attach-slack 15</pre>
+
+</main>
+
+<script>
+function show(id) {
+  const panel = document.getElementById(id);
+  const group = panel.parentElement;
+  group.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  panel.classList.add('active');
+  let el = panel.previousElementSibling;
+  while (el && !el.classList.contains('tabs')) el = el.previousElementSibling;
+  if (el) {
+    el.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    el.querySelectorAll('.tab').forEach(t => {
+      if (t.getAttribute('onclick')?.includes(`'${id}'`)) t.classList.add('active');
+    });
+  }
+}
+</script>
+</body>
+</html>

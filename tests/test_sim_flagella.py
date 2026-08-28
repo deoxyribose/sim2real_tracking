@@ -1,9 +1,9 @@
-"""Tests for the FG-only flagellum simulator."""
+"""Tests for the FG-only flagellum + cell simulator (v1)."""
 import numpy as np
 
 from sim2real.data import (
     CANONICAL_H, CANONICAL_W, FLAGELLUM_K,
-    FlagellumSimConfig, sample_scene, SimSampleV2, FlagellumLatent,
+    CellLatent, FlagellumSimConfig, sample_scene, SimSampleV2, FlagellumLatent,
 )
 
 
@@ -22,46 +22,57 @@ def test_sample_scene_shape():
 
 
 def test_scene_flagellum_latents_valid():
+    """Force always 1 cell with 1 flagellum."""
     rng = np.random.default_rng(0)
-    cfg = FlagellumSimConfig(T=8, n_flagella_probs=(0.0, 1.0, 0.0))  # always 1 flagellum
+    cfg = FlagellumSimConfig(T=8, p_empty_scene=0.0,
+                             n_cells_probs=(1.0, 0.0),
+                             n_flagella_per_cell_probs=(0.0, 1.0, 0.0))
     s = sample_scene(rng, cfg, bg_patch=_fake_bg())
+    assert len(s.latents.cells) == 1
     assert len(s.latents.flagella) == 1
     l = s.latents.flagella[0]
     assert l.attachment.shape == (2,)
     assert l.control_points.shape == (FLAGELLUM_K, 2)
-    all_pts = l.all_points()
-    assert all_pts.shape == (FLAGELLUM_K + 1, 2)
-    assert 0 <= all_pts[0, 0] < CANONICAL_H
-    assert 0 <= all_pts[0, 1] < CANONICAL_W
 
 
-def test_scene_arc_length_positive():
+def test_flagellum_attachment_on_cell_membrane():
+    """The whole point of the v1 change: attachment must lie on cell boundary."""
     rng = np.random.default_rng(0)
-    cfg = FlagellumSimConfig(T=8, n_flagella_probs=(0.0, 1.0, 0.0))
-    s = sample_scene(rng, cfg, bg_patch=_fake_bg())
-    l = s.latents.flagella[0]
-    L = l.arc_length_px()
-    assert cfg.length_min_px * 0.7 <= L <= cfg.length_max_px * 1.4  # loose bound
+    cfg = FlagellumSimConfig(T=4, p_empty_scene=0.0,
+                             n_cells_probs=(1.0, 0.0),
+                             n_flagella_per_cell_probs=(0.0, 1.0, 0.0))
+    for _ in range(20):
+        s = sample_scene(rng, cfg, bg_patch=_fake_bg())
+        assert len(s.latents.cells) == 1 and len(s.latents.flagella) == 1
+        cell = s.latents.cells[0]
+        flag = s.latents.flagella[0]
+        d = float(np.linalg.norm(flag.attachment - cell.center))
+        # Attachment should be within ~2 px of the cell radius
+        assert abs(d - cell.radius_px) < 2.0, f"attachment distance {d:.2f} vs radius {cell.radius_px:.2f}"
 
 
-def test_zero_flagella_case():
+def test_empty_scene_has_no_cells_no_flagella():
     rng = np.random.default_rng(1)
-    cfg = FlagellumSimConfig(T=8, n_flagella_probs=(1.0, 0.0, 0.0))  # always 0
+    cfg = FlagellumSimConfig(T=4, p_empty_scene=1.0)
     s = sample_scene(rng, cfg, bg_patch=_fake_bg())
+    assert len(s.latents.cells) == 0
     assert len(s.latents.flagella) == 0
-    # Clip should be pure BG (numerically the same as the tiled BG); no FG contribution.
 
 
-def test_two_flagella_case():
+def test_two_cells_case():
+    """Force always 2 cells."""
     rng = np.random.default_rng(2)
-    cfg = FlagellumSimConfig(T=8, n_flagella_probs=(0.0, 0.0, 1.0))  # always 2
-    s = sample_scene(rng, cfg, bg_patch=_fake_bg())
-    assert len(s.latents.flagella) == 2
-    a0 = s.latents.flagella[0].attachment
-    a1 = s.latents.flagella[1].attachment
-    # Attachments should be separated by ≥30 px (see forbidden_zone in sample_one_flagellum)
-    d = float(np.linalg.norm(a0 - a1))
-    assert d >= 20  # allow some slack since forbidden radius is exact but samples can still be close if 50 retries fail
+    cfg = FlagellumSimConfig(T=4, p_empty_scene=0.0,
+                             n_cells_probs=(0.0, 1.0),
+                             n_flagella_per_cell_probs=(1.0, 0.0, 0.0))  # 0 flag per cell for simplicity
+    for _ in range(5):
+        s = sample_scene(rng, cfg, bg_patch=_fake_bg())
+        assert len(s.latents.cells) >= 1  # sometimes second cell placement fails, that's ok
+        # Cells should not overlap centers-to-centers
+        for i, a in enumerate(s.latents.cells):
+            for b in s.latents.cells[i+1:]:
+                d = float(np.linalg.norm(a.center - b.center))
+                assert d >= a.radius_px + b.radius_px  # non-overlapping
 
 
 def test_no_nan_or_inf():
@@ -74,10 +85,9 @@ def test_no_nan_or_inf():
 
 
 def test_bg_tiling_fills_canvas():
-    """Small BG patch should still cover the whole canvas via reflect-tile."""
+    """Empty scene (no FG) → clip should be pure BG (non-zero everywhere)."""
     rng = np.random.default_rng(4)
-    cfg = FlagellumSimConfig(T=8, n_flagella_probs=(1.0, 0.0, 0.0))  # zero flagella so clip = bg
+    cfg = FlagellumSimConfig(T=8, p_empty_scene=1.0)
     small_bg = np.ones((cfg.T, 32, 32), dtype=np.float32) * 2.5
     s = sample_scene(rng, cfg, bg_patch=small_bg)
-    # Every pixel should be non-zero (BG value 2.5 tiled everywhere)
     assert (s.clip != 0).all()

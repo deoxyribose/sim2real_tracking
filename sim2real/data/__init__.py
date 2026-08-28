@@ -14,7 +14,7 @@ from .canonicalize import (
 from .types import (
     CLASS_EMPTY, CLASS_PIPETTE, CLASS_CELL, CLASS_FLAGELLUM, N_CLASSES,
     FLAGELLUM_K,
-    FlagellumLatent, SceneLatents, SimSampleV2,
+    CellLatent, FlagellumLatent, SceneLatents, SimSampleV2,
 )
 from .sim_flagella import FlagellumSimConfig, sample_scene
 
@@ -27,6 +27,6 @@ __all__ = [
     "sigma_scale", "temporal_energy_map",
     "CLASS_EMPTY", "CLASS_PIPETTE", "CLASS_CELL", "CLASS_FLAGELLUM", "N_CLASSES",
     "FLAGELLUM_K",
-    "FlagellumLatent", "SceneLatents", "SimSampleV2",
+    "CellLatent", "FlagellumLatent", "SceneLatents", "SimSampleV2",
     "FlagellumSimConfig", "sample_scene",
 ]

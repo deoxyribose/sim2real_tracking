@@ -53,17 +53,24 @@ class FlagellumLatent:
 
 
 @dataclass
+class CellLatent:
+    """One cell body: circle in canonical space + weak polarity/contrast."""
+    center: np.ndarray             # (2,) float32 = (y, x) canonical px
+    radius_px: float               # in canonical px
+    amplitude_sigma: float         # positive number in σ-units (polarity implicit: cells are dark)
+    parent_index: Optional[int] = None  # used by cell-anchored flagella (v2), else None
+
+
+@dataclass
 class SceneLatents:
     """All ground-truth latents for one clip. Anonymous per-clip candidate set.
 
     Slots are un-ordered — no identity across clips. Any slot can be any class.
-    For MVP, `flagella` is the only populated list; `cells` and `pipettes` are
-    empty placeholders.
+    For v2 we populate flagella + cells; pipettes still stubbed.
     """
     flagella: list[FlagellumLatent] = field(default_factory=list)
-    # Populated in later phases:
-    cells: list = field(default_factory=list)
-    pipettes: list = field(default_factory=list)
+    cells: list[CellLatent] = field(default_factory=list)
+    pipettes: list = field(default_factory=list)  # still stubbed
 
     @property
     def n_objects(self) -> int:

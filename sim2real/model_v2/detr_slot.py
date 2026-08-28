@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 
 from .encoder import Encoder
-from .heads import ClassHead, FlagellumHead
+from .heads import CellHead, ClassHead, FlagellumHead
 from .slot_attention import SlotAttention
 
 
@@ -55,4 +55,5 @@ class DETRSlotModel(nn.Module):
 
         class_logits = ClassHead(d_ff=self.cfg.d_ff_head, name="class_head")(slots)
         flag_out = FlagellumHead(d_ff=self.cfg.d_ff_head, name="flagellum_head")(slots)
-        return dict(class_logits=class_logits, **flag_out)
+        cell_out = CellHead(d_ff=self.cfg.d_ff_head // 2, name="cell_head")(slots)
+        return dict(class_logits=class_logits, **flag_out, **cell_out)

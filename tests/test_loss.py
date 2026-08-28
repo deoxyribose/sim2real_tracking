@@ -1,67 +1,89 @@
-"""Tests for the Hungarian + NLL loss."""
+"""Tests for the extended Hungarian + NLL loss (cells + flagella)."""
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from sim2real.data import (
-    CANONICAL_H, CANONICAL_W, CLASS_EMPTY, CLASS_FLAGELLUM, FLAGELLUM_K, N_CLASSES,
-    FlagellumLatent, SceneLatents,
+    CANONICAL_H, CANONICAL_W, CLASS_EMPTY, CLASS_CELL, CLASS_FLAGELLUM,
+    FLAGELLUM_K, N_CLASSES,
+    CellLatent, FlagellumLatent, SceneLatents,
 )
 from sim2real.model_v2 import (
-    MAX_GT, DETRSlotConfig, DETRSlotModel, compute_loss, hungarian_match, pack_gt_batch,
+    MAX_GT_FLAG, MAX_GT_CELL,
+    DETRSlotConfig, DETRSlotModel,
+    compute_loss, hungarian_match_flagella, hungarian_match_cells, pack_gt_batch, run_matches,
 )
 
 
-def _make_scene(n_flag=1, seed=0):
+def _make_scene(n_cells=1, n_flag=1, seed=0):
     rng = np.random.default_rng(seed)
+    cells = []
     flagella = []
+    for _ in range(n_cells):
+        c = CellLatent(center=rng.uniform(80, 180, size=2).astype(np.float32),
+                       radius_px=float(rng.uniform(15, 30)),
+                       amplitude_sigma=float(rng.uniform(4, 10)))
+        cells.append(c)
     for _ in range(n_flag):
         attach = rng.uniform(50, 200, size=2).astype(np.float32)
-        angles = rng.uniform(0, 2*np.pi)
+        angle = rng.uniform(0, 2*np.pi)
         step = 8
-        pts = np.stack([attach + i*step*np.array([np.sin(angles), np.cos(angles)]) for i in range(1, FLAGELLUM_K+1)]).astype(np.float32)
+        pts = np.stack([attach + i*step*np.array([np.sin(angle), np.cos(angle)])
+                        for i in range(1, FLAGELLUM_K + 1)]).astype(np.float32)
         flagella.append(FlagellumLatent(
             attachment=attach, control_points=pts,
             width_px=4.0, polarity=1, amplitude_sigma=8.0,
         ))
-    return SceneLatents(flagella=flagella)
+    return SceneLatents(flagella=flagella, cells=cells)
 
 
 def test_pack_gt_batch_shapes():
-    scenes = [_make_scene(1), _make_scene(2), _make_scene(0)]
+    scenes = [_make_scene(1, 1), _make_scene(2, 3), _make_scene(0, 0)]
     gt = pack_gt_batch(scenes)
-    assert gt["gt_pts"].shape == (3, MAX_GT, FLAGELLUM_K + 1, 2)
-    assert gt["gt_mask"].tolist() == [[1, 0], [1, 1], [0, 0]]
+    assert gt["gt_pts"].shape == (3, MAX_GT_FLAG, FLAGELLUM_K + 1, 2)
+    assert gt["gt_cell_center"].shape == (3, MAX_GT_CELL, 2)
+    # Second scene has 3 flagella but MAX_GT_FLAG=4, all fit
+    assert gt["gt_mask"][0].tolist() == [1, 0, 0, 0]
+    assert gt["gt_mask"][1].tolist() == [1, 1, 1, 0]
+    assert gt["gt_mask"][2].tolist() == [0, 0, 0, 0]
+    assert gt["gt_cell_mask"][0].tolist() == [1, 0]
+    assert gt["gt_cell_mask"][1].tolist() == [1, 1]
 
 
-def test_hungarian_match_matches_close():
-    """When the model puts a slot exactly at GT, that slot should match."""
-    scene = _make_scene(1)
+def test_hungarian_cells_matches_close():
+    scene = _make_scene(1, 0)
     gt = pack_gt_batch([scene])
     S = 4
     class_logits = np.full((1, S, N_CLASSES), -5.0, dtype=np.float32)
-    class_logits[0, 2, CLASS_FLAGELLUM] = 5.0   # slot 2 says "I'm flagellum!"
-    pred_pts = np.full((1, S, FLAGELLUM_K + 1, 2), 200.0, dtype=np.float32)
-    pred_pts[0, 2] = gt["gt_pts"][0, 0]         # slot 2 predicts GT exactly
-    match = hungarian_match(class_logits, pred_pts, gt["gt_pts"], gt["gt_mask"])
-    assert match.shape == (1, S)
-    assert match[0, 2] == 0
+    class_logits[0, 1, CLASS_CELL] = 5.0
+    pred_center = np.full((1, S, 2), 300.0, dtype=np.float32)
+    pred_center[0, 1] = gt["gt_cell_center"][0, 0]
+    pred_radius = np.full((1, S), 30.0, dtype=np.float32)
+    pred_radius[0, 1] = gt["gt_cell_radius"][0, 0]
+    match = hungarian_match_cells(class_logits, pred_center, pred_radius,
+                                   gt["gt_cell_center"], gt["gt_cell_radius"], gt["gt_cell_mask"])
+    assert match[0, 1] == 0
     assert (match[0] == -1).sum() == S - 1
 
 
-def test_hungarian_no_match_when_no_gt():
-    scene = _make_scene(0)
+def test_hungarian_flag_avoids_cell_slots():
+    scene = _make_scene(1, 1)
     gt = pack_gt_batch([scene])
     S = 4
-    pred_pts = np.random.randn(1, S, FLAGELLUM_K + 1, 2).astype(np.float32) * 5 + 100
-    class_logits = np.zeros((1, S, N_CLASSES), dtype=np.float32)
-    match = hungarian_match(class_logits, pred_pts, gt["gt_pts"], gt["gt_mask"])
-    assert (match == -1).all()
+    class_logits = np.full((1, S, N_CLASSES), -5.0, dtype=np.float32)
+    class_logits[0, :, CLASS_FLAGELLUM] = 2.0
+    pred_pts = np.full((1, S, FLAGELLUM_K + 1, 2), 100.0, dtype=np.float32)
+    pred_pts[0, 0] = gt["gt_pts"][0, 0]   # slot 0 predicts GT flag exactly
+    forbidden = np.array([[False, True, False, False]])   # slot 1 already used by cell
+    match = hungarian_match_flagella(class_logits, pred_pts, gt["gt_pts"], gt["gt_mask"],
+                                      slot_forbidden_np=forbidden)
+    assert match[0, 0] == 0
+    assert match[0, 1] == -1
 
 
 def test_compute_loss_smoke_and_grad():
     B = 2
-    scenes = [_make_scene(1, seed=0), _make_scene(2, seed=1)]
+    scenes = [_make_scene(1, 1, seed=0), _make_scene(2, 3, seed=1)]
     gt_np = pack_gt_batch(scenes)
     gt = {k: jnp.asarray(v) for k, v in gt_np.items()}
 
@@ -73,26 +95,19 @@ def test_compute_loss_smoke_and_grad():
     key = jax.random.PRNGKey(0)
     params = model.init({"params": key, "slots": key}, clip, energy)
 
-    # Step 1: run forward on host, get outputs as numpy for matching
     out_fwd = model.apply(params, clip, energy, rngs={"slots": key})
-    match_np = hungarian_match(
-        np.asarray(out_fwd["class_logits"]),
-        np.asarray(out_fwd["pts_mean"]),
-        gt_np["gt_pts"], gt_np["gt_mask"],
-    )
-    match = jnp.asarray(match_np)
+    match_flag, match_cell = run_matches({k: np.asarray(v) for k, v in out_fwd.items()}, gt_np)
+    match_flag_j = jnp.asarray(match_flag)
+    match_cell_j = jnp.asarray(match_cell)
 
-    # Step 2: define loss_fn that takes params and pre-computed match
     def loss_fn(p):
         out = model.apply(p, clip, energy, rngs={"slots": key})
-        losses = compute_loss(out, gt, match)
+        losses = compute_loss(out, gt, match_flag_j, match_cell_j)
         return losses["total"], losses
 
     (total, losses), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     assert jnp.isfinite(total)
-    # Component sanity
-    for k in ("class_", "pts", "width", "amp", "polarity"):
+    for k in ("class_", "pts", "width", "amp", "polarity", "cell_pos", "cell_rad", "cell_amp"):
         assert jnp.isfinite(losses[k]), f"{k}={losses[k]}"
-    # Non-zero gradients
     total_grad = jax.tree_util.tree_reduce(lambda a, b: a + jnp.abs(b).sum(), grads, 0.0)
     assert float(total_grad) > 0
