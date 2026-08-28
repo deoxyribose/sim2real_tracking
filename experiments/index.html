@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>sim2real_tracking — Experiment Index</title>
+<style>
+  body { max-width: 800px; margin: 40px auto; font-family: -apple-system, sans-serif; padding: 0 24px; background: #0e0f13; color: #eaeaea; line-height: 1.55; }
+  h1 { letter-spacing: -0.5px; }
+  h2 { color: #7bd3d8; margin-top: 2em; }
+  .card { background: #1a1d25; border: 1px solid #2a2f3a; border-radius: 8px; padding: 16px 20px; margin: 12px 0; }
+  a { color: #7bd3d8; }
+  .stat { font-family: 'JetBrains Mono', ui-monospace, monospace; color: #6bd97b; }
+  .dim { color: #9aa0a6; font-size: 0.9em; }
+</style></head>
+<body>
+<h1>DETR-Slot experiments — flagellum tracking</h1>
+<p class="dim">Three iterations on the object-centric refactor of sim2real_tracking. All models are
+sim-trained (foreground rendered onto real background patches), evaluated on 59 real painted
+flagellum annotations.</p>
+
+<h2>Milestones</h2>
+
+<div class="card">
+<h3><a href="detr_slot_v1/explainer.html">v1 — DETR-Slot baseline</a></h3>
+<p>Slot-attention encoder → distributional heads (∅/pipette/cell/flagellum + mean+σ). No cell class.</p>
+<p><span class="stat">Coverage k=2 = 12.5%, k=3 = 51.0%, k=5 = 99.0%.</span> 22 min training on RTX 5090.</p>
+</div>
+
+<div class="card">
+<h3><a href="detr_slot_v2/explainer.html">v2 — Cell class + boundary attachment + CP-SAT verifier</a></h3>
+<p>Sim scenes have cells; flagella attach on cell membrane. Model adds CellHead. CP-SAT verifier
+picks non-overlapping subset with attach-on-cell IP constraint.</p>
+<p><span class="stat">Coverage k=2 = 50.0%, k=3 = 77.9%, k=5 = 97.1%. Verifier F1 = 0.45.</span>
+Best for downstream that wants one selected curve per flagellum.</p>
+</div>
+
+<div class="card">
+<h3><a href="detr_slot_v3/explainer.html">v3 — Structural cell-anchored flagellum head</a></h3>
+<p>Attachment reparameterized as <code>(cell_slot, angle, radius)</code>. Attach-on-cell
+guaranteed by architecture, not statistics. Compares all three approaches side-by-side.</p>
+<p><span class="stat">Coverage k=2 = 26.9%, k=3 = 65.4-87.5%, k=5 = 100.0%.</span> Best broad
+coverage — samples always land <i>somewhere</i> near GT.</p>
+</div>
+
+<h2>Framework</h2>
+<div class="card">
+<p><b>The 2026-08-28 refactor</b>: replace reconstruction-loss object-centric video models with
+DETR-with-slot-attention emitting <i>distributional</i> latents. Sample many curves per slot,
+score them, pick a subset via IP.</p>
+<p>Training data: sim foregrounds composited on real BG patches harvested from your videos.</p>
+<p>Verifier: adapted from <code>~/discrete_linking_opt</code> (Meyer et al.) — OR-Tools CP-SAT
+with reconstruction/energy scoring, at-most-one pixel constraints, attach-on-cell constraint,
+cardinality caps.</p>
+</div>
+
+<p class="dim" style="text-align: center; margin-top: 40px;">
+Branch: <code>detr-slot-v1</code> ·
+<a href="https://github.com/deoxyribose/sim2real_tracking/tree/detr-slot-v1">source on GitHub</a>
+</p>
+</body></html>

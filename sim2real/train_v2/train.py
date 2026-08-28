@@ -118,7 +118,8 @@ def train(args):
 
     sim_cfg = FlagellumSimConfig(T=args.T)
     model_cfg = DETRSlotConfig(n_slots=args.n_slots, n_iters=args.n_iters,
-                               d_slot=args.d_slot, d_ff_slot=args.d_ff_slot)
+                               d_slot=args.d_slot, d_ff_slot=args.d_ff_slot,
+                               anchored_flagellum=args.anchored)
     key = jax.random.PRNGKey(args.seed)
     key, init_key = jax.random.split(key)
     state, model, sched = create_train_state(
@@ -205,6 +206,7 @@ def main():
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--anchored", action="store_true", help="Use structural cell-anchored flagellum head")
     ap.add_argument("--bg-patches", default="/home/frans/sim2real_tracking/data_cache/bg_patches_v0.npz")
     ap.add_argument("--out-dir", default="/home/frans/sim2real_tracking/runs/detr_slot/v0")
     args = ap.parse_args()

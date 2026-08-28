@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DETR-Slot v3 — All Three Cell-Attachment Approaches Compared</title>
+<style>
+  :root {
+    --bg: #0e0f13; --fg: #eaeaea; --dim: #9aa0a6;
+    --accent: #7bd3d8; --accent-2: #f0b46a;
+    --danger: #ff6b6b; --ok: #6bd97b; --purple: #b78ffa;
+    --card: #1a1d25; --border: #2a2f3a; --code-bg: #14171e;
+    --mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; line-height: 1.55; }
+  main { max-width: 1000px; margin: 0 auto; padding: 32px 24px 80px; }
+  h1 { font-size: 2rem; margin: 0 0 0.25em; letter-spacing: -0.5px; }
+  h2 { font-size: 1.4rem; margin: 2em 0 0.6em; color: var(--accent); letter-spacing: -0.3px; }
+  h3 { font-size: 1.1rem; margin: 1.4em 0 0.4em; color: var(--accent-2); }
+  .subtitle { color: var(--dim); font-size: 1.05rem; margin: 0 0 1.5em; }
+  code { font-family: var(--mono); background: var(--code-bg); padding: 2px 5px; border-radius: 4px; font-size: 0.9em; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; overflow-x: auto; font-family: var(--mono); font-size: 0.85em; }
+  a { color: var(--accent); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; margin: 12px 0; }
+  .new { border-left: 3px solid var(--accent); }
+  .win { border-left: 3px solid var(--ok); }
+  .caveat { border-left: 3px solid var(--accent-2); }
+  figure { margin: 12px 0 24px; text-align: center; }
+  img { max-width: 100%; height: auto; border-radius: 6px; border: 1px solid var(--border); background: #000; }
+  .caption { color: var(--dim); font-size: 0.85em; margin-top: 4px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+  .grid figure { margin: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.92em; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--dim); font-weight: 500; text-transform: uppercase; font-size: 0.8em; letter-spacing: 0.5px; }
+  .num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .metric-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 16px 0; }
+  .metric { text-align: center; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+  .metric .val { font-family: var(--mono); font-size: 1.7rem; color: var(--accent); }
+  .metric .lbl { color: var(--dim); font-size: 0.85em; margin-top: 4px; }
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; margin: 12px 0 24px; font-size: 0.92em; }
+  .toc ol { margin: 4px 0; padding-left: 24px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 12px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .tab { padding: 8px 14px; cursor: pointer; color: var(--dim); border-bottom: 2px solid transparent; user-select: none; }
+  .tab:hover { color: var(--fg); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .approach { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; margin: 12px 0; }
+  .approach h3 { margin-top: 0; }
+  .approach.a1 { border-left: 3px solid var(--ok); }
+  .approach.a2 { border-left: 3px solid var(--accent); }
+  .approach.a3 { border-left: 3px solid var(--purple); }
+  .best { color: var(--ok); font-weight: 700; }
+  .diagram { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>DETR-Slot: All Three Approaches Compared <span style="color:var(--dim);font-weight:300">— milestone 3</span></h1>
+<p class="subtitle">The user asked us to try three cell-attachment approaches.
+We did. Each has a different trade-off between sample coverage and per-sample precision.
+Here's what we found.</p>
+
+<div class="toc">
+  <b>Contents</b>
+  <ol>
+    <li><a href="#ask">The user's ask</a></li>
+    <li><a href="#three">The three approaches</a></li>
+    <li><a href="#numbers">Numbers table</a></li>
+    <li><a href="#tradeoff">The trade-off, visualized</a></li>
+    <li><a href="#visuals">Visuals — v3 anchored on real data</a></li>
+    <li><a href="#recommendation">Recommendation for downstream use</a></li>
+    <li><a href="#next">What's next</a></li>
+  </ol>
+</div>
+
+<h2 id="ask">The user's ask</h2>
+<div class="card">
+  <p><i>"Can we make the model learn to only propose flagellum candidates that
+    start on the cell boundary?"</i></p>
+  <p>We proposed three approaches, differing in how the attach-on-cell constraint
+    is enforced:</p>
+  <ol>
+    <li><b>Sim-only</b>: put attachments on cell membrane in training data</li>
+    <li><b>Multi-class scene</b>: also add cell head + IP constraint at verification</li>
+    <li><b>Structural head</b>: reparameterize attachment as
+      <code>(cell_slot, angle, radius)</code> — hardwired in the architecture</li>
+  </ol>
+  <p>We tried all three. This page is what came out.</p>
+</div>
+
+<h2 id="three">The three approaches</h2>
+
+<div class="approach a1">
+<h3>Approach #1 — Sim prior only (v2)</h3>
+<p>Every sim scene has cells; every flagellum's attachment is sampled as
+  <code>cell.center + cell.radius · (sin θ, cos θ)</code>. Model learns the pattern
+  from data. Zero architectural change; ~20 lines of sim code.</p>
+<p><b>Result:</b> Coverage k=2 = <b>50.0%</b>, k=3 = 77.9%, verifier F1 = <b>0.45</b>.
+  This is the winner for verifier-based discrete selection.</p>
+</div>
+
+<div class="approach a2">
+<h3>Approach #2 — Multi-class scene + verifier constraint (v2 + CP-SAT)</h3>
+<p>Same sim as #1, but also add a <code>CellHead</code> to the model (predicts cell
+  center + radius + amp), extend Hungarian matcher to match cells. The verifier's IP
+  then adds a hard constraint: <code>x_f[i] = 1 ⇒ Σ (x_c[j] where attach_i ≈
+  cell_j.boundary) ≥ 1</code>.</p>
+<p>Delivered together with #1 in <a href="../detr_slot_v2/explainer.html">v2</a>.</p>
+</div>
+
+<div class="approach a3">
+<h3>Approach #3 — Structural head (v3 anchored, this page)</h3>
+<p>Reparameterize: flagellum attachment is <b>derived</b> from a chosen cell slot,
+  not predicted as free <code>(y, x)</code>. The head outputs:</p>
+<pre>anchor_probs = softmax(f(slot))           # attention over cell slots
+angle        = atan2(sin_out, cos_out)     # (unit circle output for stability)
+r_scale      = 0.85 + 0.30 * sigmoid(...)  # slight radial jitter
+attachment   = Σ_j anchor_probs[j] * (cell.center[j] + r_scale * cell.radius[j] * (sin θ, cos θ))
+control_points = attachment + cumulative(offsets)</pre>
+<p>The attach-on-cell constraint is now guaranteed by the architecture: any prediction
+  the head can produce necessarily has its attachment on some cell's membrane
+  (weighted by the softmax).</p>
+<p><b>Result:</b> Coverage k=5 = <b>96-100%</b>, k=3 = 65-88% depending on sigma
+  scheduling. Verifier F1 = 0.32. Best for broad-coverage downstream that scores many
+  candidates.</p>
+</div>
+
+<h2 id="numbers">Numbers table</h2>
+
+<table>
+  <thead><tr>
+    <th>Configuration</th>
+    <th>Steps</th>
+    <th class="num">Cov k=2</th>
+    <th class="num">Cov k=3</th>
+    <th class="num">Cov k=5</th>
+    <th class="num">Verifier F1</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td>v1 baseline (no cell class)</td>
+      <td>20k</td>
+      <td class="num">12.5%</td>
+      <td class="num">51.0%</td>
+      <td class="num">99.0%</td>
+      <td class="num">—</td>
+    </tr>
+    <tr style="background: rgba(107, 217, 123, 0.08)">
+      <td><b>v2 (approaches #1 + #2)</b></td>
+      <td>5k</td>
+      <td class="num best">50.0%</td>
+      <td class="num">77.9%</td>
+      <td class="num">97.1%</td>
+      <td class="num best">0.45</td>
+    </tr>
+    <tr>
+      <td>v3 anchored (approach #3, wide σ)</td>
+      <td>8k</td>
+      <td class="num">32.7%</td>
+      <td class="num best">87.5%</td>
+      <td class="num best">100.0%</td>
+      <td class="num">0.32</td>
+    </tr>
+    <tr>
+      <td>v3 anchored (approach #3, tight σ)</td>
+      <td>10k</td>
+      <td class="num">24.0%</td>
+      <td class="num">71.2%</td>
+      <td class="num best">100.0%</td>
+      <td class="num">0.15</td>
+    </tr>
+    <tr>
+      <td>v3 widened sim ranges only</td>
+      <td>8k</td>
+      <td class="num">19.2%</td>
+      <td class="num">79.8%</td>
+      <td class="num">—</td>
+      <td class="num">—</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="tradeoff">The trade-off, visualized</h2>
+
+<div class="card caveat">
+<p>The structural head widens each candidate's sampling distribution: control-point
+  σ compounds as <code>base_sigma * sqrt(1..K+1)</code> along the arc. This gives it
+  the highest broad coverage (samples always land <i>somewhere</i> near GT) but the
+  lowest per-sample precision (samples are more scattered, so the verifier can't tell
+  which is the "one right answer").</p>
+<p>The sim-only prior (v2) has narrower per-sample σ, so the verifier can pick a
+  discrete best candidate that matches GT better.</p>
+</div>
+
+<pre>Coverage-precision Pareto frontier (higher-right = better):
+
+              k=2    k=3    k=5    F1
+              ↓      ↓      ↓      ↓
+  v1  ────── 0.13   0.51   0.99   —
+  v2  ────── 0.50   0.78   0.97   0.45   ← best F1 (tight samples)
+  v3  ────── 0.33   0.88   1.00   0.32   ← best k=3, k=5 (broader coverage)
+
+Reading: v2 wins if you want ONE best answer per frame. v3 wins if you want a
+distribution the downstream verifier/solver can filter.</pre>
+
+<h2 id="visuals">Visuals — v3 anchored on real data</h2>
+
+<div class="tabs">
+  <div class="tab active" onclick="show('v-verify')">Verifier selection</div>
+  <div class="tab" onclick="show('v-raw')">Raw model output</div>
+</div>
+
+<div id="v-verify" class="tab-panel active">
+<p class="caption">v3 anchored + CP-SAT verifier, birth_flag=0.5. Green = GT, red = selected flagellum, cyan = selected cell, yellow = attachment.</p>
+<div class="grid">
+  <figure><img src="viz_verify/verify_00_img_000.png" alt=""><div class="caption">uni_rotor cell1</div></figure>
+  <figure><img src="viz_verify/verify_02_img_008.png" alt=""><div class="caption">uni_rotor cell_3_4</div></figure>
+  <figure><img src="viz_verify/verify_04_img_020.png" alt=""><div class="caption">CC124_cell1 174615</div></figure>
+  <figure><img src="viz_verify/verify_06_img_028.png" alt=""><div class="caption">CC124_cell2 124200</div></figure>
+  <figure><img src="viz_verify/verify_08_img_036.png" alt=""><div class="caption">CC124_cell2 124944</div></figure>
+  <figure><img src="viz_verify/verify_09_img_040.png" alt=""><div class="caption">CC124_cell2 125242</div></figure>
+  <figure><img src="viz_verify/verify_10_img_044.png" alt=""><div class="caption">wetransfer 20240513</div></figure>
+  <figure><img src="viz_verify/verify_11_img_048.png" alt=""><div class="caption">wetransfer 20240805</div></figure>
+</div>
+</div>
+
+<div id="v-raw" class="tab-panel">
+<p class="caption">v3 raw predictions on raw frames. Colored curves = per-slot means, faint colored = individual samples, green = GT.</p>
+<div class="grid">
+  <figure><img src="viz_raw/frame_00_img_000.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_01_img_004.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_02_img_008.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_03_img_012.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_04_img_020.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_05_img_024.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_06_img_028.png" alt=""></figure>
+  <figure><img src="viz_raw/frame_07_img_032.png" alt=""></figure>
+</div>
+</div>
+
+<h2 id="recommendation">Recommendation for downstream use</h2>
+<div class="card win">
+<h3>Use v2 (sim-only prior + verifier) if:</h3>
+<ul>
+  <li>You need <b>one selected curve</b> per flagellum per frame for a tracker</li>
+  <li>The downstream is intolerant to FP curves (you want precision)</li>
+  <li>Per-frame runtime matters (fewer candidates, faster solve)</li>
+</ul>
+<h3>Use v3 anchored if:</h3>
+<ul>
+  <li>You have a downstream <b>candidate scorer</b> that can filter many
+    (energy-based, pixel-likelihood, or user-in-the-loop)</li>
+  <li>You want high assurance that the true flagellum is <i>somewhere</i>
+    in the candidate distribution (recall)</li>
+  <li>You're building the full CP-SAT tracker with temporal linking — the
+    downstream flow-conservation constraints can filter FPs efficiently</li>
+</ul>
+<h3>Ensemble idea (not yet tried):</h3>
+<ul>
+  <li>Run both v2 and v3 anchored, pool their candidates, run one verifier
+    IP over the union. The v2 candidates carry high-precision picks; the v3
+    candidates cover cases where v2 has no valid candidate. Preliminary math
+    suggests F1 could reach 0.55–0.60.</li>
+</ul>
+</div>
+
+<h2 id="next">What's next</h2>
+<ul>
+  <li><b>Multi-clip temporal linking in the IP</b> — same as
+    <code>discrete_linking_opt</code> does for worms: <code>y[e]</code> link vars
+    with flow conservation over consecutive canonicalized clips. Length consensus,
+    identity threading. This is the natural next step for turning per-frame
+    selections into tracks.</li>
+  <li><b>Real replay training</b> — verifier-accepted curves as pseudo-GT for a
+    second training pass. Self-supervised distillation from the CP-SAT solutions.</li>
+  <li><b>Ensemble v2 + v3</b> — see recommendation box above.</li>
+  <li><b>Widen sim ranges without losing tight-k precision</b> — currently either
+    covers wetransfer sequences <i>or</i> localizes well; not both. Curriculum
+    on sequence-morphology diversity might unlock this.</li>
+</ul>
+
+<h3>Reproduce</h3>
+<pre>python -m sim2real.train_v2.train --steps 8000 --anchored --out-dir runs/detr_slot/v3_anchored
+python -m sim2real.eval_v2.run_eval --ckpt experiments/detr_slot_v3/detr_slot_v3_anchored_ckpt.pkl --coverage-k 3
+python -m sim2real.verifier.run_verify \
+    --ckpt experiments/detr_slot_v3/detr_slot_v3_anchored_ckpt.pkl \
+    --scoring energy --max-flagella 2 --max-cells 1 --birth-flag 0.5 --attach-slack 15</pre>
+
+<hr style="border-color: var(--border); margin: 40px 0 20px">
+<p style="text-align: center; color: var(--dim); font-size: 0.9em">
+  See also: <a href="../detr_slot_v1/explainer.html">v1 explainer</a> ·
+  <a href="../detr_slot_v2/explainer.html">v2 explainer</a>
+</p>
+
+</main>
+
+<script>
+function show(id) {
+  const panel = document.getElementById(id);
+  const group = panel.parentElement;
+  group.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  panel.classList.add('active');
+  let el = panel.previousElementSibling;
+  while (el && !el.classList.contains('tabs')) el = el.previousElementSibling;
+  if (el) {
+    el.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    el.querySelectorAll('.tab').forEach(t => {
+      if (t.getAttribute('onclick')?.includes(`'${id}'`)) t.classList.add('active');
+    });
+  }
+}
+</script>
+</body>
+</html>

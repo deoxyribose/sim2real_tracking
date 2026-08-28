@@ -8,6 +8,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
+from .anchored_flagellum_head import AnchoredFlagellumHead
 from .encoder import Encoder
 from .heads import CellHead, ClassHead, FlagellumHead
 from .slot_attention import SlotAttention
@@ -23,6 +24,9 @@ class DETRSlotConfig:
     encoder_d_model: int = 128
     encoder_channels: tuple[int, ...] = (32, 64, 128)
     encoder_strides: tuple[int, ...] = (2, 2, 2)
+    # If True, use the structural cell-anchored flagellum head (approach #3) — flagellum
+    # attachment is DERIVED from a chosen cell slot rather than free (y, x).
+    anchored_flagellum: bool = False
 
 
 class DETRSlotModel(nn.Module):
@@ -54,6 +58,10 @@ class DETRSlotModel(nn.Module):
         )(features)
 
         class_logits = ClassHead(d_ff=self.cfg.d_ff_head, name="class_head")(slots)
-        flag_out = FlagellumHead(d_ff=self.cfg.d_ff_head, name="flagellum_head")(slots)
         cell_out = CellHead(d_ff=self.cfg.d_ff_head // 2, name="cell_head")(slots)
+        if self.cfg.anchored_flagellum:
+            flag_out = AnchoredFlagellumHead(d_ff=self.cfg.d_ff_head, name="anchored_flag_head")(
+                slots, cell_out)
+        else:
+            flag_out = FlagellumHead(d_ff=self.cfg.d_ff_head, name="flagellum_head")(slots)
         return dict(class_logits=class_logits, **flag_out, **cell_out)
