@@ -10,8 +10,14 @@ dist/
 
 # Virtual envs
 .venv/
+.venv-*/
 venv/
 env/
+
+# External / large data — NOT part of the codebase
+algae_data/
+sam3_repo/
+checkpoints/sam3/
 
 # Editor / IDE
 .vscode/

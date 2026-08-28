@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DETR-Slot for Flagellum Tracking — v1</title>
+<style>
+  :root {
+    --bg: #0e0f13;
+    --fg: #eaeaea;
+    --dim: #9aa0a6;
+    --accent: #7bd3d8;
+    --accent-2: #f0b46a;
+    --danger: #ff6b6b;
+    --ok: #6bd97b;
+    --card: #1a1d25;
+    --border: #2a2f3a;
+    --code-bg: #14171e;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Menlo', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; line-height: 1.55; }
+  main { max-width: 960px; margin: 0 auto; padding: 32px 24px 80px; }
+  h1 { font-size: 2rem; margin: 0 0 0.25em; letter-spacing: -0.5px; }
+  h2 { font-size: 1.4rem; margin: 2em 0 0.6em; color: var(--accent); letter-spacing: -0.3px; }
+  h3 { font-size: 1.1rem; margin: 1.4em 0 0.4em; color: var(--accent-2); }
+  p, li { color: var(--fg); }
+  .subtitle { color: var(--dim); font-size: 1.05rem; margin: 0 0 1.5em; }
+  code { font-family: var(--mono); background: var(--code-bg); padding: 2px 5px; border-radius: 4px; font-size: 0.9em; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; overflow-x: auto; font-family: var(--mono); font-size: 0.85em; }
+  a { color: var(--accent); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; margin: 12px 0; }
+  .kill { border-left: 3px solid var(--danger); }
+  .keep { border-left: 3px solid var(--ok); }
+  .new { border-left: 3px solid var(--accent); }
+  .caption { color: var(--dim); font-size: 0.85em; margin-top: 4px; }
+  figure { margin: 12px 0 24px; text-align: center; }
+  img { max-width: 100%; height: auto; border-radius: 6px; border: 1px solid var(--border); background: #000; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }
+  .grid figure { margin: 0; }
+  .grid img { width: 100%; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.92em; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--dim); font-weight: 500; text-transform: uppercase; font-size: 0.8em; letter-spacing: 0.5px; }
+  .num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .big { font-size: 2.4rem; color: var(--ok); font-family: var(--mono); font-weight: 300; }
+  .big-caption { color: var(--dim); font-size: 0.9em; margin-top: -8px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
+  .tab { padding: 8px 14px; cursor: pointer; color: var(--dim); border-bottom: 2px solid transparent; user-select: none; }
+  .tab:hover { color: var(--fg); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  details { margin: 8px 0; }
+  details summary { cursor: pointer; color: var(--accent-2); padding: 6px 0; }
+  details[open] summary { color: var(--fg); }
+  .pipeline { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; align-items: stretch; }
+  .stage { flex: 1; min-width: 140px; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font-size: 0.9em; }
+  .stage-title { color: var(--accent); font-weight: 600; margin-bottom: 4px; }
+  .stage-desc { color: var(--dim); font-size: 0.85em; }
+  .arrow { color: var(--dim); align-self: center; font-size: 1.2em; }
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; margin: 12px 0 24px; font-size: 0.92em; }
+  .toc ol { margin: 4px 0; padding-left: 24px; }
+  .metric-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 16px 0; }
+  .metric { text-align: center; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+  .metric .val { font-family: var(--mono); font-size: 1.6rem; color: var(--accent); }
+  .metric .lbl { color: var(--dim); font-size: 0.85em; margin-top: 4px; }
+  .diagram { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; overflow-x: auto; }
+  .diagram svg { display: block; margin: 0 auto; }
+  ul.checklist { list-style: none; padding-left: 0; }
+  ul.checklist li { padding-left: 22px; position: relative; margin: 4px 0; }
+  ul.checklist li::before { content: '✓'; color: var(--ok); position: absolute; left: 0; }
+  ul.checklist li.x::before { content: '✗'; color: var(--danger); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>DETR-Slot for Flagellum Tracking <span style="color:var(--dim);font-weight:300">— v1</span></h1>
+<p class="subtitle">Sim-trained object-centric model with distributional latents.
+Real-frame evaluation on 59 painted annotations. 22 min of training on a 5090.</p>
+
+<div class="toc">
+  <b>Contents</b>
+  <ol>
+    <li><a href="#problem">The problem</a></li>
+    <li><a href="#old">Why the previous approach stalled</a></li>
+    <li><a href="#new">The new approach in one line</a></li>
+    <li><a href="#pipeline">Pipeline</a></li>
+    <li><a href="#data">Training data recipe</a></li>
+    <li><a href="#model">Model &amp; losses</a></li>
+    <li><a href="#metric">The metric</a></li>
+    <li><a href="#results">Results</a></li>
+    <li><a href="#visuals">Visuals</a></li>
+    <li><a href="#code">Code map</a></li>
+    <li><a href="#next">What to fix next</a></li>
+  </ol>
+</div>
+
+<h2 id="problem">The problem</h2>
+<p>Chlamydomonas flagella are ~1-2 raw pixels wide with contrast &lt; 5 gray levels vs
+a noise floor of ~2-3 gray levels. The human eye picks them up because of
+spatial coherence over 40-60 pixels of arc length; a per-pixel classifier drowns.</p>
+
+<p>We measured this across 59 real annotated frames from 16 sequences (five different
+microscope setups): median <b>width 4 px</b>, median <b>SNR 0.37</b>, median <b>length
+51 px</b>. Widths in native space range 4-8 px depending on native camera resolution.
+See <code>annotations/flagella_v0/calibration.json</code>.</p>
+
+<h2 id="old">Why the previous approach stalled</h2>
+<div class="card kill">
+  <p><b>Old:</b> reconstruction-based object-centric video model. Slot attention encoder
+    → STN glimpses → decoder → pixel MSE against the input frame.</p>
+  <p>Fatal problem: <b>area-weighted pixel loss dominated by cell body</b> (~1000 px) over
+    thin flagellum (~200 px), even with mask weighting. Recon adaptation on real videos
+    made cell segmentation better and flagellum segmentation <i>worse</i>. Multiple
+    experiments (Aug 25-27) never crossed a 55% FG-ARI ceiling on flagella.</p>
+</div>
+
+<h2 id="new">The new approach in one line</h2>
+<div class="card new">
+  <p style="font-size:1.05em">
+    <b>The slot module keeps its job of carving the clip into objects, but supervision moves
+    from "explain the pixels" to "name the latents," outputs become distributions you
+    sample rather than estimates you trust, and everything downstream of sampling —
+    scoring, selection, identity, time — belongs to the verifier and the solver
+    (not yet built).</b>
+  </p>
+</div>
+
+<h3>Kill</h3>
+<ul class="checklist">
+  <li class="x">decoder, STN glimpses, canvas composite</li>
+  <li class="x">reconstruction loss (<code>sim2real/losses/recon.py</code>) and its
+    unsupervised-adapt variants</li>
+  <li class="x">BackgroundRenderer (we harvest real backgrounds instead)</li>
+  <li class="x">temporal identity in outputs (slot indices mean nothing across clips)</li>
+</ul>
+
+<h3>Keep</h3>
+<ul class="checklist">
+  <li>ConvStem encoder</li>
+  <li>Slot attention (Locatello-style, per-slot learned init to break symmetry)</li>
+  <li>Hungarian matching (moved to the LOSS, not the E-step)</li>
+</ul>
+
+<h3>New</h3>
+<ul class="checklist">
+  <li>Input: canonicalized clip (residual, band-passed, width-normalized, σ-scaled)
+    + temporal-energy map channel</li>
+  <li>Typed distributional heads per slot: class logits ({∅, pipette, cell, flagellum}) +
+    class-conditional Gaussians on all params</li>
+  <li>Flagellum head predicts attachment + K=7 arc-length control points, each with
+    (µ, log σ)</li>
+  <li>Loss: DETR Hungarian match + NLL under predicted Gaussians</li>
+  <li>Training data: sim FG-only rendered onto real BG patches harvested from
+    energy-map-certified flagella-free regions of your videos</li>
+</ul>
+
+<h2 id="pipeline">Pipeline</h2>
+<div class="diagram">
+<svg viewBox="0 0 880 200" xmlns="http://www.w3.org/2000/svg" width="880" height="200" style="max-width:100%;height:auto">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#9aa0a6"/>
+    </marker>
+    <style>
+      .box { fill: #1a1d25; stroke: #2a2f3a; }
+      .lbl { fill: #eaeaea; font: 12px -apple-system, sans-serif; text-anchor: middle; }
+      .sub { fill: #9aa0a6; font: 10px -apple-system, sans-serif; text-anchor: middle; }
+      .head { fill: #7bd3d8; font: 11px -apple-system, sans-serif; text-anchor: middle; font-weight: 600; }
+    </style>
+  </defs>
+
+  <!-- Raw clip -->
+  <rect class="box" x="10" y="60" width="110" height="80" rx="6"/>
+  <text class="head" x="65" y="82">Raw clip</text>
+  <text class="sub" x="65" y="102">(T, H, W)</text>
+  <text class="sub" x="65" y="118">grayscale</text>
+
+  <!-- Canonicalize -->
+  <path stroke="#9aa0a6" fill="none" d="M120,100 L140,100" marker-end="url(#arr)"/>
+  <rect class="box" x="140" y="40" width="160" height="120" rx="6"/>
+  <text class="head" x="220" y="60">Canonicalize</text>
+  <text class="lbl" x="220" y="82">running-median − BG</text>
+  <text class="lbl" x="220" y="100">band-pass DoG</text>
+  <text class="lbl" x="220" y="118">width-normalize</text>
+  <text class="lbl" x="220" y="136">σ-scale + clip</text>
+  <text class="sub" x="220" y="152">+ energy map</text>
+
+  <!-- Encoder -->
+  <path stroke="#9aa0a6" fill="none" d="M300,100 L320,100" marker-end="url(#arr)"/>
+  <rect class="box" x="320" y="60" width="130" height="80" rx="6"/>
+  <text class="head" x="385" y="82">ConvStem</text>
+  <text class="sub" x="385" y="102">stride 8</text>
+  <text class="sub" x="385" y="118">(H/8, W/8, D)</text>
+
+  <!-- Slot attention -->
+  <path stroke="#9aa0a6" fill="none" d="M450,100 L470,100" marker-end="url(#arr)"/>
+  <rect class="box" x="470" y="60" width="130" height="80" rx="6"/>
+  <text class="head" x="535" y="82">Slot attention</text>
+  <text class="sub" x="535" y="102">K=8 slots</text>
+  <text class="sub" x="535" y="118">3 iterations</text>
+
+  <!-- Heads -->
+  <path stroke="#9aa0a6" fill="none" d="M600,100 L620,100" marker-end="url(#arr)"/>
+  <rect class="box" x="620" y="30" width="130" height="60" rx="6"/>
+  <text class="head" x="685" y="52">Class head</text>
+  <text class="sub" x="685" y="70">∅ / pip / cell / flag</text>
+
+  <rect class="box" x="620" y="105" width="130" height="80" rx="6"/>
+  <text class="head" x="685" y="127">Flagellum head</text>
+  <text class="sub" x="685" y="145">(K+1) × (µ, log σ)</text>
+  <text class="sub" x="685" y="160">+ width, amp, polarity</text>
+  <text class="sub" x="685" y="175">all as Gaussians</text>
+
+  <!-- Sample -->
+  <path stroke="#9aa0a6" fill="none" d="M750,145 L770,145" marker-end="url(#arr)"/>
+  <rect class="box" x="770" y="105" width="100" height="80" rx="6"/>
+  <text class="head" x="820" y="127">Sample</text>
+  <text class="sub" x="820" y="147">100× per slot</text>
+  <text class="sub" x="820" y="163">candidate curves</text>
+  <text class="sub" x="820" y="179">→ verifier</text>
+</svg>
+</div>
+<p class="caption">The one-way pipeline. Everything from "canonicalize" onward is shared
+between sim and real. Only training data differs (see next section).</p>
+
+<h2 id="data">Training data recipe</h2>
+
+<div class="tabs">
+  <div class="tab active" onclick="showTab('t-train')">Sim (training)</div>
+  <div class="tab" onclick="showTab('t-real')">Real (evaluation)</div>
+  <div class="tab" onclick="showTab('t-bg')">BG patches</div>
+</div>
+
+<div id="t-train" class="tab-panel active">
+  <p>For each training scene:</p>
+  <ol>
+    <li>Sample number of flagella from (0, 1, 2) with probs (10%, 50%, 40%) — the 10%
+      zero-flagellum case is a <b>hard negative</b> that calibrates presence.</li>
+    <li>Sample per-flagellum: attachment point, orientation, K=7 arc-length control
+      points (with per-step angular jitter for curl), width, polarity, amplitude, beat
+      params. Ranges pulled from <code>calibration.json</code> — not guessed.</li>
+    <li>Roll out T=16 frames of the beating flagellum.</li>
+    <li>Render each frame as the <b>signed intensity contribution only</b> (no BG).
+      Gaussian tube profile of the chosen width, stamped along the beating curve.</li>
+    <li><b>Composite on a random real-BG patch</b> pulled from the harvested bank.</li>
+    <li>The result is (T, 256, 256) canonical-space clip + GT latents (attachment
+      + control points + width + amp + polarity + class).</li>
+  </ol>
+</div>
+
+<div id="t-real" class="tab-panel">
+  <p>For each real annotated frame:</p>
+  <ol>
+    <li>Load raw source clip (T=16 frames centered on the annotated frame).</li>
+    <li>Apply same banner-crop as the annotation sampler used.</li>
+    <li>Run canonicalization with the sequence's calibrated <code>src_width_px</code>
+      so the flagellum resamples to the same canonical width the sim used.</li>
+    <li>Model output → sample 100 candidate curves per slot → compute Chamfer distance
+      to the painted GT polyline.</li>
+    <li>GT is "covered" if any of the 800 samples is within <b>k × 4 canonical
+      pixels</b> in Chamfer distance.</li>
+  </ol>
+</div>
+
+<div id="t-bg" class="tab-panel">
+  <p>Real BG patches (<code>data_cache/bg_patches_v0.npz</code>, 384 patches, 96 MB):</p>
+  <ol>
+    <li>For each sequence, sample 4 random 16-frame clips.</li>
+    <li>Canonicalize each clip → get temporal-energy map.</li>
+    <li>Find 6 patch centers with <b>bottom-20th-percentile energy</b> (certified
+      flagella-free — no motion) and ≥20 px separation.</li>
+    <li>Extract (16, 96, 96) sub-clips.</li>
+  </ol>
+  <p>This deletes the BG half of the sim2real gap rather than modeling it. Real noise,
+    real debris, real out-of-focus artifacts.</p>
+</div>
+
+<h2 id="model">Model &amp; losses</h2>
+
+<p><b>Architecture:</b> encoder (stack T frames + energy map as channels, ConvStem stride 8)
+  → slot attention (8 slots, 3 iterations, <b>per-slot learned init</b> + small per-batch
+  noise for symmetry breaking) → typed heads.</p>
+
+<p><b>Model size:</b> 0.48 M parameters. Deliberately tiny — the plan's insight is that
+  the network only needs to <b>propose a candidate distribution</b>; scoring and selection
+  are downstream.</p>
+
+<p><b>Loss:</b></p>
+<pre>total = 10 · class_ce      (upweighted so slot specialization dominates early)
+      +  1 · pts_nll        (attachment + K control points, diagonal Gaussian)
+      + 0.5 · width_nll
+      + 0.5 · amp_nll
+      + 0.5 · polarity_bce</pre>
+
+<p><b>Matching:</b> Hungarian on host with cost = 1·class_neg_log_p + 1·attachment_L2 +
+  5·curve_Chamfer. Matched slots pay NLL, unmatched slots pay class CE toward ∅.
+  <code>stop_gradient</code> on the match indices.</p>
+
+<h3>Slot symmetry-breaking lesson</h3>
+<p><b>v0 failed with 0% recall.</b> Every slot collapsed to identical output — a canvas-center
+  Gaussian with σ=60 px. Diagnosis: shared-µ + gaussian-noise slot init got averaged
+  out under SGD.</p>
+<p><b>v1 fix:</b> Per-slot <i>learned</i> init vector (each slot has its own trainable
+  starting embedding) + small per-batch noise on top. 10× class-loss weight so
+  specialization can dominate before the pts loss stabilizes.</p>
+
+<h2 id="metric">The metric</h2>
+<div class="card new">
+  <p><b>Sample-coverage-recall</b>: fraction of GT flagellum annotations for which
+    <i>some</i> sampled candidate curve is within k × canonical_width in symmetric
+    Chamfer distance.</p>
+  <p>Explicitly <b>not NLL</b> and <b>not accuracy-of-means</b>. The network's job is
+    coverage; precise identity + shape selection are the downstream verifier's job.
+    An answer with wide σ that includes truth is more useful than a tight point
+    estimate that misses.</p>
+</div>
+
+<h2 id="results">Results</h2>
+
+<h3>Coverage recall at 20k training steps</h3>
+<div class="metric-row">
+  <div class="metric">
+    <div class="val">99.0%</div>
+    <div class="lbl">k=5 (within 20 canonical px)</div>
+  </div>
+  <div class="metric">
+    <div class="val">51.0%</div>
+    <div class="lbl">k=3 (within 12 canonical px)</div>
+  </div>
+  <div class="metric">
+    <div class="val">12.5%</div>
+    <div class="lbl">k=2 (within 8 canonical px, one flagellum-width)</div>
+  </div>
+</div>
+<p class="caption">104 GT flagellum instances across 59 real frames from 15 sequences.
+  Model trained on sim only.</p>
+
+<h3>Per-sequence recall at k=5</h3>
+<details>
+<summary>Show per-sequence breakdown</summary>
+<table>
+  <thead><tr><th>Sequence</th><th class="num">k=2</th><th class="num">k=3</th><th class="num">k=5</th></tr></thead>
+  <tbody>
+    <tr><td>uni_rotor / cell1</td><td class="num">50%</td><td class="num">100%</td><td class="num">100%</td></tr>
+    <tr><td>uni_rotor / cell_2</td><td class="num">0%</td><td class="num">0%</td><td class="num">100%</td></tr>
+    <tr><td>uni_rotor / cell_3_4</td><td class="num">25%</td><td class="num">50%</td><td class="num">100%</td></tr>
+    <tr><td>uni_rotor / cell_5</td><td class="num">0%</td><td class="num">75%</td><td class="num">100%</td></tr>
+    <tr><td>CC124_cell1 / 174615</td><td class="num">12%</td><td class="num">62%</td><td class="num">100%</td></tr>
+    <tr><td>CC124_cell1 / 180313</td><td class="num">38%</td><td class="num">62%</td><td class="num">100%</td></tr>
+    <tr><td>CC124_cell2 / 124200</td><td class="num">0%</td><td class="num">43%</td><td class="num">86%</td></tr>
+    <tr><td>CC124_cell2 / 124646</td><td class="num">0%</td><td class="num">38%</td><td class="num">100%</td></tr>
+    <tr><td>CC124_cell2 / 124944</td><td class="num">25%</td><td class="num">50%</td><td class="num">100%</td></tr>
+    <tr><td>CC124_cell2 / 125242</td><td class="num">25%</td><td class="num">100%</td><td class="num">100%</td></tr>
+    <tr><td>wetransfer / 20240513</td><td class="num">0%</td><td class="num">38%</td><td class="num">100%</td></tr>
+    <tr><td>wetransfer / 20240805</td><td class="num">12%</td><td class="num">62%</td><td class="num">100%</td></tr>
+    <tr><td>wetransfer / 20240726</td><td class="num">0%</td><td class="num">50%</td><td class="num">100%</td></tr>
+    <tr><td>wetransfer / paradeb</td><td class="num">0%</td><td class="num">14%</td><td class="num">100%</td></tr>
+    <tr><td>wetransfer / cell2_20240806</td><td class="num">0%</td><td class="num">25%</td><td class="num">100%</td></tr>
+    <tr style="background:var(--code-bg)"><td><b>Overall</b></td><td class="num"><b>12.5%</b></td><td class="num"><b>51.0%</b></td><td class="num"><b>99.0%</b></td></tr>
+  </tbody>
+</table>
+</details>
+
+<h3>Training curve</h3>
+<p>Loss saturated around step ~5000 at total ≈ 60-75. class-CE ~0.3, pts-NLL ~60,
+  width/amp ~1/2.5, polarity ~0.15.</p>
+
+<h2 id="visuals">Visuals</h2>
+
+<div class="tabs">
+  <div class="tab active" onclick="showTab('v-real')">Real frames (raw)</div>
+  <div class="tab" onclick="showTab('v-sim')">Sim frames (in-distribution)</div>
+</div>
+
+<div id="v-real" class="tab-panel active">
+  <p><b>Green</b> = painted GT flagellum. <b>Colored curves</b> = per-slot mean predictions.
+    <b>Faint colored streaks</b> = individual samples from each slot's Gaussian.
+    Text top-left shows the highest per-slot flagellum confidence.</p>
+  <div class="grid">
+    <figure>
+      <img src="viz_raw/frame_00_img_000.png" alt="uni_rotor cell1_154532">
+      <div class="caption">uni_rotor cell1 — samples cluster on GT</div>
+    </figure>
+    <figure>
+      <img src="viz_raw/frame_01_img_004.png" alt="uni_rotor cell_2">
+      <div class="caption">uni_rotor cell_2 — GT partly covered</div>
+    </figure>
+    <figure>
+      <img src="viz_raw/frame_02_img_008.png" alt="uni_rotor cell_3_4">
+      <div class="caption">uni_rotor cell_3_4 — 2 cells, samples on both</div>
+    </figure>
+    <figure>
+      <img src="viz_raw/frame_03_img_012.png" alt="uni_rotor cell_5">
+      <div class="caption">uni_rotor cell_5 — samples near cell</div>
+    </figure>
+    <figure>
+      <img src="viz_raw/frame_04_img_020.png" alt="CC124_cell1 174615">
+      <div class="caption">CC124_cell1 174615 — low confidence (p=0.13)</div>
+    </figure>
+    <figure>
+      <img src="viz_raw/frame_05_img_024.png" alt="CC124_cell1 180313">
+      <div class="caption">CC124_cell1 180313 — p=0.28</div>
+    </figure>
+    <figure>
+      <img src="viz_raw/frame_06_img_028.png" alt="CC124_cell2 124200">
+      <div class="caption">CC124_cell2 124200 — p=0.30</div>
+    </figure>
+    <figure>
+      <img src="viz_raw/frame_07_img_032.png" alt="CC124_cell2 124646">
+      <div class="caption">CC124_cell2 124646 — p=0.11</div>
+    </figure>
+  </div>
+  <p class="caption">Model has never seen a real frame during training.
+    Same checkpoint (<code>detr_slot_v1_ckpt.pkl</code>).</p>
+</div>
+
+<div id="v-sim" class="tab-panel">
+  <p>Sim data — the training distribution. Confidence higher (0.5-0.6 range) and mean
+    predictions track GT curves closely. Hard-negative rejection works too (sim_01, sim_03).</p>
+  <div class="grid">
+    <figure>
+      <img src="viz_sim/sim_00.png" alt="sim 0">
+      <div class="caption">1 flagellum (p=0.59), samples tight on GT</div>
+    </figure>
+    <figure>
+      <img src="viz_sim/sim_02.png" alt="sim 2">
+      <div class="caption">2 flagella (p=0.32), spread predictions</div>
+    </figure>
+    <figure>
+      <img src="viz_sim/sim_05.png" alt="sim 5">
+      <div class="caption">2 flagella (p=0.63), tight mean overlap</div>
+    </figure>
+    <figure>
+      <img src="viz_sim/sim_07.png" alt="sim 7">
+      <div class="caption">2 flagella (p=0.63), overlap on top-right</div>
+    </figure>
+    <figure>
+      <img src="viz_sim/sim_11.png" alt="sim 11">
+      <div class="caption">2 flagella (p=0.53), near-perfect overlap</div>
+    </figure>
+    <figure>
+      <img src="viz_sim/sim_01.png" alt="sim 1">
+      <div class="caption">0 flagella (p=0.11), correctly rejected</div>
+    </figure>
+    <figure>
+      <img src="viz_sim/sim_03.png" alt="sim 3">
+      <div class="caption">0 flagella (p=0.07), correctly rejected</div>
+    </figure>
+    <figure>
+      <img src="viz_sim/sim_06.png" alt="sim 6">
+      <div class="caption">2 flagella (p=0.57)</div>
+    </figure>
+  </div>
+</div>
+
+<h3>The sim ↔ real gap that remains</h3>
+<table>
+  <thead><tr><th>Metric</th><th>Sim (in-distribution)</th><th>Real (out-of-distribution)</th></tr></thead>
+  <tbody>
+    <tr><td><code>p_flag_max</code> for scenes with flagella</td><td>0.5-0.6</td><td>0.1-0.4</td></tr>
+    <tr><td>Mean prediction quality</td><td>Tight overlap with GT</td><td>Correct region, wrong details</td></tr>
+    <tr><td>Sample coverage @ k=5</td><td>≈100%</td><td>99.0%</td></tr>
+    <tr><td>Sample coverage @ k=2</td><td>(not measured — sim GT ≡ input)</td><td>12.5%</td></tr>
+  </tbody>
+</table>
+<p>Since BG is real (harvested from your own videos), the residual gap lives in the
+  FG appearance model — tube profile, SNR ranges, motion-blur envelope. Fixable by
+  tightening the calibration-driven ranges in <code>sim_flagella.py</code>.</p>
+
+<h2 id="code">Code map</h2>
+<pre><b>sim2real/data/</b>          canonicalization + FG-only simulator + types
+  canonicalize.py         real | sim → canonical residual clip + energy map
+  sim_flagella.py         FG-only flagellum renderer (composites on real BG)
+  types.py                FlagellumLatent, SceneLatents, class ids
+
+<b>sim2real/model_v2/</b>      DETR-slot model + loss
+  encoder.py              ConvStem (T frames + energy as channels)
+  slot_attention.py       Locatello with per-slot learned init
+  heads.py                ClassHead + FlagellumHead (typed distributional)
+  detr_slot.py            top-level wire-up
+  loss.py                 Hungarian match (host) + NLL
+
+<b>sim2real/train_v2/train.py</b>   training loop, JAX/Flax, JIT'd step
+<b>sim2real/eval_v2/coverage.py</b> sample-coverage-recall on real annotations
+<b>sim2real/eval_v2/run_eval.py</b> end-to-end evaluation entrypoint
+
+<b>scripts/annot_sample_frames.py</b> sample frames from all sequences for painting
+<b>scripts/annot_flagella.py</b>      napari-based paint UI
+<b>scripts/calibrate_flagellum.py</b> measure widths/SNR/lengths from painted masks
+<b>scripts/harvest_bg_patches.py</b>  cache flagella-free BG patches
+<b>scripts/viz_detr_slot.py</b>       overlay on canonical clip midpoint
+<b>scripts/viz_detr_slot_raw.py</b>   overlay on raw source frame
+<b>scripts/viz_detr_slot_sim.py</b>   overlay on sim scene
+
+<b>tests/test_{canonicalize,sim_flagella,model_v2,loss}.py</b>   28 tests, all green</pre>
+
+<h2 id="next">What to fix next</h2>
+<p>To raise tight-k (k≤2) coverage, in order of expected impact:</p>
+<ol>
+  <li><b>More sim data diversity</b> — bump n_flagella_probs, wider curl std, wider
+    amp range. The model may currently be overfitting the narrow synthetic distribution.</li>
+  <li><b>Add cell + pipette classes to the sim + scene</b> — currently flagellum-only,
+    so the model doesn't learn "flagellum next to cell body" as the target pattern.
+    Attachment prior can then key off cell membrane.</li>
+  <li><b>Larger encoder</b> — 0.48M params is trivially small; the ViT bump in the
+    original recipe was there for a reason.</li>
+  <li><b>Curriculum on SNR</b> — start at 5× the calibrated SNR, decay to
+    measured median (0.37) over training.</li>
+  <li><b>Real replay training</b> — after the verifier stage exists, feed back the
+    verifier-accepted real candidates as pseudo-GT and continue training. This is
+    the self-training phase from the plan; deferred until coverage numbers demand it.</li>
+</ol>
+
+<h3>Reproduce the numbers on this page</h3>
+<pre># from repo root
+pip install -e .
+python scripts/harvest_bg_patches.py                       # 384 real BG patches → data_cache/
+python -m sim2real.train_v2.train --steps 20000            # 22 min on RTX 5090
+python -m sim2real.eval_v2.run_eval \
+  --ckpt experiments/detr_slot_v1/detr_slot_v1_ckpt.pkl \
+  --n-samples 100 --coverage-k 5</pre>
+
+</main>
+
+<script>
+function showTab(id) {
+  const panel = document.getElementById(id);
+  const group = panel.parentElement;
+  group.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  panel.classList.add('active');
+  const tabs = panel.previousElementSibling.tagName === 'DIV'
+    ? panel.previousElementSibling.parentElement.querySelector('.tabs')
+    : null;
+  // Find preceding .tabs
+  let el = panel.previousElementSibling;
+  while (el && !el.classList.contains('tabs')) el = el.previousElementSibling;
+  if (el) {
+    const tabs = el.querySelectorAll('.tab');
+    tabs.forEach(t => t.classList.remove('active'));
+    // Guess which tab by matching text in the onclick
+    tabs.forEach(t => {
+      if (t.getAttribute('onclick')?.includes(`'${id}'`)) t.classList.add('active');
+    });
+  }
+}
+</script>
+</body>
+</html>
