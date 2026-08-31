@@ -508,14 +508,26 @@ essential structure.</p>
 <td style="padding:4px 12px; text-align:center;">0.654</td>
 </tr>
 <tr style="background:#f2faf5;">
-<td style="padding:4px 12px;"><b>v3 (BCE score, 50k)</b></td>
+<td style="padding:4px 12px;"><b>v3 (BCE score, 7M, 50k)</b></td>
 <td style="padding:4px 12px; text-align:center;"><b>0.750</b></td>
 <td style="padding:4px 12px; text-align:center;"><b>0.654</b></td>
 <td style="padding:4px 12px; text-align:center;"><b>0.971</b></td>
 <td style="padding:4px 12px; text-align:center;"><b>0.942</b></td>
 </tr>
+<tr>
+<td style="padding:4px 12px;">v4 (BCE, 16M, 8-sugg)</td>
+<td style="padding:4px 12px; text-align:center;">–</td>
+<td style="padding:4px 12px; text-align:center;">–</td>
+<td style="padding:4px 12px; text-align:center;">0.904 (20k) → 0.837 (40k) → 0.837 (60k) → 0.567 (80k)</td>
+<td style="padding:4px 12px; text-align:center;">0.885 → 0.808 → 0.769 → 0.519</td>
+</tr>
 </tbody>
 </table>
+<p><b>Lesson learned</b>: doubling the model (7M → 16M) and doubling
+suggestions/cell (4 → 8) at the same LR (3e-4) overfit rapidly — v4 peaks at
+step 20k and degrades monotonically after. Bigger isn't better here at the
+current data scale. If we want a bigger model we'd need cosine LR + more
+regularisation (dropout / weight decay boost).</p>
 <p><b>Key improvement</b>: swapping MSE→BCE for the score-head loss lifts pre-DIR
 recall from 69%→97% at the 12 px threshold. MSE was collapsing to always-0 on
 the imbalanced targets (only ~1-5% of grid cells are near a GT); BCE handles
