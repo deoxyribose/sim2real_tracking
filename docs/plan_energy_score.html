@@ -536,15 +536,56 @@ pixel-mask perfectly enough to help reconstruction"; the 12 px threshold is
 </figure>
 </div>
 
+<h2>What's still failing</h2>
+<p>Only 3 out of 59 annotations miss at 12 px (recall 97%). All three are
+n_gt=2 (Chlamydomonas pairs), and their min-Chamfer distances are 10-17 px
+— the model gets one flagellum right and the other one lands just outside
+the 12 px threshold. Pattern: pair disentanglement is the last hard case.</p>
+<pre>img_036.png  n_gt=2  min_chamfer = [12.5, 10.2]
+img_043.png  n_gt=2  min_chamfer = [11.4, 17.1]
+img_057.png  n_gt=2  min_chamfer = [14.2, 10.1]</pre>
+
 <h2>Design questions still open</h2>
 <div class="card pending">
 <span class="tag later">Q4 pending</span>
 <h3>DIR-outputs-as-pseudo-labels self-training?</h3>
-<p>Given 48% recall on real, we could bootstrap by taking DIR-selected
-tracks on the real videos as pseudo-labels and training a second round.
-Worth trying only if the first-round numbers plateau clearly below what
-we'd want.</p>
+<p>Now that first-pass recall is 94% post-DIR, self-training could push
+n_gt=2 disentanglement further by giving the model real-data examples with
+proper pair separation. Not urgent — the recall ceiling isn't obviously
+below what we need.</p>
 </div>
+
+<h2>How to reproduce</h2>
+<pre>
+# 1. Fit PCA over 30k sim clips (one-time)
+python -m sim2real.model.flagella_pca --n-clips 30000 --n-components 16 \
+    --out data_cache/flagella_pca.npz
+
+# 2. Train (v3-style, BCE score head)
+python -m sim2real.scripts.train_energy \
+    --n-steps 50000 --batch-size 12 --lr 3e-4 --beta 0.05 \
+    --out-dir runs/energy_v3
+
+# 3. Evaluate on real labels
+python -m sim2real.scripts.eval_energy_dir \
+    --ckpt runs/energy_v3/ckpt_step050000.pkl \
+    --n-draws 8 --score-thresh 0.03 --top-k 32 --coverage-thresh 12.0 \
+    --dir-pick-base 0 --dir-score-bonus 100 --dir-birth 0 --dir-death 0 \
+    --out runs/energy_v3/eval.json
+
+# 4. Visualize predictions on real frames
+python -m sim2real.scripts.viz_eval_predictions \
+    --ckpt runs/energy_v3/ckpt_step050000.pkl \
+    --n-annotations 16 --score-thresh 0.03 \
+    --out runs/energy_v3/eval_viz.png
+
+# 5. Track a full real sequence, emit MP4
+python -m sim2real.scripts.track_real_video \
+    --ckpt runs/energy_v3/ckpt_step050000.pkl \
+    --seq-dir algae_data/.../CC124_cell2/Export_20211015_124200 \
+    --ext .bmp --crop-bottom 200 --src-width 4.0 --n-frames 96 \
+    --out runs/energy_v3/track_cell2.mp4
+</pre>
 
 </body>
 </html>
