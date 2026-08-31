@@ -35,6 +35,7 @@ class EnergyLossConfig:
     score_sigma_px: float = 32.0   # width of the confidence target
     coord_weight: float = 1.0
     score_weight: float = 100.0    # deeptangle uses ~1e2
+    photo_weight: float = 5.0      # weight on width + amp L1 loss
     outside_penalty: float = 0.0   # optional penalty for preds fully outside canvas
 
 
@@ -61,7 +62,10 @@ def _pairwise_curve_dist(a: Array, b: Array) -> Array:
 def compute_energy_loss(
     curves_a: Array, curves_b: Array,
     scores_a: Array, scores_b: Array,
+    widths_a: Array, widths_b: Array,
+    amps_a: Array, amps_b: Array,
     gt_curves: Array, gt_valid: Array,
+    gt_widths: Array, gt_amps: Array,
     cfg_e: EnergyLossConfig,
 ) -> tuple[Array, dict]:
     """Combined energy-score + confidence loss.
@@ -79,6 +83,8 @@ def compute_energy_loss(
     cb = curves_b.reshape(P, K, 2)
     sa = scores_a.reshape(P)
     sb = scores_b.reshape(P)
+    wa = widths_a.reshape(P); wb = widths_b.reshape(P)
+    aa = amps_a.reshape(P);   ab = amps_b.reshape(P)
 
     # Pairwise pred-vs-gt distances: (P, G_max)
     def pair_dist(preds):
@@ -115,6 +121,27 @@ def compute_energy_loss(
     div_per_slot = _pairwise_curve_dist(ca, cb)                    # (P,)
     diversity = div_per_slot.mean()
 
+    # ---- Photometric target: for each prediction, use the width & amp of its
+    # NEAREST GT flagellum, but only include predictions that are actually
+    # close (within score_sigma_px) so far-away preds don't drift toward random
+    # GTs. Loss is L1 on width, L1 on signed amp.
+    nearest_gt_idx_a = d_a_masked.argmin(axis=1)                    # (P,)
+    nearest_gt_idx_b = d_b_masked.argmin(axis=1)
+    tgt_w_a = gt_widths[nearest_gt_idx_a]
+    tgt_w_b = gt_widths[nearest_gt_idx_b]
+    tgt_a_a = gt_amps[nearest_gt_idx_a]
+    tgt_a_b = gt_amps[nearest_gt_idx_b]
+    near_mask_a = (nearest_a < cfg_e.score_sigma_px).astype(jnp.float32)
+    near_mask_b = (nearest_b < cfg_e.score_sigma_px).astype(jnp.float32)
+    denom_a = jnp.maximum(near_mask_a.sum(), 1.0)
+    denom_b = jnp.maximum(near_mask_b.sum(), 1.0)
+    photo_loss = 0.5 * (
+        (jnp.abs(wa - tgt_w_a) * near_mask_a).sum() / denom_a
+        + (jnp.abs(wb - tgt_w_b) * near_mask_b).sum() / denom_b
+        + (jnp.abs(aa - tgt_a_a) * near_mask_a).sum() / denom_a
+        + (jnp.abs(ab - tgt_a_b) * near_mask_b).sum() / denom_b
+    )
+
     # ---- Score target: exp(-d²/σ²) toward NEAREST GT
     def score_target(nearest):
         return jnp.exp(-(nearest ** 2) / (cfg_e.score_sigma_px ** 2))
@@ -128,7 +155,8 @@ def compute_energy_loss(
     div_capped = jnp.minimum(diversity,
                               cfg_e.div_ceiling_k * jax.lax.stop_gradient(accuracy))
     energy = cfg_e.coord_weight * accuracy - cfg_e.beta * 0.5 * div_capped
-    total = energy + cfg_e.score_weight * score_loss
+    total = energy + cfg_e.score_weight * score_loss + \
+             cfg_e.photo_weight * photo_loss
 
     stats = dict(
         loss_total=total,
@@ -136,6 +164,7 @@ def compute_energy_loss(
         loss_diversity=diversity,
         loss_diversity_capped=div_capped,
         loss_score=score_loss,
+        loss_photo=photo_loss,
         diversity_over_accuracy=diversity / jnp.maximum(accuracy, 1e-3),
         mean_score_a=sa.mean(),
         mean_score_target=s_tgt_a.mean(),

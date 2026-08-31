@@ -22,7 +22,7 @@ from sim2real.model.energy_loss import (
     EnergyLossConfig, compute_energy_loss, gt_curves_from_sim,
 )
 from sim2real.model.unet_energy import (
-    UNetConfig, UNetEnergy, decode_curves, sample_batched_noise,
+    UNetConfig, UNetEnergy, decode_curves, sample_batched_noise, unpack_pred,
 )
 from sim2real.sim.flagella_diverse import DiverseSimConfig, sample_clip
 
@@ -47,7 +47,7 @@ def build_train_step(model: UNetEnergy, cfg_u: UNetConfig,
     """Returns a jit'd train_step(state, batch, key) → (state, stats)."""
 
     def loss_fn(params, batch, key):
-        video, gt_curves, gt_valid = batch          # (B, T, H, W), (B, G, K, 2), (B, G)
+        video, gt_curves, gt_valid, gt_widths, gt_amps = batch
         B = video.shape[0]
         k_a, k_b = jax.random.split(key)
         noise_a = sample_batched_noise(k_a, B, cfg_u)
@@ -57,13 +57,21 @@ def build_train_step(model: UNetEnergy, cfg_u: UNetConfig,
 
         curves_a = decode_curves(pred_a, cfg_u, pca_mean, pca_basis)
         curves_b = decode_curves(pred_b, cfg_u, pca_mean, pca_basis)
-        scores_a = jax.nn.sigmoid(pred_a[..., -1])
-        scores_b = jax.nn.sigmoid(pred_b[..., -1])
+        f_a = unpack_pred(pred_a); f_b = unpack_pred(pred_b)
+        scores_a = jax.nn.sigmoid(f_a["score"])
+        scores_b = jax.nn.sigmoid(f_b["score"])
+        widths_a, widths_b = f_a["width"], f_b["width"]
+        amps_a, amps_b = f_a["amp"], f_b["amp"]
 
         def per_ex(i):
             return compute_energy_loss(
-                curves_a[i], curves_b[i], scores_a[i], scores_b[i],
-                gt_curves[i], gt_valid[i], cfg_e,
+                curves_a[i], curves_b[i],
+                scores_a[i], scores_b[i],
+                widths_a[i], widths_b[i],
+                amps_a[i], amps_b[i],
+                gt_curves[i], gt_valid[i],
+                gt_widths[i], gt_amps[i],
+                cfg_e,
             )
         # vmap over batch
         totals, stats = jax.vmap(per_ex)(jnp.arange(B))
@@ -97,25 +105,17 @@ jax.tree_util.register_pytree_node_class(TrainState)
 
 def sample_batch(key, sim_cfg: DiverseSimConfig, batch_size: int,
                  cfg_u: UNetConfig, n_max_gt: int):
-    """Draw one training batch: (video, gt_curves, gt_valid).
+    """Draw one training batch: (video, gt_curves, gt_valid, gt_widths, gt_amps).
     We pass the mid-frame gt only (deeptangle predicts past/present/future;
     we start with just the middle for simplicity)."""
     keys = jax.random.split(key, batch_size)
     outs = jax.vmap(lambda k: sample_clip(k, sim_cfg))(keys)
-    # Use the median-subtracted clip as the model input (residual space)
     clip = outs["clip_median"]                                 # (B, T, H, W)
-    # Model expects (B, T, H, W); we already have that.
     gt_curves = outs["curves"][:, sim_cfg.T // 2]              # (B, N, K, 2)
     gt_valid = outs["flagella"]["alive"]                       # (B, N)
-    # Right-pad along the flagellum axis if needed
-    N = gt_curves.shape[1]
-    if N < n_max_gt:
-        K = gt_curves.shape[2]
-        pad_c = jnp.zeros((batch_size, n_max_gt - N, K, 2))
-        pad_v = jnp.zeros((batch_size, n_max_gt - N), dtype=jnp.bool_)
-        gt_curves = jnp.concatenate([gt_curves, pad_c], axis=1)
-        gt_valid = jnp.concatenate([gt_valid, pad_v], axis=1)
-    return clip, gt_curves, gt_valid
+    gt_widths = outs["flagella"]["width"]                      # (B, N)
+    gt_amps = outs["flagella"]["amp"]                          # (B, N) signed
+    return clip, gt_curves, gt_valid, gt_widths, gt_amps
 
 
 def main():
