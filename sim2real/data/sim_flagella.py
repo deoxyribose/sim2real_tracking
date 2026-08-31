@@ -34,8 +34,12 @@ class FlagellumSimConfig:
     T: int = 16
     # High-level scene composition:
     p_empty_scene: float = 0.08                       # hard-negative (no cell, no flagellum)
-    n_cells_probs: tuple[float, float] = (0.55, 0.45) # given non-empty: (1 cell, 2 cells)
-    n_flagella_per_cell_probs: tuple[float, float, float] = (0.10, 0.45, 0.45)  # 0, 1, 2 flagella per cell
+    # Both tuples define their own support from their length:
+    #   n_cells_probs[i]            = P(n_cells == i + 1)   -> default (1 cell, 2 cells)
+    #   n_flagella_per_cell_probs[i]= P(n_flagella == i)     -> default (0, 1, 2 per cell)
+    # Extend either tuple to widen the prior; nothing else needs to change.
+    n_cells_probs: tuple[float, ...] = (0.55, 0.45)
+    n_flagella_per_cell_probs: tuple[float, ...] = (0.10, 0.45, 0.45)
 
     # ---- Cell body params (canonical px / σ) ----
     # Cell size in real data isn't in calibration.json (we only labeled flagella), but
@@ -211,7 +215,8 @@ def _sample_flagellum_on_cell(rng: np.random.Generator, cfg: FlagellumSimConfig,
 def _render_clip(cfg: FlagellumSimConfig,
                  cells: list[CellLatent],
                  flagella_and_beats: list[tuple[FlagellumLatent, dict]],
-                 bg_patch: Optional[np.ndarray]) -> np.ndarray:
+                 bg_patch: Optional[np.ndarray],
+                 rng: Optional[np.random.Generator] = None) -> np.ndarray:
     H, W = CANONICAL_H, CANONICAL_W
     # Cells are static across the clip — precompute their combined contribution once.
     cells_contrib = np.zeros((H, W), dtype=np.float32)
@@ -229,38 +234,97 @@ def _render_clip(cfg: FlagellumSimConfig,
             pts_t = np.concatenate([latent.attachment[None], cp_disp], axis=0)
             clip[t] += _render_flagellum_frame(pts_t, latent.width_px, -params["amp"], H, W)
     if bg_patch is not None:
-        clip += _tile_bg(bg_patch, H, W, cfg.T)
+        clip += _tile_bg(bg_patch, H, W, cfg.T, rng=rng)
     return clip
 
 
-def _tile_bg(bg_patch: np.ndarray, H: int, W: int, T: int) -> np.ndarray:
+def _tile_bg(bg_patch: np.ndarray, H: int, W: int, T: int,
+             rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    """Fill an (T, H, W) canvas from a (bg_T, bh, bw) background patch.
+
+    A patch smaller than the canvas has to be repeated. The old implementation used
+    `np.pad(mode="symmetric")`, which mirrors the patch about the canvas centre and
+    produces a kaleidoscope: with a 96px patch on a 256px canvas only 14% of the result
+    was real background, and the mirror symmetry is a trivial cue the model can latch on
+    to. Instead we tile with an INDEPENDENT random flip per tile plus a random offset, so
+    the result has no global symmetry axis and no exact spatial period.
+
+    When the patch is at least canvas-sized (the goal — harvest at 256x256), this is a
+    plain random crop and no repetition happens at all.
+    """
+    rng = np.random.default_rng() if rng is None else rng
     bg_T, bh, bw = bg_patch.shape
+
+    # --- temporal ---
     if bg_T < T:
         reps = (T + bg_T - 1) // bg_T
         bg_patch = np.tile(bg_patch, (reps, 1, 1))[:T]
     else:
-        bg_patch = bg_patch[:T]
-    if bh < H or bw < W:
-        pad_h = max(0, H - bh)
-        pad_w = max(0, W - bw)
-        pt, pb = pad_h // 2, pad_h - pad_h // 2
-        pl, pr = pad_w // 2, pad_w - pad_w // 2
-        bg_patch = np.pad(bg_patch, ((0, 0), (pt, pb), (pl, pr)), mode="symmetric")
-    if bg_patch.shape[1] > H or bg_patch.shape[2] > W:
-        by0 = (bg_patch.shape[1] - H) // 2
-        bx0 = (bg_patch.shape[2] - W) // 2
-        bg_patch = bg_patch[:, by0 : by0 + H, bx0 : bx0 + W]
-    return bg_patch.astype(np.float32)
+        t0 = int(rng.integers(0, bg_T - T + 1))
+        bg_patch = bg_patch[t0 : t0 + T]
+
+    # --- spatial ---
+    if bh >= H and bw >= W:
+        y0 = int(rng.integers(0, bh - H + 1))
+        x0 = int(rng.integers(0, bw - W + 1))
+        return bg_patch[:, y0 : y0 + H, x0 : x0 + W].astype(np.float32)
+
+    # Overlap-add with a feathered window. Butting tiles edge-to-edge leaves a hard
+    # seam on a fixed grid, which is as learnable a cue as the mirror axis was.
+    ov_y, ov_x = max(1, bh // 4), max(1, bw // 4)
+    step_y, step_x = bh - ov_y, bw - ov_x
+    n_y = int(np.ceil((H + ov_y) / step_y)) + 1
+    n_x = int(np.ceil((W + ov_x) / step_x)) + 1
+    win = _feather_window(bh, bw, ov_y, ov_x)
+
+    acc_h, acc_w = (n_y - 1) * step_y + bh, (n_x - 1) * step_x + bw
+    acc = np.zeros((T, acc_h, acc_w), np.float32)
+    wsum = np.zeros((acc_h, acc_w), np.float32)
+    for iy in range(n_y):
+        for ix in range(n_x):
+            tile = bg_patch
+            if rng.random() < 0.5:
+                tile = tile[:, ::-1, :]
+            if rng.random() < 0.5:
+                tile = tile[:, :, ::-1]
+            y0, x0 = iy * step_y, ix * step_x
+            acc[:, y0 : y0 + bh, x0 : x0 + bw] += tile * win
+            wsum[y0 : y0 + bh, x0 : x0 + bw] += win
+    canvas = acc / np.maximum(wsum, 1e-6)
+
+    oy = int(rng.integers(0, canvas.shape[1] - H + 1))
+    ox = int(rng.integers(0, canvas.shape[2] - W + 1))
+    return canvas[:, oy : oy + H, ox : ox + W].astype(np.float32)
+
+
+def _feather_window(h: int, w: int, ov_y: int, ov_x: int) -> np.ndarray:
+    """Separable window that ramps linearly over `ov` px at each edge and is flat inside."""
+    def ramp(n: int, ov: int) -> np.ndarray:
+        r = np.ones(n, np.float32)
+        e = np.linspace(0.0, 1.0, ov + 2, dtype=np.float32)[1:-1]
+        r[:ov], r[-ov:] = e, e[::-1]
+        return r
+    return np.outer(ramp(h, ov_y), ramp(w, ov_x)).astype(np.float32)
 
 
 def sample_scene(rng: np.random.Generator, cfg: FlagellumSimConfig,
-                 bg_patch: Optional[np.ndarray] = None) -> SimSampleV2:
-    """One clip: sample cells, attach flagella on their membranes, roll out, composite."""
+                 bg_patch: Optional[np.ndarray] = None,
+                 return_beats: bool = False):
+    """One clip: sample cells, attach flagella on their membranes, roll out, composite.
+
+    Returns a SimSampleV2. With `return_beats=True` returns `(sample, beats)` where `beats`
+    is the per-flagellum beat dict, aligned index-for-index with `sample.latents.flagella`.
+    The beat is deliberately NOT part of the latent — `latents.flagella` holds the static
+    REST shape, which is what supervision sees, while the rendered frames show the shape
+    displaced by the beat. `beats` is for visualisation/diagnostics only.
+    """
     scene = SceneLatents()
     flagella_and_beats: list[tuple[FlagellumLatent, dict]] = []
 
     if rng.uniform() >= cfg.p_empty_scene:
-        n_cells = int(rng.choice([1, 2], p=cfg.n_cells_probs))
+        # Support is derived from the length of the probability tuple, so widening the
+        # prior is a config change: n_cells_probs[i] is P(n_cells == i + 1).
+        n_cells = int(rng.choice(np.arange(1, len(cfg.n_cells_probs) + 1), p=cfg.n_cells_probs))
         for _ in range(n_cells):
             c = _sample_cell(rng, cfg, scene.cells)
             if c is not None:
@@ -268,7 +332,9 @@ def sample_scene(rng: np.random.Generator, cfg: FlagellumSimConfig,
 
         # Per cell, sample its flagella
         for ci, cell in enumerate(scene.cells):
-            n_flag = int(rng.choice([0, 1, 2], p=cfg.n_flagella_per_cell_probs))
+            # n_flagella_per_cell_probs[i] is P(n_flagella == i), so index 0 means "none".
+            n_flag = int(rng.choice(np.arange(len(cfg.n_flagella_per_cell_probs)),
+                                    p=cfg.n_flagella_per_cell_probs))
             used_angles: list[float] = []
             for _ in range(n_flag):
                 latent, params = _sample_flagellum_on_cell(rng, cfg, cell, ci, used_angles)
@@ -281,7 +347,10 @@ def sample_scene(rng: np.random.Generator, cfg: FlagellumSimConfig,
                 scene.flagella.append(latent_with_parent)
                 flagella_and_beats.append((latent_with_parent, params))
 
-    clip = _render_clip(cfg, scene.cells, flagella_and_beats, bg_patch=bg_patch)
+    clip = _render_clip(cfg, scene.cells, flagella_and_beats, bg_patch=bg_patch, rng=rng)
     energy = clip.std(axis=0)
-    return SimSampleV2(clip=clip.astype(np.float32), energy=energy.astype(np.float32),
-                       latents=scene, sigma_canonical=1.0)
+    sample = SimSampleV2(clip=clip.astype(np.float32), energy=energy.astype(np.float32),
+                         latents=scene, sigma_canonical=1.0)
+    if return_beats:
+        return sample, [params for _latent, params in flagella_and_beats]
+    return sample

@@ -21,6 +21,8 @@ dependencies = [
     "scipy>=1.11",
     "scikit-learn",
     "scikit-image",
+    "opencv-python-headless",  # sim2real/data/canonicalize.py
+    "tifffile",                # scripts/harvest_bg_patches.py
     "matplotlib",
     "imageio[ffmpeg]",
     "tensorboardX",

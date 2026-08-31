@@ -65,11 +65,17 @@ def load_native_clip(seq_root: str, start: int, count: int, crop: tuple[int, int
 
 
 def find_low_energy_centers(energy: np.ndarray, patch_h: int, patch_w: int, n: int,
-                            pct_thresh: float = 20.0, min_center_dist: int = 20) -> list[tuple[int, int]]:
+                            pct_thresh: float = 20.0, min_center_dist: int = 20,
+                            valid: np.ndarray | None = None) -> list[tuple[int, int]]:
     """Return up to n (y, x) center coords whose surrounding patch has mean energy
     below the pct_thresh-percentile of the whole energy map.
 
     Enforces a minimum distance between chosen centers to encourage patch diversity.
+
+    `valid`: (H, W) bool mask from `canonicalize_clip`. Candidates whose patch is not
+    FULLY valid are discarded before ranking. This is essential: center-pad fill has
+    temporal energy exactly 0, so it otherwise wins the low-energy ranking outright and
+    the bank fills up with constant-zero blocks instead of background.
     """
     H, W = energy.shape
     py, px = patch_h // 2, patch_w // 2
@@ -91,11 +97,29 @@ def find_low_energy_centers(energy: np.ndarray, patch_h: int, patch_w: int, n: i
         area = (y1 - y0 + 1) * (x1 - x0 + 1)
         return (A - B - C + D) / area
 
+    # Integral image over the valid mask lets us reject partly-padded patches in O(1).
+    if valid is not None:
+        vi = np.cumsum(np.cumsum(valid.astype(np.int64), axis=0), axis=1)
+
+    def valid_frac(y0, x0, y1, x1):
+        y0m, x0m = y0 - 1, x0 - 1
+        A = vi[y1, x1]
+        B = vi[y0m, x1] if y0m >= 0 else 0
+        C = vi[y1, x0m] if x0m >= 0 else 0
+        D = vi[y0m, x0m] if (y0m >= 0 and x0m >= 0) else 0
+        area = (y1 - y0 + 1) * (x1 - x0 + 1)
+        return (A - B - C + D) / area
+
     candidates = []
     for y in ys:
         for x in xs:
-            m = patch_mean(y - py, x - px, y + py - 1, x + px - 1)
+            y0, x0, y1, x1 = y - py, x - px, y + py - 1, x + px - 1
+            if valid is not None and valid_frac(y0, x0, y1, x1) < 1.0:
+                continue
+            m = patch_mean(y0, x0, y1, x1)
             candidates.append((float(m), int(y), int(x)))
+    if not candidates:
+        return []
     candidates.sort(key=lambda t: t[0])
     thresh = float(np.percentile([c[0] for c in candidates], pct_thresh))
 
@@ -163,10 +187,13 @@ def main():
             energy = out["energy"]    # (H, W)
             centers = find_low_energy_centers(energy, args.patch_h, args.patch_w,
                                               n=args.patches_per_clip,
-                                              pct_thresh=args.pct_thresh)
+                                              pct_thresh=args.pct_thresh,
+                                              valid=out["valid"])
             for (y, x) in centers:
                 py, px = args.patch_h // 2, args.patch_w // 2
                 patch = clip[:, y - py : y + py, x - px : x + px].copy()
+                if not out["valid"][y - py : y + py, x - px : x + px].all():
+                    continue  # belt-and-braces; find_low_energy_centers already filtered
                 if patch.shape == (args.clip_len, args.patch_h, args.patch_w):
                     all_patches.append(patch)
                     all_sequences.append(rel)

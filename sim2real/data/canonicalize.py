@@ -145,13 +145,35 @@ def center_crop_or_pad(clip: np.ndarray, target_h: int = CANONICAL_H, target_w: 
     return np.stack([_center_crop_or_pad(clip[t], target_h, target_w) for t in range(clip.shape[0])], axis=0)
 
 
-def sigma_scale(clip: np.ndarray, estimator: str = "mad") -> tuple[np.ndarray, float]:
-    """Divide the whole clip by a scalar noise estimate. Returns (scaled_clip, σ)."""
+def canonical_valid_mask(src_h: int, src_w: int,
+                         target_h: int = CANONICAL_H, target_w: int = CANONICAL_W) -> np.ndarray:
+    """(target_h, target_w) bool mask: True where a canonical pixel came from real source data.
+
+    `center_crop_or_pad` fills undersized frames with constant 0. Those pixels are NOT
+    background — they are padding, and must be excluded from any statistic (σ estimation)
+    or any sampling of "real" content (BG-patch harvesting). Mirrors the crop/pad geometry
+    of `_center_crop_or_pad` exactly.
+    """
+    mask = np.ones((src_h, src_w), dtype=bool)
+    return _center_crop_or_pad(mask.astype(np.float32), target_h, target_w) > 0.5
+
+
+def sigma_scale(clip: np.ndarray, estimator: str = "mad",
+                valid: Optional[np.ndarray] = None) -> tuple[np.ndarray, float]:
+    """Divide the whole clip by a scalar noise estimate. Returns (scaled_clip, σ).
+
+    `valid`: optional (H, W) bool mask. Only these pixels contribute to the estimate.
+    Padding pixels are exact zeros; including them collapses the MAD (at >=50% padding
+    it hits exactly 0) and every real pixel then blows past the output clip.
+    """
+    sample = clip if valid is None else clip[:, valid]
+    if sample.size == 0:
+        raise ValueError("sigma_scale: no valid pixels to estimate σ from")
     if estimator == "mad":
-        m = np.median(clip)
-        sigma = 1.4826 * np.median(np.abs(clip - m)) + 1e-6
+        m = np.median(sample)
+        sigma = 1.4826 * np.median(np.abs(sample - m)) + 1e-6
     elif estimator == "std":
-        sigma = float(clip.std()) + 1e-6
+        sigma = float(sample.std()) + 1e-6
     else:
         raise ValueError(estimator)
     return clip / sigma, float(sigma)
@@ -191,6 +213,8 @@ def canonicalize_clip(
     Returns:
         dict with keys:
           - "clip": (T, target_h, target_w) float32 canonical residual (σ-scaled)
+          - "valid": (target_h, target_w) bool, True where the pixel is real source
+            data rather than center-pad fill
           - "energy": (target_h, target_w) float32 temporal-energy map (in same σ units)
           - "sigma": float, noise σ estimate (canonical scale)
           - "meta": dict with intermediate scales for provenance / debug
@@ -210,11 +234,14 @@ def canonicalize_clip(
     # 3. Band-pass (in canonical spatial scale)
     bp = band_pass_flagellum(resampled, cfg.bandpass_sigma_small, cfg.bandpass_sigma_large)
 
-    # 4. Center-crop / pad
+    # 4. Center-crop / pad. `valid` marks which canonical pixels are real source data
+    # (vs. constant-0 padding) — everything downstream must respect it.
     cropped = center_crop_or_pad(bp, target_h, target_w)
+    valid = canonical_valid_mask(bp.shape[1], bp.shape[2], target_h, target_w)
 
-    # 5. σ-scale (single scalar over the whole clip is fine for now — one video, one σ)
-    scaled, sigma = sigma_scale(cropped, cfg.sigma_scale_estimator)
+    # 5. σ-scale (single scalar over the whole clip is fine for now — one video, one σ),
+    # estimated over valid pixels ONLY.
+    scaled, sigma = sigma_scale(cropped, cfg.sigma_scale_estimator, valid=valid)
 
     # 5b. Hard clip to output_clip_sigma to keep model inputs bounded. Preserves gradient
     # info near the noise-floor while discarding pathological outliers.
@@ -224,8 +251,12 @@ def canonicalize_clip(
     # 6. Temporal energy map (in σ units, computed AFTER clipping so it stays bounded)
     energy = temporal_energy_map(scaled, mode="std")
 
+    # Padding carries no signal; keep it at exactly 0 and let `valid` flag it.
+    scaled = np.where(valid[None], scaled, 0.0)
+
     return dict(
         clip=scaled.astype(np.float32),
+        valid=valid,
         energy=energy.astype(np.float32),
         sigma=sigma,
         meta=dict(
