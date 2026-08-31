@@ -526,6 +526,13 @@ The tight 8 px threshold is "the DIR-rendered flagellum overlaps the GT
 pixel-mask perfectly enough to help reconstruction"; the 12 px threshold is
 "the tracked skeleton is close enough to be useful to a downstream biologist."</p>
 <figure>
+  <img src="assets/recall_curve_v2_v3.png" alt="Recall curve v2 vs v3">
+  <figcaption>Recall vs coverage threshold. v3 (orange) climbs steeply and
+  reaches ~100% by 12 canonical px; v2 (blue) plateaus around 90% even at
+  40 px. Shape difference: v3's mistakes are all near-misses within a few px
+  of the true skeleton, while v2 has many candidates far from GT.</figcaption>
+</figure>
+<figure>
   <img src="assets/eval_v3_viz.png" alt="v3 eval: candidates + selected + GT on 16 real frames"
        style="max-height:900px">
   <figcaption>v3 @ 50k on 16 real frames (median-subtracted residual, seismic
