@@ -471,26 +471,50 @@ essential structure.</p>
 </div>
 
 <div class="card done">
-<span class="tag done">step 5 ✓ (first numbers)</span>
-<h3>Recall on the 59 painted flagella</h3>
-<p><b>v2 baseline (MSE score, 50k steps, BS=8):</b></p>
-<pre>coverage@ 8 px  pre-DIR = 0.481   post-DIR = 0.442
-coverage@12 px  pre-DIR = 0.692   post-DIR = 0.654
-by n_gt @8px:   n_gt=1 (14 clips) → 0.643   n_gt=2 (45 clips) → 0.456</pre>
-<p><b>Chamfer distance to nearest candidate</b> (all 104 GT, canonical px):</p>
-<pre>p25=6.4   p50=8.1   p75=13.5   p90=34.9   p95=59.8
-≤5 px: 13   ≤8 px: 50 (48%)   ≤12 px: 72 (69%)   ≤20 px: 88 (85%)</pre>
-<p>The model produces candidates <em>near</em> the GT (69% within 12 px, real
-flagellum width ≈ 4 px) but often just outside the tight 8 px threshold. The
-dominant failure mode is n_gt=2 scenes (Chlamydomonas pairs) where the model's
-two suggestions per grid cell struggle to disentangle the pair.</p>
+<span class="tag done">step 5 ✓</span>
+<h3>Recall on the 59 painted flagella (104 GT skeletons)</h3>
+<table style="border-collapse:collapse; margin:1rem 0;">
+<thead><tr>
+<th style="text-align:left; padding:4px 12px; border-bottom:2px solid #dcdce0;">run</th>
+<th style="padding:4px 12px; border-bottom:2px solid #dcdce0;">pre-DIR @ 8 px</th>
+<th style="padding:4px 12px; border-bottom:2px solid #dcdce0;">post-DIR @ 8 px</th>
+<th style="padding:4px 12px; border-bottom:2px solid #dcdce0;">pre-DIR @ 12 px</th>
+<th style="padding:4px 12px; border-bottom:2px solid #dcdce0;">post-DIR @ 12 px</th>
+</tr></thead>
+<tbody>
+<tr>
+<td style="padding:4px 12px;">v2 (MSE score, 50k)</td>
+<td style="padding:4px 12px; text-align:center;">0.481</td>
+<td style="padding:4px 12px; text-align:center;">0.442</td>
+<td style="padding:4px 12px; text-align:center;">0.692</td>
+<td style="padding:4px 12px; text-align:center;">0.654</td>
+</tr>
+<tr style="background:#f2faf5;">
+<td style="padding:4px 12px;"><b>v3 (BCE score, 50k)</b></td>
+<td style="padding:4px 12px; text-align:center;"><b>0.750</b></td>
+<td style="padding:4px 12px; text-align:center;"><b>0.654</b></td>
+<td style="padding:4px 12px; text-align:center;"><b>0.971</b></td>
+<td style="padding:4px 12px; text-align:center;"><b>0.942</b></td>
+</tr>
+</tbody>
+</table>
+<p><b>Key improvement</b>: swapping MSE→BCE for the score-head loss lifts pre-DIR
+recall from 69%→97% at the 12 px threshold. MSE was collapsing to always-0 on
+the imbalanced targets (only ~1-5% of grid cells are near a GT); BCE handles
+the imbalance cleanly. DIR now recovers 94% of the 97% raw model coverage —
+losing only 3 pts to the ILP.</p>
+<p>Real flagellum width ≈ 4 canonical px, so 8 px ≈ 2× width and 12 px ≈ 3×.
+The tight 8 px threshold is "the DIR-rendered flagellum overlaps the GT
+pixel-mask perfectly enough to help reconstruction"; the 12 px threshold is
+"the tracked skeleton is close enough to be useful to a downstream biologist."</p>
 <figure>
-  <img src="assets/eval_v2_viz.png" alt="v2 eval: candidates + selected + GT on 16 real frames"
+  <img src="assets/eval_v3_viz.png" alt="v3 eval: candidates + selected + GT on 16 real frames"
        style="max-height:900px">
-  <figcaption>Real frames (median-subtracted residual, seismic colormap):
-  green = GT, orange = DIR-selected, light-blue = candidate pool from 8 noise
-  draws. Model is clearly attending to the correct region on most frames;
-  candidates cluster near GT even when they don't quite hit within 8 px.</figcaption>
+  <figcaption>v3 @ 50k on 16 real frames (median-subtracted residual, seismic
+  colormap): green = GT flagellum, orange = DIR-selected, light-blue = candidate
+  pool from 8 noise draws. Candidates cluster tightly on the true skeleton;
+  DIR keeps the good ones and suppresses the far-away ones via same-frame
+  overlap constraints.</figcaption>
 </figure>
 </div>
 
