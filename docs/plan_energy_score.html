@@ -534,6 +534,16 @@ pixel-mask perfectly enough to help reconstruction"; the 12 px threshold is
   DIR keeps the good ones and suppresses the far-away ones via same-frame
   overlap constraints.</figcaption>
 </figure>
+<figure>
+  <video controls loop muted style="max-width:100%; border:1px solid #dcdce0;">
+    <source src="assets/track_cell2_v3.mp4" type="video/mp4">
+  </video>
+  <figcaption>Full pipeline on <code>CC124_cell2/Export_20211015_124200</code>
+  — 128 raw frames, T=16 sliding windows with stride 4, 4 noise draws per
+  window, DIR with temporal linking (link_max_dist=80 canonical px). Colors
+  encode DIR track ids; skeleton continuity across frames = temporal link
+  fired.</figcaption>
+</figure>
 </div>
 
 <h2>What's still failing</h2>
