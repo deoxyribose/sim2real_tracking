@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>sim2real_tracking — plan: energy-score UNet + DIR</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --fg: #1d1d1f; --muted: #6b6b70; --bg: #fafafa; --card: #fff;
+    --accent: #005ec4; --good: #178d3f; --bad: #b02a2a; --warn: #a86300;
+    --border: #dcdce0;
+  }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 860px; margin: 0 auto; padding: 2rem 1.25rem 6rem;
+    color: var(--fg); background: var(--bg); line-height: 1.55;
+  }
+  h1 { font-size: 2rem; margin-bottom: .25rem; }
+  h2 { margin-top: 3rem; padding-top: .5rem; border-top: 2px solid var(--border);
+       font-size: 1.35rem; }
+  h3 { margin-top: 1.5rem; font-size: 1.05rem; }
+  p, li { color: var(--fg); }
+  .muted { color: var(--muted); font-size: .95rem; }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: .9rem; }
+  code { background: #eef1f4; padding: 1px 5px; border-radius: 3px; }
+  pre { background: #f2f4f6; padding: .8rem 1rem; border-radius: 5px;
+        overflow-x: auto; }
+  .card { background: var(--card); border: 1px solid var(--border);
+          border-radius: 6px; padding: 1rem 1.2rem; margin: 1rem 0; }
+  .card.warn { border-color: var(--warn); background: #fff8ec; }
+  .card.q { border-color: var(--accent); background: #eef4fc; }
+  img { max-width: 100%; height: auto; display: block; margin: .8rem 0;
+        border: 1px solid var(--border); border-radius: 4px; }
+  figure { margin: 1rem 0; }
+  figcaption { font-size: .9rem; color: var(--muted); margin-top: .3rem; }
+  .pipeline { width: 100%; overflow-x: auto; margin: 1rem 0; }
+  .kbd { border: 1px solid var(--border); border-bottom-width: 2px;
+         padding: 1px 6px; border-radius: 3px; background: #fff;
+         font-family: "SF Mono", Menlo, Consolas, monospace; font-size: .85rem; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 3px;
+         font-size: .78rem; font-weight: 600; text-transform: uppercase;
+         letter-spacing: .04em; }
+  .tag.decide { background: #eaf4ff; color: var(--accent); }
+  .tag.later { background: #f4eeda; color: var(--warn); }
+  .tag.done { background: #e5f4ea; color: var(--good); }
+  .card.done { border-color: var(--good); background: #f2faf5; }
+  .card.pending { border-color: var(--warn); background: #fff8ec; }
+</style>
+</head>
+<body>
+
+<h1>Energy-score UNet + Discrete Inverse Rendering</h1>
+<p class="muted">Plan doc — 2026-08-31. Draft after pivoting from DETR-slot to
+a stochastic dense predictor with an ILP post-solve. Written to align on the
+approach before committing code; the design questions in blue boxes are the ones
+we should resolve before implementation.</p>
+
+<h2>Why we're pivoting</h2>
+<p>The DETR-slot pipeline hits a ceiling on real videos (see
+<a href="../MEMORY.md">MEMORY.md</a> — sim→real gap is representational, no
+finetune has beaten <code>algae_unet_4slot_v4</code> yet). Two independent
+insights motivate the pivot:</p>
+<ol>
+  <li><b>The real–sim gap is largely photometric noise.</b> After temporal-median
+      subtraction, real videos are mostly the flagellum residual plus
+      preprocessing artifacts (see figure below). The residual is what the model
+      actually needs to explain — not the raw video, not a canonicalised
+      band-passed thing.</li>
+  <li><b>We don't need per-frame accuracy, we need recall × diversity.</b> Each
+      real frame has O(1–3) flagella; if the model outputs 100 candidates per
+      clip, one landing close is enough for the downstream ILP
+      (<code>discrete_linking_opt</code>) to lock onto it. That reframes the
+      loss from "predict the flagellum" to "cover the flagellum with samples".</li>
+</ol>
+
+<h2>Step 1 — median-subtract everything (real and sim)</h2>
+<p>Every real video is preprocessed by <b>global temporal-median subtraction</b>
+(or sliding-window when the cell/pipette drifts). The sim's job is to match the
+appearance of that residual.</p>
+
+<figure>
+  <img src="assets/median_subtract_pair.png" alt="two real videos, median-subtracted">
+  <figcaption>
+    Two real videos (cell2, cell1) — raw frame, minus global median, minus
+    sliding-window median (window=21, stride=30 frames spanned ≈6000 raw frames).
+    After median subtraction the flagellum beat pattern is clean; residual noise
+    consists of shot noise, motion-blur streaks, drifting debris, defocus
+    variation, and (for the global panel of the drifting cell) the pipette
+    ghost. <b>This is the distribution we want the sim to match.</b>
+  </figcaption>
+</figure>
+
+<h2>Step 2 — sim that matches the residual</h2>
+<p>The sim (JAX, batchable) produces a median-subtracted clip directly:</p>
+<ol>
+  <li>Sample scene: cell bodies with contact-force repulsion; flagella attached
+      to cell membranes (mixed polarity — sometimes darker, sometimes brighter
+      than BG) and free-floating debris-flagella.</li>
+  <li>Prescribe flagellum kinematics from a diverse mixture: curvature-wave
+      (with tip amplification / breaststroke variants), near-static bent, and a
+      lateral-sine baseline for coverage. Optionally: RFT swimming for
+      free-floating flagella if we want moving objects — deeptangle's
+      <code>solve()</code> is ~20 lines of JAX and gives calibrated
+      low-Re propulsion.</li>
+  <li>Render + apply per-clip distortions: faintness (contrast dim), defocus
+      (Gaussian blur), motion blur (temporal box), drifting debris blobs,
+      vignette, additive noise.</li>
+  <li><b>Subtract the temporal median of the simulated clip itself.</b> The
+      model input distribution is the residual distribution — not the composite
+      distribution.</li>
+</ol>
+<p class="muted">A first cut of the sim lives at
+<code>sim2real/sim/flagella_diverse.py</code> (JAX, ~500 LOC, untested; needs
+one fix pass then a validation grid comparing sim residuals vs real residuals
+side-by-side).</p>
+
+<h2>Step 3 — UNet trained with the energy score</h2>
+<p>A UNet ingests the T-frame residual clip and outputs a <b>stochastic
+prediction</b> of flagellum parameters — a per-location skeleton with mixed
+existence. To turn the UNet into a sampler we condition on a per-pixel noise
+channel (simplest option; alternatives in the questions box below).</p>
+
+<h3>The energy score</h3>
+<p>For a predictive distribution P and target y, the energy score is</p>
+<pre>ES(P, y)  =  E<sub>X~P</sub> ‖X − y‖  −  ½ E<sub>X,X'~P</sub> ‖X − X'‖</pre>
+<p>It's a <b>strictly proper scoring rule</b> (Gneiting &amp; Raftery 2007):
+minimized exactly when P is the true predictive distribution. The two terms
+have complementary jobs:</p>
+<ul>
+  <li><code>E‖X − y‖</code> — pulls samples toward the truth (accuracy).</li>
+  <li><code>−½ E‖X − X'‖</code> — <em>rewards</em> spread between independent
+      samples (calibrated diversity). Without it, MSE-style training collapses
+      to the conditional mean.</li>
+</ul>
+<p>In practice we Monte-Carlo it with two independent forward passes per training
+example: draw X and X' with different noise seeds, compute the two terms on the
+mini-batch. Compute cost: 2× a normal forward.</p>
+
+<figure>
+  <img src="assets/energy_score.png" alt="three predictive distributions vs a fixed target">
+  <figcaption>
+    Three predictive point clouds against a fixed target (★). (A) is confidently
+    wrong — big <code>E‖X−y‖</code>, small spread — worst score. (B) collapses
+    at the truth — perfect <em>if the truth were deterministic</em>, but that's
+    exactly the failure mode we want to avoid on OOD real data. (C) is a
+    diverse cloud around the truth — pays some
+    <code>E‖X−y‖</code> for large <code>½E‖X−X'‖</code>, and generalises. When
+    the target is genuinely uncertain (many plausible flagella shapes given the
+    same faint residual), (C) beats (B) in expectation over targets — that's the
+    calibrated regime we're after.
+  </figcaption>
+</figure>
+
+<h3>What is X?</h3>
+<p>The concrete shape of X — a per-pixel heatmap? a set of K spline control
+points? PCA-reduced shape codes like deeptangle? — determines whether the
+energy score decomposes per-location or is a joint distribution over the whole
+scene. Called out in the questions box.</p>
+
+<h2>Step 4 — inference: draw many samples, pool with the prior</h2>
+<ol>
+  <li><b>Temperature-adjusted sampling.</b> Scale the noise input by τ &gt; 1 to
+      inflate variance beyond training. Gives a variance floor so the model
+      doesn't collapse to a modal answer on OOD real data. Draw N samples
+      (say N = 64).</li>
+  <li><b>Prior samples.</b> Also draw M candidates from the sim itself (fresh
+      simulator rolls, projected into the same parameter space). These act as a
+      recall safety net: whenever the NN is silent in a location, the prior
+      contributes hypotheses at the right scale.</li>
+  <li><b>Pool = NN samples ∪ prior samples.</b> Feed everything to DIR.</li>
+</ol>
+
+<h2>Step 5 — Discrete Inverse Rendering picks the coherent subset</h2>
+<p><code>discrete_linking_opt</code> already solves this problem for
+worms/cells: an ILP (CP-SAT) picks a non-overlapping subset of primitives that
+(a) reconstructs the frames and (b) forms smooth tracks across time. We port
+the same machinery, with flagella as the primitive:</p>
+<ul>
+  <li><b>Same-frame constraint:</b> flagella whose supports overlap more than a
+      threshold can't both be selected.</li>
+  <li><b>Temporal constraint:</b> selected flagella must chain into tracks;
+      pay a birth/death cost for tracks that appear/disappear mid-clip.</li>
+  <li><b>Objective:</b> reconstruction fit + track-smoothness + hypothesis
+      score.</li>
+</ul>
+<p>Two ingredients we get for free from the DIR side: gap-linking (bridge
+frame-to-frame blinks), and warm-start chaining (gap-1 → gap-2 → gap-3) for
+tractability.</p>
+
+<h2>End-to-end pipeline</h2>
+<figure class="pipeline">
+<svg viewBox="0 0 860 220" xmlns="http://www.w3.org/2000/svg"
+     preserveAspectRatio="xMidYMid meet"
+     style="max-width:100%; height:auto; background:#fff; border:1px solid #dcdce0; border-radius:4px;">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6"
+            markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1d1d1f"/>
+    </marker>
+    <style>
+      .box{fill:#fff;stroke:#1d1d1f;stroke-width:1.4;}
+      .txt{font:600 12px sans-serif;fill:#1d1d1f;text-anchor:middle;}
+      .sub{font:10px sans-serif;fill:#6b6b70;text-anchor:middle;}
+      .edge{stroke:#1d1d1f;stroke-width:1.4;fill:none;}
+      .band{fill:#eaf4ff;stroke:#005ec4;stroke-width:1.2;}
+    </style>
+  </defs>
+
+  <!-- Real branch -->
+  <rect class="box" x="15" y="30" width="130" height="60" rx="6"/>
+  <text class="txt" x="80" y="55">real video</text>
+  <text class="sub" x="80" y="72">T frames, (H, W)</text>
+
+  <rect class="box" x="15" y="130" width="130" height="60" rx="6"/>
+  <text class="txt" x="80" y="155">median subtract</text>
+  <text class="sub" x="80" y="172">global or windowed</text>
+
+  <path class="edge" d="M 80 90 L 80 130" marker-end="url(#ar)"/>
+
+  <!-- Sim branch -->
+  <rect class="box band" x="175" y="10" width="150" height="60" rx="6"/>
+  <text class="txt" x="250" y="35">sim (diverse)</text>
+  <text class="sub" x="250" y="52">κ-wave, RFT?, distort</text>
+
+  <rect class="box band" x="175" y="80" width="150" height="60" rx="6"/>
+  <text class="txt" x="250" y="105">median subtract</text>
+  <text class="sub" x="250" y="122">match real residual</text>
+
+  <rect class="box band" x="175" y="150" width="150" height="60" rx="6"/>
+  <text class="txt" x="250" y="175">GT: skeleton, class</text>
+  <text class="sub" x="250" y="192">per-flagellum latents</text>
+
+  <path class="edge" d="M 250 70 L 250 80" marker-end="url(#ar)"/>
+  <path class="edge" d="M 250 140 L 250 150" marker-end="url(#ar)"/>
+
+  <!-- UNet -->
+  <rect class="box" x="355" y="80" width="140" height="60" rx="6"/>
+  <text class="txt" x="425" y="105">UNet + noise z</text>
+  <text class="sub" x="425" y="122">energy-score loss</text>
+
+  <path class="edge" d="M 145 160 L 355 130" marker-end="url(#ar)"/>
+  <path class="edge" d="M 325 110 L 355 110" marker-end="url(#ar)"/>
+
+  <!-- Samples -->
+  <rect class="box" x="525" y="15" width="140" height="60" rx="6"/>
+  <text class="txt" x="595" y="40">N NN samples</text>
+  <text class="sub" x="595" y="57">temperature τ &gt; 1</text>
+
+  <rect class="box band" x="525" y="145" width="140" height="60" rx="6"/>
+  <text class="txt" x="595" y="170">M prior samples</text>
+  <text class="sub" x="595" y="187">fresh sim rolls</text>
+
+  <path class="edge" d="M 495 100 L 525 55" marker-end="url(#ar)"/>
+  <path class="edge" d="M 250 210 L 525 180" marker-end="url(#ar)"/>
+
+  <!-- DIR -->
+  <rect class="box" x="695" y="80" width="150" height="60" rx="6"/>
+  <text class="txt" x="770" y="105">DIR (CP-SAT ILP)</text>
+  <text class="sub" x="770" y="122">non-overlap + tracks</text>
+
+  <path class="edge" d="M 665 55 L 695 100" marker-end="url(#ar)"/>
+  <path class="edge" d="M 665 165 L 695 130" marker-end="url(#ar)"/>
+</svg>
+<figcaption>
+  Real + sim converge in residual space. UNet trained on sim with energy score,
+  driven at inference by a noise seed. NN + prior samples pool into DIR, which
+  picks a coherent non-overlapping temporally-linked subset.
+</figcaption>
+</figure>
+
+<h2>Research question</h2>
+<p>Given the ILP downstream, we don't care about winning on any single
+prediction — we care about the answer being <em>in the pool</em>. The core
+question:</p>
+<blockquote>
+<b>How do we maximise the chance that at least one sample (out of N) lands
+close to a real flagellum, when the real data is OOD relative to the sim?</b>
+</blockquote>
+<p>The energy score is our first move — it explicitly rewards spread, so it
+should generalise better than MSE. Levers to explore later: sampling
+temperature, noise-channel shape, prior mixture weight, whether to also
+condition on a coarse feature from a frozen self-supervised backbone, whether
+to add an ensemble of UNets, etc.</p>
+
+<h2>Design decisions — resolved</h2>
+
+<div class="card done">
+<span class="tag done">Q1 ✓</span>
+<h3>Sample X = deeptangle-style grid of skeleton offsets</h3>
+<p>Per grid cell: (K spline control points as offsets, confidence). Energy score
+computed per cell independently. Scene-level joint calibration is
+<em>DIR's</em> job, not the NN's.</p>
+</div>
+
+<div class="card done">
+<span class="tag done">Q2 ✓</span>
+<h3>Stochasticity: noise-input channel, N independent draws (no AR)</h3>
+<p>Concatenate a low-frequency noise map <code>z</code> to the input; different
+seeds give different sample sets. At inference draw N independent samples with
+different z, pool everything into DIR — multi-modality comes entirely from the
+noise channel + the energy score's diversity term.</p>
+<p><b>Why no AR:</b> we considered a mask-and-repeat scheme (draw, subtract the
+top-scoring flagella from the residual, redraw). That gives disjoint-flagellum
+<em>coverage</em>, not multi-modality — different hypotheses about the same
+location would need a training-paradigm change (Attend-Infer-Repeat style).
+Not worth the complexity until we have evidence A.1 undercovers.</p>
+<p><b>Escalation path (if A.1 undercovers real data):</b></p>
+<ol>
+<li>Add greedy peel-off as an inference-time layer on top of A.1 (many
+    independent chains, each with a couple of peel-off iterations). No
+    retraining.</li>
+<li>If still insufficient, escalate to full AIR-style AR
+    (one flagellum per call, chained). Retraining required.</li>
+</ol>
+<p><b>Risk to watch:</b> the UNet learning to ignore <code>z</code>. Mitigations:
+per-clip noise (not per-frame), sufficient noise-channel scale, and monitoring
+the ratio <code>½E‖X−X'‖ / E‖X−y‖</code> during training — if it collapses to
+0 we know z is being ignored.</p>
+</div>
+
+<div class="card done">
+<span class="tag done">Q3 ✓</span>
+<h3>DIR consumes individual per-sample flagella</h3>
+<p>No cross-sample NMS before the ILP. Ultra-loose pooling is exactly the
+deeptangle worm recipe DIR was designed for.</p>
+</div>
+
+<div class="card pending">
+<span class="tag later">Q4 pending</span>
+<h3>Sim residual only for MVP; DIR-outputs-as-pseudo-labels TBD</h3>
+<p>MVP trains on median-subtracted sim residuals only. Once we have a working
+pipeline, revisit whether to bootstrap a second training round using DIR
+outputs on real data as pseudo-labels (self-training loop). Not committing to
+this yet — needs the MVP recall numbers first.</p>
+</div>
+
+<div class="card done">
+<span class="tag done">Q5 ✓</span>
+<h3>Two metrics: pre-DIR sample recall + post-DIR precision/recall</h3>
+<p>Pre-DIR: max over samples of Chamfer-close-enough recall, averaged over the
+59 painted flagella — a pure "does the NN cover it" number.
+Post-DIR: precision + recall of the selected subset — end-to-end number.</p>
+</div>
+
+<div class="card warn">
+<span class="tag later">later</span>
+<h3>Things we're deliberately deferring</h3>
+<ul>
+<li>RFT swimming — only worth adding if free-floating flagella / whole-cell
+    translation turn out to matter for validation recall.</li>
+<li>Style transfer between sim BG and real BG — median subtraction should
+    mostly moot this.</li>
+<li>Multi-scale training (deeptangle's <code>--nworms 5,10,50,100,150,200,250</code>
+    trick) — add if density robustness fails.</li>
+<li>Real-video self-supervised pretraining — orthogonal to the recall pivot.</li>
+</ul>
+</div>
+
+<h2>Progress log</h2>
+
+<div class="card done">
+<span class="tag done">step 1 ✓</span>
+<h3>Median-cleaned all 16 annotated sequences, characterised the residual</h3>
+<p>Script: <code>scripts/inspect_real_residuals.py</code>. Outputs at
+<code>runs/real_residuals/{panel,hist,stats}</code>. Loaded N=200 evenly-spaced
+frames per sequence, subtracted a sliding window-21 median.</p>
+<figure>
+  <img src="assets/real_residuals_panel.png" alt="16-row panel of real residuals" style="max-height:800px">
+  <figcaption>Raw / − global median / − window median / residual histogram, per
+  sequence. Visible pattern: cell body dominates the raw; drift shows up in the
+  global-median column as blue/red halos; window-median cleans that up.</figcaption>
+</figure>
+<figure>
+  <img src="assets/real_residuals_hist.png" alt="residual PDF overlay">
+  <figcaption>Left: σ-scaled (comb-shape = pure 8-bit quantization; σ-MAD is
+  degenerate). Right: raw uint8 units — real signal amplitude spans a wide
+  range across sequences. This is what the sim needs to cover.</figcaption>
+</figure>
+<p><b>Calibration numbers</b> ([0,1] intensity units, aggregate across 16 seqs):</p>
+<ul>
+<li>signal peak (residual p99.9): min <b>0.02</b>, median <b>0.045</b>, max <b>0.44</b></li>
+<li>drift energy (global − window median): min <b>0.0007</b>, median <b>0.0019</b>, max <b>0.014</b></li>
+<li>baseline brightness (raw p50): min <b>0.36</b>, max <b>0.73</b></li>
+<li>noise σ: quantization-limited (~0.004); real per-pixel noise is sub-quantum
+    in most sequences.</li>
+</ul>
+</div>
+
+<div class="card done">
+<span class="tag done">step 2 ✓ (first pass)</span>
+<h3>Smoke-tested the diverse sim + calibrated distortion knobs</h3>
+<p>Bugs found + fixed: config needed <code>frozen=True</code> for
+<code>jax.jit</code> hashability. Added two capabilities that were missing but
+visible in real:</p>
+<ul>
+<li><b>Slow cell drift</b> — per-cell linear velocity applied to centers per
+    frame. Real cells wander ≲3 px over a few-second clip.</li>
+<li><b>Pipette primitive</b> — soft-edged dark bar entering from a random
+    edge, present in ~50% of clips (matches real).</li>
+</ul>
+<p>Tuned ranges after visual comparison: cell radius 8-35 px (was 12-60),
+cell amp 0.05-0.28 (was 0.10-0.35), flag amp 0.02-0.70 (was 0.10-0.55),
+debris count 0-5 (was 0-12), debris amp 0.005-0.06 (was 0.03-0.20),
+vignette max 0.10 (was 0.35).</p>
+<figure>
+  <img src="assets/sim_vs_real.png" alt="sim vs real residual samples" style="max-height:700px">
+  <figcaption>Real (top 4 rows) vs sim (bottom 8 rows). Raw and
+  median-subtracted (color = ±p99.5). Sim now has pipettes + drift; residual
+  amplitudes visibly overlap.</figcaption>
+</figure>
+<figure>
+  <img src="assets/sim_vs_real_distribution.png" alt="sim vs real residual PDFs">
+  <figcaption>Left: aggregate residual PDF, sim (red) vs real (blue). Sim
+  covers real with a broader central bulge — desired "cover + some". Right:
+  tail coverage per percentile: <b>sim ≥ real at every p up to p99.9</b>. Sim is
+  short at p99.99 (0.44 vs 0.75) — that's rare saturated pixels in real;
+  low-priority to chase.</figcaption>
+</figure>
+<p><b>Remaining sim gaps</b> (not blockers for the UNet prototype):</p>
+<ul>
+<li>Extreme tail (p99.99): sim maxes at 0.44, real reaches 0.75. Would need
+    rare "hot spot" events or reducing final [0,1] clip.</li>
+<li>Real has a much sharper peak at 0 than sim — sim spreads noise more
+    uniformly. Not a coverage problem (sim covers everything real has), but
+    the sim is "denser" in the moderate range.</li>
+<li>No numerical noise-σ calibration yet — real σ is sub-quantum so MAD
+    saturates. Would need std-of-diff on a bright BG patch to get a real
+    number; deferring.</li>
+</ul>
+</div>
+
+<h2>Next steps (blocked on user weigh-in)</h2>
+<ol>
+<li><b>Prototype the UNet head + energy-score loss on the sim only.</b>
+    Verify samples are actually diverse (monitor
+    <code>½E‖X−X'‖ / E‖X−y‖</code> — collapse to 0 means z is being ignored).
+    This is a bigger commit and worth aligning on before starting: the concrete
+    output-tensor shape, the noise-channel design, and whether to reuse an
+    existing UNet in the repo or build fresh.</li>
+<li>Plumb into DIR with a stripped-down primitive definition and one real
+    sequence.</li>
+<li>Measure recall on the 59-annotation validation set. Decide Q4 (pseudo-label
+    self-training) based on numbers.</li>
+</ol>
+
+</body>
+</html>
