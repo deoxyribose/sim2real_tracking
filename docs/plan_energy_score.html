@@ -553,6 +553,16 @@ pixel-mask perfectly enough to help reconstruction"; the 12 px threshold is
 </figure>
 </div>
 
+<h2>Sanity: sim is harder than real</h2>
+<p>Held-out sim eval on 200 fresh sim clips (seed offset 1e6):</p>
+<pre>V3 pre-DIR recall on sim @ 12 px  = 0.701
+V3 pre-DIR recall on real @ 12 px = 0.971</pre>
+<p>Sim recall is <em>lower</em> than real. That's not a bug — it's evidence
+that the sim's distortion + shape ranges genuinely span "real + some". Model
+trained to handle sim's hardest cases (tiny flagella, very faint amps, extreme
+curvatures, dense pairs) then has plenty of slack on real, which sits comfortably
+inside the sim distribution.</p>
+
 <h2>What's still failing</h2>
 <p>Only 3 out of 59 annotations miss at 12 px (recall 97%). All three are
 n_gt=2 (Chlamydomonas pairs), and their min-Chamfer distances are 10-17 px

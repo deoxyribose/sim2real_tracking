@@ -45,8 +45,9 @@ def main():
     pca_mean, pca_basis = load_pca_scaled(args.pca)
     model = UNetEnergy(cfg=cfg_u)
 
-    dir_cfg = BuildConfig(cost_mode="score_only", pick_cost_base=3.0,
-                            score_bonus=30.0, birth_cost=0.5, death_cost=0.5)
+    # Matches the tuned config from eval_energy_dir that gave 94% post-DIR recall.
+    dir_cfg = BuildConfig(cost_mode="score_only", pick_cost_base=0.0,
+                            score_bonus=100.0, birth_cost=0.0, death_cost=0.0)
     solve_cfg = SolveConfig(time_limit_s=15.0)
 
     annots = load_real_annotations()[: args.n_annotations]
