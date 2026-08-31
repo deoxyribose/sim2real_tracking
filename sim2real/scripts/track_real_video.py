@@ -154,24 +154,33 @@ def main():
     ttl = ax.set_title("", fontsize=10)
     fig.tight_layout()
 
-    # Group selected hypos by anchor
-    hypos_by_anchor: dict[int, list[Hypothesis]] = {}
+    # Group selected hypos by anchor, plus which TRACK each belongs to
+    hypos_by_anchor: dict[int, list[tuple[Hypothesis, int]]] = {}
+    hypo_to_track = {}
+    for tid, track in enumerate(sol["tracks"]):
+        for hid in track:
+            hypo_to_track[hid] = tid
+    n_tracks_used = len(sol["tracks"])
     for si in sol["selected_indices"]:
         h = hypos[si]
-        hypos_by_anchor.setdefault(h.frame, []).append(h)
+        tid = hypo_to_track.get(si, -1)
+        hypos_by_anchor.setdefault(h.frame, []).append((h, tid))
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     writer = imageio.get_writer(str(args.out), fps=args.fps, codec="libx264",
                                  quality=8, macro_block_size=1)
+    track_colors = plt.cm.tab20(np.linspace(0, 1, max(n_tracks_used, 1)))
     for i, a in enumerate(anchor_list):
         frame = residual[a]
         rng = max(float(np.percentile(np.abs(frame), 99.5)), 0.02)
         ax.clear()
         ax.imshow(np.clip((frame + rng) / (2 * rng), 0, 1), cmap="seismic")
-        for h in hypos_by_anchor.get(i, []):
-            ax.plot(h.skeleton[:, 1], h.skeleton[:, 0], "-", color="#ff9500",
-                    linewidth=1.6, alpha=0.85)
-        ax.set_title(f"t={a}  n_sel={len(hypos_by_anchor.get(i, []))}", fontsize=10)
+        for h, tid in hypos_by_anchor.get(i, []):
+            color = track_colors[tid % len(track_colors)] if tid >= 0 else (0.6, 0.6, 0.6)
+            ax.plot(h.skeleton[:, 1], h.skeleton[:, 0], "-", color=color,
+                    linewidth=2.0, alpha=0.9)
+        ax.set_title(f"t={a}  n_sel={len(hypos_by_anchor.get(i, []))}  "
+                     f"n_tracks_total={n_tracks_used}", fontsize=10)
         ax.set_xticks([]); ax.set_yticks([])
         ax.set_xlim(0, cfg_u.W - 1); ax.set_ylim(cfg_u.H - 1, 0)
         fig.canvas.draw()

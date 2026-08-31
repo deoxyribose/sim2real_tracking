@@ -54,10 +54,13 @@ class BuildConfig:
     # Score bonus: subtract score_bonus_per_unit_score * score from node cost
     # so high-confidence predictions are cheaper (rewarded).
     score_bonus: float = 100.0
-    # Temporal linking
+    # Temporal linking. Real flagella beat fast so consecutive-anchor
+    # skeletons can be quite different even for the same flagellum. Wider
+    # link_max_dist recovers longer tracks (25→80 improved mean track length
+    # from 1.7 to 3.1 frames on a cell2 test).
     link_max_gap: int = 2                # bridge up to N missing frames
-    link_max_dist: float = 30.0          # px — no link beyond this skeleton dist
-    link_cost_scale: float = 1.0         # per-px cost of a link
+    link_max_dist: float = 80.0          # px — no link beyond this skeleton dist
+    link_cost_scale: float = 0.1         # per-px cost of a link
     link_gap_cost_factor: float = 1.5    # multiply cost by factor**(gap-1)
     # Track transitions
     birth_cost: float = 20.0             # constant per-track birth
