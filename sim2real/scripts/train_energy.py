@@ -130,6 +130,8 @@ def main():
     ap.add_argument("--out-dir", default="runs/energy_v0")
     ap.add_argument("--H", type=int, default=256)
     ap.add_argument("--T", type=int, default=16)
+    ap.add_argument("--n-suggestions", type=int, default=4)
+    ap.add_argument("--base-channels", type=int, default=32)
     ap.add_argument("--beta", type=float, default=0.5,
                     help="weight on the diversity term (0=no spread, 1=proper ES)")
     args = ap.parse_args()
@@ -137,7 +139,9 @@ def main():
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     # Configs
-    cfg_u = UNetConfig(T=args.T, H=args.H, W=args.H)
+    cfg_u = UNetConfig(T=args.T, H=args.H, W=args.H,
+                        n_suggestions=args.n_suggestions,
+                        base_channels=args.base_channels)
     cfg_e = EnergyLossConfig(beta=args.beta)
     sim_cfg = DiverseSimConfig(T=args.T, H=args.H, W=args.H)
 

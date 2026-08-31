@@ -56,6 +56,24 @@ a stochastic dense predictor with an ILP post-solve. Written to align on the
 approach before committing code; the design questions in blue boxes are the ones
 we should resolve before implementation.</p>
 
+<div class="card done">
+<span class="tag done">overnight summary — 2026-08-31 evening</span>
+<h3>End-to-end pipeline working on real data</h3>
+<p>Pivot is realised: sim → energy-loss U-Net → many-candidate stochastic
+inference → CP-SAT ILP → tracked skeletons. Best run so far:</p>
+<pre>v3 (BCE score head, 50k steps):
+  pre-DIR recall  = 0.971 @ 12 canonical px   (0.750 @ 8 px)
+  post-DIR recall = 0.942 @ 12 canonical px   (0.654 @ 8 px)
+on 104 GT flagella from 59 painted real frames</pre>
+<p>Trained-on-sim-only model recovers 94% of real flagellum skeletons after
+DIR, with only sim data + a residual-space representation. Baseline v2 (MSE
+score) was at 0.65 @ 12 px — the MSE-to-BCE switch on the score head lifted
+the ceiling significantly.</p>
+<p>What's still in flight: <code>runs/energy_v4</code> is training a bigger
+model (8 suggestions/cell, 48 channels, 100k steps) to see if the tight
+@8 px number climbs. Results at bottom of doc.</p>
+</div>
+
 <h2>Why we're pivoting</h2>
 <p>The DETR-slot pipeline hits a ceiling on real videos (see
 <a href="../MEMORY.md">MEMORY.md</a> — sim→real gap is representational, no
