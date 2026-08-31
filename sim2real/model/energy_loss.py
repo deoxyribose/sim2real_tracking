@@ -34,7 +34,7 @@ class EnergyLossConfig:
     div_ceiling_k: float = 3.0
     score_sigma_px: float = 32.0   # width of the confidence target
     coord_weight: float = 1.0
-    score_weight: float = 100.0    # deeptangle uses ~1e2
+    score_weight: float = 5.0      # smaller than MSE weight (BCE has ~1.0 range)
     photo_weight: float = 5.0      # weight on width + amp L1 loss
     outside_penalty: float = 0.0   # optional penalty for preds fully outside canvas
 
@@ -142,12 +142,16 @@ def compute_energy_loss(
         + (jnp.abs(ab - tgt_a_b) * near_mask_b).sum() / denom_b
     )
 
-    # ---- Score target: exp(-d²/σ²) toward NEAREST GT
+    # ---- Score target: exp(-d²/σ²) toward NEAREST GT. Use BCE instead of MSE
+    # since positives (score→1) are ~1-5% of cells and MSE collapsed to always-0.
     def score_target(nearest):
         return jnp.exp(-(nearest ** 2) / (cfg_e.score_sigma_px ** 2))
     s_tgt_a = jax.lax.stop_gradient(score_target(nearest_a))
     s_tgt_b = jax.lax.stop_gradient(score_target(nearest_b))
-    score_loss = ((sa - s_tgt_a) ** 2 + (sb - s_tgt_b) ** 2).mean() * 0.5
+    eps = 1e-6
+    def bce(pred, tgt):
+        return -(tgt * jnp.log(pred + eps) + (1 - tgt) * jnp.log(1 - pred + eps))
+    score_loss = 0.5 * (bce(sa, s_tgt_a).mean() + bce(sb, s_tgt_b).mean())
 
     # Combine
     accuracy = 0.5 * (acc_a + acc_b)

@@ -430,19 +430,79 @@ vignette max 0.10 (was 0.35).</p>
 </ul>
 </div>
 
-<h2>Next steps (blocked on user weigh-in)</h2>
-<ol>
-<li><b>Prototype the UNet head + energy-score loss on the sim only.</b>
-    Verify samples are actually diverse (monitor
-    <code>½E‖X−X'‖ / E‖X−y‖</code> — collapse to 0 means z is being ignored).
-    This is a bigger commit and worth aligning on before starting: the concrete
-    output-tensor shape, the noise-channel design, and whether to reuse an
-    existing UNet in the repo or build fresh.</li>
-<li>Plumb into DIR with a stripped-down primitive definition and one real
-    sequence.</li>
-<li>Measure recall on the 59-annotation validation set. Decide Q4 (pseudo-label
-    self-training) based on numbers.</li>
-</ol>
+<div class="card done">
+<span class="tag done">step 3 ✓</span>
+<h3>Prototype trained + energy loss stable</h3>
+<p><code>sim2real/model/unet_energy.py</code> (fresh U-Net, 32×32 grid,
+n_suggestions=4, 22 outputs per prediction). <code>sim2real/model/energy_loss.py</code>
+implements <code>E‖X−y‖ − β·½E‖X−X'‖</code> with:</p>
+<ul>
+<li>Safe-norm (<code>sqrt(sum²+ε)</code>) — <code>jnp.linalg.norm</code> has infinite
+gradient at 0; matching curves used to NaN backprop.</li>
+<li>Diversity ceiling — <code>min(diversity, k·accuracy)</code> stops the model
+gaming the reward.</li>
+<li>Grad clipping (global norm 1.0), bounded outputs (tanh on dy/dx/theta/pca,
+softplus on width), σ-normalized PCA basis.</li>
+<li>Photometric L1 supervision on width + amp for predictions within
+score_sigma_px of a GT flagellum, so DIR can render candidates back to pixels.</li>
+</ul>
+<p>Two 50k-step runs on CPU (BS=8/12, ~13 min each). v2 uses MSE score loss;
+v3 uses BCE (MSE collapsed to always-predict-0 on the imbalanced positives).</p>
+</div>
+
+<div class="card done">
+<span class="tag done">step 4 ✓</span>
+<h3>DIR implemented (CP-SAT ILP with temporal smoothness)</h3>
+<p><code>sim2real/dir/</code> — three modules:</p>
+<ul>
+<li><b>renderer.py</b>: Gaussian-tube rasterizer + support mask.</li>
+<li><b>build_problem.py</b>: hypothesis pool → node costs (score-only or
+recon+score), same-frame at-most-one on high-overlap pairs (>40%),
+temporal links across gap ≤ 2 frames with skeleton-distance cost,
+per-track birth/death cost.</li>
+<li><b>solve.py</b>: CP-SAT model with x/y/birth/death variables, flow
+conservation (<code>x = birth + Σincoming = death + Σoutgoing</code>), link
+implications, at-most-one cliques.</li>
+</ul>
+<p>Simplifications vs. reference (<code>discrete_linking_opt/2_..._celegans.py</code>):
+drop multilinear overlap interactions (rely on at-most-one), drop cell divisions
+(flagella don't split). Adaptations for flagella: linking + birth/death is the
+essential structure.</p>
+</div>
+
+<div class="card done">
+<span class="tag done">step 5 ✓ (first numbers)</span>
+<h3>Recall on the 59 painted flagella</h3>
+<p><b>v2 baseline (MSE score, 50k steps, BS=8):</b></p>
+<pre>coverage@ 8 px  pre-DIR = 0.481   post-DIR = 0.442
+coverage@12 px  pre-DIR = 0.692   post-DIR = 0.654
+by n_gt @8px:   n_gt=1 (14 clips) → 0.643   n_gt=2 (45 clips) → 0.456</pre>
+<p><b>Chamfer distance to nearest candidate</b> (all 104 GT, canonical px):</p>
+<pre>p25=6.4   p50=8.1   p75=13.5   p90=34.9   p95=59.8
+≤5 px: 13   ≤8 px: 50 (48%)   ≤12 px: 72 (69%)   ≤20 px: 88 (85%)</pre>
+<p>The model produces candidates <em>near</em> the GT (69% within 12 px, real
+flagellum width ≈ 4 px) but often just outside the tight 8 px threshold. The
+dominant failure mode is n_gt=2 scenes (Chlamydomonas pairs) where the model's
+two suggestions per grid cell struggle to disentangle the pair.</p>
+<figure>
+  <img src="assets/eval_v2_viz.png" alt="v2 eval: candidates + selected + GT on 16 real frames"
+       style="max-height:900px">
+  <figcaption>Real frames (median-subtracted residual, seismic colormap):
+  green = GT, orange = DIR-selected, light-blue = candidate pool from 8 noise
+  draws. Model is clearly attending to the correct region on most frames;
+  candidates cluster near GT even when they don't quite hit within 8 px.</figcaption>
+</figure>
+</div>
+
+<h2>Design questions still open</h2>
+<div class="card pending">
+<span class="tag later">Q4 pending</span>
+<h3>DIR-outputs-as-pseudo-labels self-training?</h3>
+<p>Given 48% recall on real, we could bootstrap by taking DIR-selected
+tracks on the real videos as pseudo-labels and training a second round.
+Worth trying only if the first-round numbers plateau clearly below what
+we'd want.</p>
+</div>
 
 </body>
 </html>

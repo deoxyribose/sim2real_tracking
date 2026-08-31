@@ -130,6 +130,10 @@ def main():
     ap.add_argument("--limit", type=int, default=0,
                     help="only eval first N annotations (0 = all)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--dir-pick-base", type=float, default=3.0)
+    ap.add_argument("--dir-score-bonus", type=float, default=30.0)
+    ap.add_argument("--dir-birth", type=float, default=0.5)
+    ap.add_argument("--dir-death", type=float, default=0.5)
     args = ap.parse_args()
 
     print(f"loading ckpt {args.ckpt}", flush=True)
@@ -139,8 +143,11 @@ def main():
 
     dir_cfg = DIRRunConfig(
         n_noise_draws=1,   # already exhausted at candidate gather
-        build=BuildConfig(cost_mode="score_only", pick_cost_base=3.0,
-                           score_bonus=30.0, birth_cost=0.5, death_cost=0.5),
+        build=BuildConfig(cost_mode="score_only",
+                           pick_cost_base=args.dir_pick_base,
+                           score_bonus=args.dir_score_bonus,
+                           birth_cost=args.dir_birth,
+                           death_cost=args.dir_death),
         solve=SolveConfig(time_limit_s=15.0),
     )
 
