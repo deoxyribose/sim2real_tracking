@@ -82,6 +82,26 @@ instead of shooting to frame corners (which v7's PCA-based attempt did).</p>
 experiments (aggressive photometric augs, σ-scale, weight decay, larger
 patches, longer training) all peaked at ~0.85-0.89, below v8's original
 0.913. Ceiling for this architecture; inference tuning gets you the rest.</p>
+<p><b>Post-DIR recall (end-to-end pipeline)</b>: DIR selects a non-overlapping
+subset of the candidate pool. Wide-TTA rollouts capped at 500 per clip
+for tractability; birth_cost=death_cost=0 (all hypotheses share frame 0,
+no temporal chain). Three cost/pool strategies compared:</p>
+<pre>Strategy                                       | pre    | post   | Δ
+-----------------------------------------------|--------|--------|------
+Uniform 500 · score_only · score=1.0           | 0.990  | 0.942  | -0.048
+Top-500 by score · score_only · real scores    | 0.981  | 0.913  | -0.068
+Uniform 500 · recon+score cost                 | 0.990  | 0.904  | -0.086</pre>
+<p>Counterintuitive winner: the ILP does BEST when all candidates have equal
+cost — it degenerates to maximum-independent-set selection, and with 500
+overlapping-tube candidates the covering rollouts survive as members of
+their overlap cluster. Real attachment scores actively HURT: high-scored
+distractors near the cell body get preferred over lower-scored but
+GT-accurate rollouts. The recon+score cost penalises rollouts that don't
+match the noisy residual well, dropping ~4% more than the trivial mode.</p>
+<p>Bottleneck for post→pre gap: no per-hypothesis signal reliably ranks
+GT proximity. A calibrated per-rollout confidence — not the attachment
+score — would close this. Options: verify each rollout with a second
+forward pass, or train a light critic head. Deferred; 0.942 is usable.</p>
 </div>
 
 <div class="card done">

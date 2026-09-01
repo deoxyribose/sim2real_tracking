@@ -57,9 +57,12 @@ def inverse_transform_rollout(rollout: np.ndarray, H: int, W: int,
 def run_augmented(params, backbone, attach_head, knot_gen, cfg,
                     clip: np.ndarray, smed: np.ndarray, key,
                     n_draws: int, n_attach: int, n_rollouts: int,
-                    score_thresh: float, angle_deg: float, flipped: bool):
+                    score_thresh: float, angle_deg: float, flipped: bool,
+                    return_scores: bool = False):
     """Run one augmented version of an image; return rollouts in ORIGINAL
-    (canonical / model-canvas) coordinates."""
+    (canonical / model-canvas) coordinates. If return_scores, also return
+    a parallel list of per-rollout attachment scores (inherited from the
+    seed grid cell — all rollouts from one attachment share its score)."""
     aug_clip = flip_clip(clip) if flipped else clip
     if angle_deg != 0:
         aug_clip = rotate_clip(aug_clip, angle_deg)
@@ -71,6 +74,7 @@ def run_augmented(params, backbone, attach_head, knot_gen, cfg,
     video = jnp.asarray(aug_clip)[None]
     smed_in = jnp.asarray(aug_smed)[None, ..., None]
     rollouts_orig = []
+    scores_orig = []
     for _ in range(n_draws):
         key, k = jax.random.split(key)
         noise = sample_batched_noise(k, 1, cfg)
@@ -78,19 +82,22 @@ def run_augmented(params, backbone, attach_head, knot_gen, cfg,
                                           smed_in, train=False)
         attach = attach_head.apply(params["attach"], grid)
         f = unpack_attachment(attach[0])
-        atts, scores = sample_attachments(f, n_attach, cfg)
-        keep = scores >= score_thresh
-        atts = atts[keep]
+        atts, att_scores = sample_attachments(f, n_attach, cfg)
+        keep = att_scores >= score_thresh
+        atts = atts[keep]; att_scores = att_scores[keep]
         if len(atts) == 0: continue
         for _ in range(n_rollouts):
             key, kr = jax.random.split(key)
             rollout_keys = jax.random.split(kr, len(atts))
             rollouts = rollout_batch(full_res[0], params["knot"], knot_gen,
                                       cfg, jnp.asarray(atts), rollout_keys, 1.0)
-            for r in rollouts:
+            for r, s in zip(rollouts, att_scores):
                 inv = inverse_transform_rollout(np.asarray(r), cfg.H, cfg.W,
                                                   angle_deg, flipped)
                 rollouts_orig.append(inv)
+                scores_orig.append(float(s))
+    if return_scores:
+        return rollouts_orig, scores_orig, key
     return rollouts_orig, key
 
 
