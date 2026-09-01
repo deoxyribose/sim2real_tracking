@@ -226,14 +226,13 @@ class KnotGenerator(nn.Module):
     @nn.compact
     def __call__(self, patch: Array) -> tuple[Array, Array]:
         cfg = self.cfg
-        # 2 convs → flatten → MLP → two heads
         x = nn.Conv(64, (3, 3), padding="SAME",
                      dtype=jnp.float32, param_dtype=jnp.float32)(patch)
         x = nn.gelu(x)
         x = nn.Conv(64, (3, 3), padding="SAME",
                      dtype=jnp.float32, param_dtype=jnp.float32)(x)
         x = nn.gelu(x)
-        x = x.reshape(x.shape[0], -1)                # (N, P*P*64)
+        x = x.reshape(x.shape[0], -1)
         x = nn.Dense(128, dtype=jnp.float32,
                       param_dtype=jnp.float32)(x)
         x = nn.gelu(x)

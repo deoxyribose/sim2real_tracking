@@ -205,6 +205,8 @@ def main():
     ap.add_argument("--patch-size", type=int, default=24)
     ap.add_argument("--step-max", type=float, default=8.0)
     ap.add_argument("--no-augs", action="store_true")
+    ap.add_argument("--no-sigma-scale", action="store_true",
+                    help="disable the residual σ-scale in the sim")
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
 
@@ -214,7 +216,8 @@ def main():
                         base_channels=args.base_channels,
                         patch_size=args.patch_size,
                         step_max=args.step_max)
-    sim_cfg = DiverseSimConfig(T=args.T, H=args.H, W=args.H)
+    sim_cfg = DiverseSimConfig(T=args.T, H=args.H, W=args.H,
+                                sigma_scale_residual=not args.no_sigma_scale)
     print(f"cfg: H={cfg.H} T={cfg.T} grid={cfg.grid_h}×{cfg.grid_w} "
           f"patch={cfg.patch_size} n_bins=(ang{cfg.n_angle_bins}, "
           f"step{cfg.n_step_bins})   n_max_flag={sim_cfg.n_max_flagella}")
