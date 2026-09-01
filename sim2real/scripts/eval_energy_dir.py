@@ -37,16 +37,21 @@ from sim2real.dir.solve import solve_problem
 
 def sample_candidates_for_frame(
     params, model, cfg_u, residual_clip, key, n_draws, score_thresh, top_k,
-    pca_mean, pca_basis, temperature=1.0,
+    pca_mean, pca_basis, temperature=1.0, static_median=None,
 ):
     """Run the model n_draws times on the residual clip, return:
-        curves    (list of (K, 2)),  scores, widths, amps."""
+        curves    (list of (K, 2)),  scores, widths, amps.
+    `static_median`: optional (H, W) median frame (Option A cell-body context)."""
     video = jnp.asarray(residual_clip)[None]                    # (1, T, H, W)
+    if static_median is not None:
+        smed = jnp.asarray(static_median)[None, ..., None]      # (1, H, W, 1)
+    else:
+        smed = None
     all_curves, all_scores, all_widths, all_amps = [], [], [], []
     for _ in range(n_draws):
         key, k = jax.random.split(key)
         noise = sample_batched_noise(k, 1, cfg_u, temperature=temperature)
-        pred = model.apply(params, video, noise, train=False)
+        pred = model.apply(params, video, noise, smed, train=False)
         curves = np.asarray(decode_curves(pred, cfg_u, pca_mean, pca_basis))[0]
         f = unpack_pred(pred)
         widths = np.asarray(f["width"][0])
@@ -185,29 +190,49 @@ def main():
             print(f"  [{ai:3d}] skip {ann['name']}: {e}", flush=True)
             continue
         clip = canon["clip"]                                    # (T, H_c, W_c)
-        # canonical H, W may not equal cfg_u.H, W — pad if needed
-        if clip.shape[1] != cfg_u.H or clip.shape[2] != cfg_u.W:
-            ph = cfg_u.H - clip.shape[1]
-            pw = cfg_u.W - clip.shape[2]
-            if ph < 0 or pw < 0:
-                print(f"  [{ai:3d}] clip too big: {clip.shape}", flush=True)
-                continue
-            clip = np.pad(clip, ((0, 0), (0, ph), (0, pw)), constant_values=0.0)
+        # canonical is 256×256 by default. Resize (not crop) to model input.
+        src_h, src_w = clip.shape[1], clip.shape[2]
+        if src_h != cfg_u.H or src_w != cfg_u.W:
+            import cv2
+            scale_y = cfg_u.H / src_h
+            scale_x = cfg_u.W / src_w
+            clip = np.stack([
+                cv2.resize(clip[t], (cfg_u.W, cfg_u.H), interpolation=cv2.INTER_AREA)
+                for t in range(clip.shape[0])
+            ], axis=0).astype(np.float32)
+        else:
+            scale_y = scale_x = 1.0
 
-        # GT polylines: transform to canonical then to (y, x) skeleton (same K as our model)
+        # GT polylines: transform to canonical (native 256×256) then scale
+        # to match the resized clip resolution.
+        from sim2real.data.canonicalize import CANONICAL_H, CANONICAL_W
         gt_curves = []
         for pl_native in ann["gt_polylines_native"]:
             gt_canon = gt_polyline_to_canonical(pl_native, ann["meta"], cfg_can,
-                                                  canonical_h=cfg_u.H, canonical_w=cfg_u.W)
+                                                  canonical_h=CANONICAL_H,
+                                                  canonical_w=CANONICAL_W)
             if len(gt_canon) < 4:
                 continue
+            gt_canon = gt_canon * np.asarray([scale_y, scale_x])
             gt_curves.append(gt_canon)
 
         key, kk = jax.random.split(key)
+        # Static-median context: the RAW canonical temporal median (cell body).
+        # canonicalize_clip loads raw uint8-as-float32 (range [0, 255]);
+        # sim static_median lives in [0, 1] because sim intensity is normalized.
+        # Divide by 255 so eval matches training scale.
+        smed = canon.get("static_median")
+        if smed is not None:
+            smed = smed.astype(np.float32) / 255.0
+            if smed.shape[0] != cfg_u.H or smed.shape[1] != cfg_u.W:
+                import cv2
+                smed = cv2.resize(smed, (cfg_u.W, cfg_u.H),
+                                   interpolation=cv2.INTER_AREA).astype(np.float32)
         cand = sample_candidates_for_frame(
             params, model, cfg_u, clip, kk,
             n_draws=args.n_draws, score_thresh=args.score_thresh,
             top_k=args.top_k, pca_mean=pca_mean, pca_basis=pca_basis,
+            static_median=smed,
         )
 
         pre = eval_pre_dir_recall(cand["curves"], gt_curves,

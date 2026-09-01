@@ -28,12 +28,13 @@ def rgb_signed(f, rng):
 
 
 def sample_candidates(params, model, cfg_u, video, key, n_draws, score_thresh,
-                       top_k, pca_mean, pca_basis):
+                       top_k, pca_mean, pca_basis, static_median=None):
+    smed = None if static_median is None else jnp.asarray(static_median)[None, ..., None]
     all_curves = []
     for _ in range(n_draws):
         key, k = jax.random.split(key)
         noise = sample_batched_noise(k, 1, cfg_u)
-        pred = model.apply(params, video, noise, train=False)
+        pred = model.apply(params, video, noise, smed, train=False)
         curves = np.asarray(decode_curves(pred, cfg_u, pca_mean, pca_basis))[0]
         f = unpack_pred(pred)
         s = np.asarray(jax.nn.sigmoid(f["score"][0])).ravel()
@@ -57,6 +58,8 @@ def main():
     ap.add_argument("--n-clips", type=int, default=16)
     ap.add_argument("--sim-seed-offset", type=int, default=int(1e6))
     ap.add_argument("--out", required=True)
+    ap.add_argument("--show-raw", action="store_true",
+                    help="Show clip_raw (full composite) instead of median-subtracted residual")
     args = ap.parse_args()
 
     params, cfg_u = load_model_ckpt(args.ckpt)
@@ -70,17 +73,20 @@ def main():
         for i in range(args.n_clips):
             out = sample_clip(jax.random.key(args.sim_seed_offset + i), sim_cfg)
             residual = np.asarray(out["clip_median"])
+            display_clip = np.asarray(out["clip_raw"]) if args.show_raw else residual
             gt_curves = np.asarray(out["curves"])[cfg_u.T // 2]
             alive = np.asarray(out["flagella"]["alive"])
             gt_valid = [gt_curves[k] for k in range(gt_curves.shape[0])
                          if bool(alive[k])]
             key, kk = jax.random.split(key)
+            smed = np.asarray(out["temporal_median"])
             cands = sample_candidates(params, model, cfg_u,
                                         jnp.asarray(residual)[None], kk,
                                         args.n_draws, args.score_thresh,
-                                        args.top_k, pca_mean, pca_basis)
+                                        args.top_k, pca_mean, pca_basis,
+                                        static_median=smed)
             rows.append(dict(name=f"sim seed={args.sim_seed_offset + i}",
-                              residual=residual, gt=gt_valid, cands=cands))
+                              residual=display_clip, gt=gt_valid, cands=cands))
     else:
         annots = load_real_annotations()[: args.n_clips]
         for ann in annots:
@@ -91,23 +97,37 @@ def main():
             except Exception:
                 continue
             clip = canon["clip"]
-            if clip.shape[1] != cfg_u.H or clip.shape[2] != cfg_u.W:
-                ph = cfg_u.H - clip.shape[1]; pw = cfg_u.W - clip.shape[2]
-                if ph < 0 or pw < 0:
-                    continue
-                clip = np.pad(clip, ((0, 0), (0, ph), (0, pw)), constant_values=0.0)
+            src_h, src_w = clip.shape[1], clip.shape[2]
+            scale_y = scale_x = 1.0
+            if src_h != cfg_u.H or src_w != cfg_u.W:
+                import cv2
+                scale_y = cfg_u.H / src_h; scale_x = cfg_u.W / src_w
+                clip = np.stack([cv2.resize(clip[t], (cfg_u.W, cfg_u.H),
+                                              interpolation=cv2.INTER_AREA)
+                                  for t in range(clip.shape[0])], axis=0).astype(np.float32)
+            from sim2real.data.canonicalize import CANONICAL_H, CANONICAL_W
             gt = []
             for pl_native in ann["gt_polylines_native"]:
                 gc = gt_polyline_to_canonical(pl_native, ann["meta"], cfg_can,
-                                                canonical_h=cfg_u.H,
-                                                canonical_w=cfg_u.W)
+                                                canonical_h=CANONICAL_H,
+                                                canonical_w=CANONICAL_W)
                 if len(gc) >= 4:
-                    gt.append(gc)
+                    gt.append(gc * np.asarray([scale_y, scale_x]))
             key, kk = jax.random.split(key)
+            smed = canon.get("static_median")
+            if smed is None:
+                smed = np.median(clip, axis=0).astype(np.float32)
+            else:
+                smed = smed.astype(np.float32) / 255.0
+                if smed.shape[0] != cfg_u.H or smed.shape[1] != cfg_u.W:
+                    import cv2
+                    smed = cv2.resize(smed, (cfg_u.W, cfg_u.H),
+                                       interpolation=cv2.INTER_AREA).astype(np.float32)
             cands = sample_candidates(params, model, cfg_u,
                                         jnp.asarray(clip)[None], kk,
                                         args.n_draws, args.score_thresh,
-                                        args.top_k, pca_mean, pca_basis)
+                                        args.top_k, pca_mean, pca_basis,
+                                        static_median=smed)
             rows.append(dict(name=ann["name"], residual=clip, gt=gt, cands=cands))
 
     ncol = 2
@@ -118,8 +138,16 @@ def main():
         r, c = i // ncol, i % ncol
         ax = axes[r][c]
         t = row["residual"].shape[0] // 2
-        rng = max(float(np.percentile(np.abs(row["residual"][t]), 99.5)), 0.02)
-        ax.imshow(rgb_signed(row["residual"][t], rng), cmap="seismic")
+        frame = row["residual"][t]
+        # If values are non-negative, treat as raw intensity (grayscale).
+        # Otherwise treat as signed residual (seismic).
+        if frame.min() >= -0.05:
+            lo, hi = np.percentile(frame, [1, 99])
+            gray = np.clip((frame - lo) / max(hi - lo, 1e-6), 0, 1)
+            ax.imshow(gray, cmap="gray")
+        else:
+            rng = max(float(np.percentile(np.abs(frame), 99.5)), 0.02)
+            ax.imshow(rgb_signed(frame, rng), cmap="seismic")
 
         n_hit = 0
         for gt in row["gt"]:

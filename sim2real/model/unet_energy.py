@@ -35,10 +35,10 @@ Array = jnp.ndarray
 
 @dataclass(frozen=True)
 class UNetConfig:
-    T: int = 16                          # input frames
-    H: int = 256
-    W: int = 256
-    grid_stride: int = 8                 # 256/8 = 32 grid cells per side
+    T: int = 4                           # input frames
+    H: int = 128
+    W: int = 128
+    grid_stride: int = 8                 # H/8 grid cells per side
     n_suggestions: int = 4               # predictions per grid cell
     n_pca: int = 16                      # PCA coeffs per prediction
     base_channels: int = 32
@@ -114,14 +114,18 @@ class UNetEnergy(nn.Module):
     cfg: UNetConfig
 
     @nn.compact
-    def __call__(self, video: Array, noise: Array, train: bool = True) -> Array:
+    def __call__(self, video: Array, noise: Array,
+                 static_median: Array | None = None,
+                 train: bool = True) -> Array:
         """Forward pass.
 
         Args:
-          video: (B, T, H, W) or (B, H, W, T) — grayscale intensity in [0, 1].
+          video: (B, T, H, W) or (B, H, W, T) — grayscale residual in [-C, C].
                  Auto-transposed if T comes first.
-          noise: (B, H, W, 1) — per-clip noise map (temperature-scaled at inference).
-          train: dropout/BN flag (currently unused — GroupNorm has no state).
+          noise: (B, H, W, 1) — per-clip noise map.
+          static_median: (B, H, W, 1) — optional temporal-median frame for
+              cell-body context (Option A). If provided, concat as extra channel.
+          train: dropout/BN flag.
 
         Returns:
           preds: (B, grid_h, grid_w, n_suggestions, n_out_per_pred)
@@ -131,7 +135,10 @@ class UNetEnergy(nn.Module):
         # Normalize video shape → (B, H, W, T)
         if video.shape[1] == cfg.T:
             video = jnp.transpose(video, (0, 2, 3, 1))    # (B, T, H, W) → (B, H, W, T)
-        x = jnp.concatenate([video, noise], axis=-1)      # (B, H, W, T + 1)
+        chans = [video, noise]
+        if static_median is not None:
+            chans.append(static_median)
+        x = jnp.concatenate(chans, axis=-1)               # (B, H, W, T+1[+1])
         x = x.astype(compute_dtype)
 
         # Encoder

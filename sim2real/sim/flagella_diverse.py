@@ -1070,6 +1070,7 @@ def sample_clip(key: jax.Array, cfg: DiverseSimConfig) -> dict:
     return dict(
         clip_raw=clip,
         clip_median=clip_median,
+        temporal_median=med,           # (H, W) — the static context (Option A input)
         cells=cells,
         flagella=flag,
         pipette=pip,

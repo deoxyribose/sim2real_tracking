@@ -254,11 +254,20 @@ def canonicalize_clip(
     # Padding carries no signal; keep it at exactly 0 and let `valid` flag it.
     scaled = np.where(valid[None], scaled, 0.0)
 
+    # For the model's static-context input we also expose the RAW temporal
+    # median (post-resample, center-cropped/padded like `clip`, but NOT
+    # band-passed and NOT σ-scaled). That's the cell body / pipette silhouette
+    # the model was trained to attend to.
+    static_median_canonical = center_crop_or_pad(
+        resample_to_width(np.median(clip, axis=0)[None], cfg.resample_scale)[0][None],
+        target_h, target_w)[0]
+
     return dict(
         clip=scaled.astype(np.float32),
         valid=valid,
         energy=energy.astype(np.float32),
         sigma=sigma,
+        static_median=static_median_canonical.astype(np.float32),
         meta=dict(
             src_shape=clip.shape,
             resample_scale=cfg.resample_scale,

@@ -47,13 +47,13 @@ def build_train_step(model: UNetEnergy, cfg_u: UNetConfig,
     """Returns a jit'd train_step(state, batch, key) → (state, stats)."""
 
     def loss_fn(params, batch, key):
-        video, gt_curves, gt_valid, gt_widths, gt_amps = batch
+        video, static_med, gt_curves, gt_valid, gt_widths, gt_amps = batch
         B = video.shape[0]
         k_a, k_b = jax.random.split(key)
         noise_a = sample_batched_noise(k_a, B, cfg_u)
         noise_b = sample_batched_noise(k_b, B, cfg_u)
-        pred_a = model.apply(params, video, noise_a, train=True)
-        pred_b = model.apply(params, video, noise_b, train=True)
+        pred_a = model.apply(params, video, noise_a, static_med, train=True)
+        pred_b = model.apply(params, video, noise_b, static_med, train=True)
 
         curves_a = decode_curves(pred_a, cfg_u, pca_mean, pca_basis)
         curves_b = decode_curves(pred_b, cfg_u, pca_mean, pca_basis)
@@ -111,11 +111,12 @@ def sample_batch(key, sim_cfg: DiverseSimConfig, batch_size: int,
     keys = jax.random.split(key, batch_size)
     outs = jax.vmap(lambda k: sample_clip(k, sim_cfg))(keys)
     clip = outs["clip_median"]                                 # (B, T, H, W)
+    static_med = outs["temporal_median"][..., None]             # (B, H, W, 1)
     gt_curves = outs["curves"][:, sim_cfg.T // 2]              # (B, N, K, 2)
     gt_valid = outs["flagella"]["alive"]                       # (B, N)
     gt_widths = outs["flagella"]["width"]                      # (B, N)
     gt_amps = outs["flagella"]["amp"]                          # (B, N) signed
-    return clip, gt_curves, gt_valid, gt_widths, gt_amps
+    return clip, static_med, gt_curves, gt_valid, gt_widths, gt_amps
 
 
 def main():
@@ -132,8 +133,10 @@ def main():
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--out-dir", default="runs/energy_v0")
-    ap.add_argument("--H", type=int, default=256)
-    ap.add_argument("--T", type=int, default=16)
+    ap.add_argument("--H", type=int, default=128)
+    ap.add_argument("--T", type=int, default=4)
+    ap.add_argument("--coord-weight", type=float, default=5.0)
+    ap.add_argument("--photo-weight", type=float, default=0.5)
     ap.add_argument("--n-suggestions", type=int, default=4)
     ap.add_argument("--base-channels", type=int, default=32)
     ap.add_argument("--beta", type=float, default=0.5,
@@ -146,7 +149,9 @@ def main():
     cfg_u = UNetConfig(T=args.T, H=args.H, W=args.H,
                         n_suggestions=args.n_suggestions,
                         base_channels=args.base_channels)
-    cfg_e = EnergyLossConfig(beta=args.beta)
+    cfg_e = EnergyLossConfig(beta=args.beta,
+                              coord_weight=args.coord_weight,
+                              photo_weight=args.photo_weight)
     sim_cfg = DiverseSimConfig(T=args.T, H=args.H, W=args.H)
 
     print(f"grid: {cfg_u.grid_h}x{cfg_u.grid_w}  "
@@ -162,7 +167,8 @@ def main():
     k_init, k_train = jax.random.split(key)
     dummy_video = jnp.zeros((1, cfg_u.T, cfg_u.H, cfg_u.W))
     dummy_noise = jnp.zeros((1, cfg_u.H, cfg_u.W, 1))
-    params = model.init(k_init, dummy_video, dummy_noise, train=True)
+    dummy_med = jnp.zeros((1, cfg_u.H, cfg_u.W, 1))
+    params = model.init(k_init, dummy_video, dummy_noise, dummy_med, train=True)
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     print(f"model params: {n_params/1e6:.2f} M")
 

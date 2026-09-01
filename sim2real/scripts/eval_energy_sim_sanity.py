@@ -47,12 +47,13 @@ def main():
         if not gt:
             continue
         video = out["clip_median"][None]
+        smed = out["temporal_median"][None, ..., None]
 
         all_cands = []
         for _ in range(args.n_draws):
             key, k = jax.random.split(key)
             noise = sample_batched_noise(k, 1, cfg_u)
-            pred = model.apply(params, jnp.asarray(video), noise, train=False)
+            pred = model.apply(params, jnp.asarray(video), noise, smed, train=False)
             curves = np.asarray(decode_curves(pred, cfg_u, pca_mean, pca_basis))[0]
             f = unpack_pred(pred)
             s = np.asarray(jax.nn.sigmoid(f["score"][0])).ravel()
