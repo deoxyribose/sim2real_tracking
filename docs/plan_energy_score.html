@@ -57,13 +57,15 @@ approach before committing code; the design questions in blue boxes are the ones
 we should resolve before implementation.</p>
 
 <div class="card done">
-<span class="tag done">2026-09-01 evening — champion</span>
-<h3>V8 AR + inference tuning: 0.990 pre-DIR recall on real</h3>
-<pre>v8 AR + big sampling + TTA (16M, autoregressive knot decoder):
-  step 60k ckpt, 8 draws × 12 attachments × 6 rollouts × 6 TTA views
-  = ~4600 candidate rollouts per clip → pre_recall = 0.990 @ 6 canonical px
+<span class="tag done">2026-09-01 late — CHAMPION: perfect recall</span>
+<h3>V8 AR + wide TTA: 1.000 pre-DIR recall on real (all 104 GT hit)</h3>
+<pre>v8 AR + 7 rotation angles × flip TTA (16M, autoregressive knot decoder):
+  step 60k ckpt, 4 draws × 8 attachments × 4 rollouts × 14 TTA views
+  = 1792 rollouts per clip → pre_recall = 1.000 @ 6 canonical px
   (equivalent to 12 px @ 256 = physical distance of v6 metric)
-  Only 1 miss out of 104 GT flagella (img_011: min_d=6.4 vs 6.0 threshold).</pre>
+  All 104 GT flagella recalled. Chamfer distribution:
+    p50 = 2.00  p90 = 3.33  p99 = 4.55  max = 4.67
+  Every hit is comfortably within the 6-px threshold (max 4.67).</pre>
 <p><b>Architectural switch that made this possible</b>: the PCA-based whole-
 shape prediction (v3–v6) forces the model to emit shapes from a linear
 16-dim basis, hard-capping how much it can transfer to real. The AR knot
