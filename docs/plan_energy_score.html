@@ -556,14 +556,30 @@ pixel-mask perfectly enough to help reconstruction"; the 12 px threshold is
   of the true skeleton, while v2 has many candidates far from GT.</figcaption>
 </figure>
 <figure>
-  <img src="assets/eval_v3_viz.png" alt="v3 eval: candidates + selected + GT on 16 real frames"
+  <img src="assets/eval_real_honest.png" alt="v3 honest recall viz on real"
        style="max-height:900px">
-  <figcaption>v3 @ 50k on 16 real frames (median-subtracted residual, seismic
-  colormap): green = GT flagellum, orange = DIR-selected, light-blue = candidate
-  pool from 8 noise draws. Candidates cluster tightly on the true skeleton;
-  DIR keeps the good ones and suppresses the far-away ones via same-frame
-  overlap constraints.</figcaption>
+  <figcaption>v3 @ 50k on 16 real frames — HONEST recall viz. For each GT
+  (green if hit, red if miss @ 12 px) we show only the CLOSEST candidate
+  by Chamfer distance (yellow). This is exactly what the recall metric
+  measures: is there ≥1 candidate within threshold per GT? The DIR
+  selections plot ("all candidates" version) is misleading because it
+  shows the whole selected set which is much larger.</figcaption>
 </figure>
+<figure>
+  <img src="assets/eval_sim_honest.png" alt="v3 honest recall viz on sim"
+       style="max-height:900px">
+  <figcaption>Same viz on 16 held-out sim clips (seed offset 1e6). Sim
+  flagella are smaller relative to the frame at some scales, so the closest-
+  candidate lines are sometimes tiny. Recall on sim = 0.70 (see sanity
+  section) — model gets one good hit per GT flagellum 70% of the time on
+  sim's harder cases.</figcaption>
+</figure>
+<p><b>Aside: precision vs recall</b>. Post-DIR precision is only 0.05 — the
+DIR-selected pool contains many false positives — but that's expected given
+our objective is coverage/recall (per Q5). For each of the 104 GT flagella,
+what matters is whether ANY selected candidate lands close. The recall
+metric measures exactly that; the precision is a byproduct we can tune later
+with tighter DIR costs if a downstream consumer needs it.</p>
 <figure>
   <video controls loop muted style="max-width:100%; border:1px solid #dcdce0;">
     <source src="assets/track_cell2_v3.mp4" type="video/mp4">

@@ -90,7 +90,10 @@ def eval_pre_dir_recall(candidate_curves, gt_curves_canon,
 def eval_post_dir_recall(candidates, gt_curves_canon, dir_cfg,
                           residual_clip, coverage_thresh_px=8.0):
     """Build hypothesis pool from ALL candidates as if they came from a single
-    anchor frame (frame_index=0), run DIR, then compute recall on selected."""
+    anchor frame (frame_index=0), run DIR, then compute recall AND PRECISION.
+
+    Precision = fraction of DIR-selected skeletons within threshold of SOME GT.
+    """
     T, H, W = residual_clip.shape
     hypos = []
     for i in range(len(candidates["scores"])):
@@ -102,19 +105,29 @@ def eval_post_dir_recall(candidates, gt_curves_canon, dir_cfg,
             score=float(candidates["scores"][i]),
         ))
     if not hypos:
-        return dict(n_selected=0, recall=0.0)
+        return dict(n_selected=0, recall=0.0, precision=0.0)
     res = residual_clip[T // 2 : T // 2 + 1]                    # single anchor
     problem = build_problem(hypos, res, dir_cfg.build)
     sol = solve_problem(problem, dir_cfg.solve)
     sel_curves = [hypos[i].skeleton for i in sol["selected_indices"]]
     if not sel_curves:
-        return dict(n_selected=0, recall=0.0, selected=[])
+        return dict(n_selected=0, recall=0.0, precision=0.0, selected=[])
     covered = []
     for gt in gt_curves_canon:
         best = min(_chamfer_polylines(p, gt) for p in sel_curves)
         covered.append(best <= coverage_thresh_px)
+    # Precision: for each selected skeleton, is any GT within threshold?
+    if not gt_curves_canon:
+        precision = 0.0
+    else:
+        tp = 0
+        for p in sel_curves:
+            if min(_chamfer_polylines(p, g) for g in gt_curves_canon) <= coverage_thresh_px:
+                tp += 1
+        precision = tp / max(len(sel_curves), 1)
     return dict(n_selected=len(sel_curves),
                 recall=float(sum(covered) / max(len(covered), 1)),
+                precision=float(precision),
                 selected=sel_curves)
 
 
@@ -212,18 +225,25 @@ def main():
             n_candidates=len(cand["scores"]),
             pre_dir_recall=pre["recall"],
             post_dir_recall=post["recall"],
+            post_dir_precision=post.get("precision", 0.0),
             pre_dir_min_chamfer=[float(x) for x in pre["min_chamfer"]],
             post_dir_n_selected=post["n_selected"],
         ))
         print(f"  [{ai:3d}] {ann['name']:24s}  n_gt={len(gt_curves)}  "
-              f"n_cand={len(cand['scores'])}  pre_recall={pre['recall']:.2f}  "
-              f"post_recall={post['recall']:.2f}  post_sel={post['n_selected']}",
+              f"n_cand={len(cand['scores'])}  pre_R={pre['recall']:.2f}  "
+              f"post_R={post['recall']:.2f}  post_P={post.get('precision', 0):.3f}  "
+              f"post_sel={post['n_selected']}",
               flush=True)
 
     total_pre = sum(r * n for r, n in zip(pre_dir_recall_per_ann, n_gt_per_ann)) / \
                  max(sum(n_gt_per_ann), 1)
     total_post = sum(r * n for r, n in zip(post_dir_recall_per_ann, n_gt_per_ann)) / \
                   max(sum(n_gt_per_ann), 1)
+    # Precision aggregated across all selected predictions (not per-annotation)
+    total_sel = sum(a.get("post_dir_n_selected", 0) for a in per_ann)
+    total_tp = sum(a.get("post_dir_precision", 0) * a.get("post_dir_n_selected", 0)
+                    for a in per_ann)
+    total_precision = float(total_tp) / max(total_sel, 1)
 
     summary = dict(
         ckpt=args.ckpt,
@@ -231,14 +251,16 @@ def main():
         n_gt_total=sum(n_gt_per_ann),
         pre_dir_recall=float(total_pre),
         post_dir_recall=float(total_post),
+        post_dir_precision=total_precision,
+        post_dir_n_selected_total=int(total_sel),
         coverage_thresh_px=args.coverage_thresh,
         per_annotation=per_ann,
     )
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(summary, indent=2))
     print()
-    print(f"OVERALL   pre_dir_recall = {total_pre:.3f}   "
-          f"post_dir_recall = {total_post:.3f}")
+    print(f"OVERALL   pre_R = {total_pre:.3f}   post_R = {total_post:.3f}   "
+          f"post_P = {total_precision:.3f}   n_sel_total = {total_sel}")
     print(f"wrote {args.out}")
 
 
