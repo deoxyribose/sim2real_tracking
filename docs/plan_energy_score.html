@@ -528,6 +528,17 @@ suggestions/cell (4 → 8) at the same LR (3e-4) overfit rapidly — v4 peaks at
 step 20k and degrades monotonically after. Bigger isn't better here at the
 current data scale. If we want a bigger model we'd need cosine LR + more
 regularisation (dropout / weight decay boost).</p>
+<figure>
+  <img src="assets/eval_v4_20k.png" alt="v4 @ 20k eval viz" style="max-height:600px">
+  <figcaption>v4 @ 20k (peak, 0.904/0.885): orange candidates cluster on the
+  real flagellum (green GT). Quality comparable to v3.</figcaption>
+</figure>
+<figure>
+  <img src="assets/eval_v4_100k.png" alt="v4 @ 100k eval viz" style="max-height:600px">
+  <figcaption>v4 @ 100k (final, 0.827/0.788): candidates fan out from the
+  flagellum region into far corners of the frame — visible signature of
+  overfitting.</figcaption>
+</figure>
 <p><b>Key improvement</b>: swapping MSE→BCE for the score-head loss lifts pre-DIR
 recall from 69%→97% at the 12 px threshold. MSE was collapsing to always-0 on
 the imbalanced targets (only ~1-5% of grid cells are near a GT); BCE handles
