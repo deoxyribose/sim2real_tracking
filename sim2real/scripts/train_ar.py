@@ -140,17 +140,47 @@ def loss_fn(params, batch, key, backbone, attach_head, knot_gen,
     return total, stats
 
 
-def sample_batch(key, sim_cfg: DiverseSimConfig, batch_size: int):
-    keys = jax.random.split(key, batch_size)
+def _apply_photometric_augs(key, clip, static_med):
+    """Per-clip photometric augmentations to close sim/real distribution gap:
+      brightness offset, contrast scale, gamma, per-pixel gaussian noise.
+    Applied to the residual clip AND the static median so they stay
+    consistent."""
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+    B = clip.shape[0]
+    # per-batch scalars
+    brightness = jax.random.uniform(k1, (B, 1, 1, 1), minval=-0.15, maxval=0.15)
+    contrast = jax.random.uniform(k2, (B, 1, 1, 1), minval=0.7, maxval=1.3)
+    gamma = jax.random.uniform(k3, (B, 1, 1, 1), minval=0.7, maxval=1.4)
+    # Apply to residual clip (T, H, W) → treat as (H, W, T) after None reshape
+    def apply(x, is_static):
+        # x: (B, ..., H, W). Contrast + brightness.
+        x = x * contrast[..., 0] + brightness[..., 0] if is_static else \
+             x * contrast + brightness
+        # Gamma: keep sign, pow abs, restore sign. Safe for signed residuals.
+        sign = jnp.sign(x); mag = jnp.abs(x)
+        # only clip gamma for mag > 0 to avoid nan; clip mag to [1e-6, big]
+        mag = jnp.clip(mag, 1e-6, 1e4)
+        x = sign * jnp.power(mag, gamma[..., 0] if is_static else gamma)
+        return x
+    clip = apply(clip, False)
+    static_med = apply(static_med.squeeze(-1), True)[..., None]
+    # Additive noise (post-augmentation)
+    noise_sig = jax.random.uniform(k4, (B, 1, 1, 1), minval=0.01, maxval=0.15)
+    clip = clip + jax.random.normal(k4, clip.shape) * noise_sig
+    return clip, static_med
+
+
+def sample_batch(key, sim_cfg: DiverseSimConfig, batch_size: int,
+                  apply_augs: bool = True):
+    kg, ka = jax.random.split(key)
+    keys = jax.random.split(kg, batch_size)
     outs = jax.vmap(lambda k: sample_clip(k, sim_cfg))(keys)
     clip = outs["clip_median"]
     static_med = outs["temporal_median"][..., None]
-    # GT skeleton: (B, N_max_flag, K+1, 2)  (curves at mid frame)
+    if apply_augs:
+        clip, static_med = _apply_photometric_augs(ka, clip, static_med)
     T = clip.shape[1]
     curves = outs["curves"][:, T // 2]          # (B, N_flag, K_arc, 2)
-    # Note: sim's curves have K_arc points; we treat point 0 as attachment.
-    # That gives K_arc-1 "steps" per skeleton, so `n_knots` config must be
-    # K_arc - 1 or we need to resample. Simplest: pass raw and let loss slice.
     valid = outs["flagella"]["alive"]
     return clip, static_med, curves, valid
 
@@ -172,13 +202,18 @@ def main():
     ap.add_argument("--H", type=int, default=128)
     ap.add_argument("--T", type=int, default=4)
     ap.add_argument("--base-channels", type=int, default=48)
+    ap.add_argument("--patch-size", type=int, default=24)
+    ap.add_argument("--step-max", type=float, default=8.0)
+    ap.add_argument("--no-augs", action="store_true")
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = UNetARConfig(T=args.T, H=args.H, W=args.H,
-                        base_channels=args.base_channels)
+                        base_channels=args.base_channels,
+                        patch_size=args.patch_size,
+                        step_max=args.step_max)
     sim_cfg = DiverseSimConfig(T=args.T, H=args.H, W=args.H)
     print(f"cfg: H={cfg.H} T={cfg.T} grid={cfg.grid_h}×{cfg.grid_w} "
           f"patch={cfg.patch_size} n_bins=(ang{cfg.n_angle_bins}, "
@@ -230,14 +265,16 @@ def main():
 
     print("compiling...", flush=True)
     key, kb, ks = jax.random.split(key, 3)
-    batch = sample_batch(kb, sim_cfg, args.batch_size)
+    batch = sample_batch(kb, sim_cfg, args.batch_size,
+                          apply_augs=not args.no_augs)
     state, stats = train_step(state, batch, ks)
     print("first-step stats:", {k: float(v) for k, v in jax.device_get(stats).items()})
 
     t0 = time.time()
     for step in range(1, args.n_steps + 1):
         key, kb, ks = jax.random.split(key, 3)
-        batch = sample_batch(kb, sim_cfg, args.batch_size)
+        batch = sample_batch(kb, sim_cfg, args.batch_size,
+                          apply_augs=not args.no_augs)
         state, stats = train_step(state, batch, ks)
         if step % args.log_every == 0:
             stats = jax.device_get(stats)

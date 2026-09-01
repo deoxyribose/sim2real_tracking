@@ -256,6 +256,13 @@ class DiverseSimConfig:
     noise_sigma_min: float = 0.005
     noise_sigma_max: float = 0.040
 
+    # Post-median residual σ-scaling. When True, divide the median-subtracted
+    # clip by its MAD (matching real's canonicalize_clip output range).
+    # This closes the sim-real gap in the model's input distribution: real
+    # residuals live at ~[-10, 10] σ units, sim residuals were at ~[-0.5, 0.5].
+    sigma_scale_residual: bool = True
+    residual_clip_sigma: float = 10.0    # symmetric clip after σ-scaling
+
     # Background: procedural mean level in [0, 1]
     bg_level_min: float = 0.40
     bg_level_max: float = 0.65
@@ -1066,6 +1073,13 @@ def sample_clip(key: jax.Array, cfg: DiverseSimConfig) -> dict:
     # ---- Temporal median subtract -----------------------------------------
     med = jnp.median(clip, axis=0)                                             # (H, W)
     clip_median = clip - med[None]
+
+    # Optional σ-scale (match real's canonicalize_clip range). Uses MAD.
+    if cfg.sigma_scale_residual:
+        m = jnp.median(clip_median)
+        mad = 1.4826 * jnp.median(jnp.abs(clip_median - m)) + 1e-6
+        clip_median = jnp.clip(clip_median / mad, -cfg.residual_clip_sigma,
+                                cfg.residual_clip_sigma)
 
     return dict(
         clip_raw=clip,

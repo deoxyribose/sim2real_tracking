@@ -49,12 +49,12 @@ class UNetARConfig:
 
     # Knot generator
     n_knots: int = 24                 # number of segments to emit after attachment
-    patch_size: int = 12              # side-length of rotated feature-map crop
+    patch_size: int = 24              # side-length of rotated feature-map crop
     n_angle_bins: int = 32            # Δangle bin count (over [-π/2, π/2])
-    n_step_bins: int = 8              # step_len bin count
+    n_step_bins: int = 12             # step_len bin count
     angle_range: float = float(jnp.pi / 2)   # Δangle ∈ [-angle_range, angle_range]
     step_min: float = 0.5             # step_len bin edges span [step_min, step_max]
-    step_max: float = 4.5
+    step_max: float = 8.0             # up to 8-px steps (more room for wider flagella)
 
     # Attachment head
     n_attach_suggestions: int = 4     # attachments per grid cell
