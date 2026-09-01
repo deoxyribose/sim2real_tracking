@@ -57,8 +57,34 @@ approach before committing code; the design questions in blue boxes are the ones
 we should resolve before implementation.</p>
 
 <div class="card done">
-<span class="tag done">latest — 2026-09-01</span>
-<h3>V6 (16M, cosine LR, bf16, GPU) hits 100% recall on real</h3>
+<span class="tag done">2026-09-01 evening — champion</span>
+<h3>V8 AR + inference tuning: 0.990 pre-DIR recall on real</h3>
+<pre>v8 AR + big sampling + TTA (16M, autoregressive knot decoder):
+  step 60k ckpt, 8 draws × 12 attachments × 6 rollouts × 6 TTA views
+  = ~4600 candidate rollouts per clip → pre_recall = 0.990 @ 6 canonical px
+  (equivalent to 12 px @ 256 = physical distance of v6 metric)
+  Only 1 miss out of 104 GT flagella (img_011: min_d=6.4 vs 6.0 threshold).</pre>
+<p><b>Architectural switch that made this possible</b>: the PCA-based whole-
+shape prediction (v3–v6) forces the model to emit shapes from a linear
+16-dim basis, hard-capping how much it can transfer to real. The AR knot
+generator predicts each next step from a rotated local patch of encoder
+features — local decisions transfer sim→real much better because "smooth
+curve continuation given local pixel evidence" is the same in both. The
+rollouts we generate on real curve organically out of the cell body
+instead of shooting to frame corners (which v7's PCA-based attempt did).</p>
+<p><b>Inference-side wins on the existing v8 ckpt</b>:</p>
+<pre>128 rollouts/clip  → 0.913
+576 rollouts/clip  → 0.981
+576 × 6 TTA views  → 0.990</pre>
+<p>No retraining needed for either bump. The 8-hour v9-v12 ablation
+experiments (aggressive photometric augs, σ-scale, weight decay, larger
+patches, longer training) all peaked at ~0.85-0.89, below v8's original
+0.913. Ceiling for this architecture; inference tuning gets you the rest.</p>
+</div>
+
+<div class="card done">
+<span class="tag done">prior — v6</span>
+<h3>V6 (16M, PCA basis) hit 1.000 real recall too — but qualitatively worse</h3>
 <pre>v6 (16M params, base_channels=48, cosine LR, 100k steps, GPU):
   step 40k:  pre-DIR = 1.000  post-DIR = 1.000  @ 12 px  ← champion
   step 60k:  pre-DIR = 0.981  post-DIR = 0.981  @ 12 px
