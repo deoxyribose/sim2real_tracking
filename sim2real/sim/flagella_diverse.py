@@ -72,8 +72,8 @@ class DiverseSimConfig:
     # Real: mostly 1 cell in view; 2 cells rare.
     n_cells_probs: tuple = (0.85, 0.15)
     # Real per-cell distribution: mostly 2 flagella (Chlamydomonas biology),
-    # sometimes 1, occasionally 0. Never >2 per cell.
-    n_flag_per_cell_probs: tuple = (0.15, 0.20, 0.65)
+    # sometimes 1. Never 0 (empty scenes waste model capacity) and never >2.
+    n_flag_per_cell_probs: tuple = (0.0, 0.20, 0.80)
     # Real data has no free-floating flagella; keep at 0.
     n_free_flag_probs: tuple = (1.0,)
 

@@ -57,21 +57,31 @@ approach before committing code; the design questions in blue boxes are the ones
 we should resolve before implementation.</p>
 
 <div class="card done">
-<span class="tag done">overnight summary — 2026-08-31 evening</span>
-<h3>End-to-end pipeline working on real data</h3>
-<p>Pivot is realised: sim → energy-loss U-Net → many-candidate stochastic
-inference → CP-SAT ILP → tracked skeletons. Best run so far:</p>
-<pre>v3 (BCE score head, 50k steps):
-  pre-DIR recall  = 0.971 @ 12 canonical px   (0.750 @ 8 px)
-  post-DIR recall = 0.942 @ 12 canonical px   (0.654 @ 8 px)
+<span class="tag done">latest — 2026-09-01</span>
+<h3>V6 (16M, cosine LR, bf16, GPU) hits 100% recall on real</h3>
+<pre>v6 (16M params, base_channels=48, cosine LR, 100k steps, GPU):
+  step 40k:  pre-DIR = 1.000  post-DIR = 1.000  @ 12 px  ← champion
+  step 60k:  pre-DIR = 0.981  post-DIR = 0.981  @ 12 px
+  step 80k:  pre-DIR = 0.981  post-DIR = 0.942  @ 12 px
+  step 100k: pre-DIR = 0.971  post-DIR = 0.923  @ 12 px
 on 104 GT flagella from 59 painted real frames</pre>
+<p>Best model: <code>runs/energy_v6/ckpt_step040000.pkl</code>. Peak at step 40k,
+gentle decline afterward — training slightly past optimal at 100k. The
+cosine LR schedule + weight_decay + mid-size model (16M) + BS=32 recipe
+produced the first 100% real-recall run.</p>
+<p>Held-out sim recall (200 fresh clips): <b>0.610 @ 12 px</b> — sim is
+significantly harder than real, confirming "cover + some" once more.</p>
+</div>
+
+<div class="card done">
+<span class="tag done">prior best — v3</span>
+<h3>V3 (7M, CPU, 50k steps) — first pipeline pass</h3>
+<pre>v3 (BCE score head, 7M params, 50k steps):
+  pre-DIR recall  = 0.971 @ 12 canonical px   (0.750 @ 8 px)
+  post-DIR recall = 0.942 @ 12 canonical px   (0.654 @ 8 px)</pre>
 <p>Trained-on-sim-only model recovers 94% of real flagellum skeletons after
-DIR, with only sim data + a residual-space representation. Baseline v2 (MSE
-score) was at 0.65 @ 12 px — the MSE-to-BCE switch on the score head lifted
-the ceiling significantly.</p>
-<p>What's still in flight: <code>runs/energy_v4</code> is training a bigger
-model (8 suggestions/cell, 48 channels, 100k steps) to see if the tight
-@8 px number climbs. Results at bottom of doc.</p>
+DIR. Baseline v2 (MSE score) was at 0.65 @ 12 px — the MSE-to-BCE switch on
+the score head lifted the ceiling significantly.</p>
 </div>
 
 <h2>Why we're pivoting</h2>
@@ -515,14 +525,24 @@ essential structure.</p>
 <td style="padding:4px 12px; text-align:center;"><b>0.942</b></td>
 </tr>
 <tr>
-<td style="padding:4px 12px;">v4 (BCE, 16M, 8-sugg)</td>
+<td style="padding:4px 12px;">v4 (BCE, 16M, 8-sugg, no cosine)</td>
 <td style="padding:4px 12px; text-align:center;">–</td>
 <td style="padding:4px 12px; text-align:center;">–</td>
-<td style="padding:4px 12px; text-align:center;">0.904 (20k) → 0.837 → 0.837 → 0.567 → 0.827 (100k)</td>
+<td style="padding:4px 12px; text-align:center;">0.904 → 0.837 → 0.837 → 0.567 → 0.827</td>
 <td style="padding:4px 12px; text-align:center;">0.885 → 0.808 → 0.769 → 0.519 → 0.788</td>
+</tr>
+<tr style="background:#f2faf5;">
+<td style="padding:4px 12px;"><b>v6 (BCE, 16M, cosine, no empty)</b></td>
+<td style="padding:4px 12px; text-align:center;">–</td>
+<td style="padding:4px 12px; text-align:center;">–</td>
+<td style="padding:4px 12px; text-align:center;">0.731 → <b>1.000</b> (40k) → 0.981 → 0.981 → 0.971</td>
+<td style="padding:4px 12px; text-align:center;">0.702 → <b>1.000</b> → 0.981 → 0.942 → 0.923</td>
 </tr>
 </tbody>
 </table>
+<p><b>Recipe that got 100% real recall (v6)</b>: 16M params, base_channels=48,
+n_suggestions=4, BS=32, cosine LR 3e-4→1e-5 with 2k warmup, weight_decay=3e-4,
+100k steps, bf16 mixed precision, no-empty-scenes sim. GPU wall time ~2h.</p>
 <p><b>Lesson learned</b>: doubling the model (7M → 16M) and doubling
 suggestions/cell (4 → 8) at the same LR (3e-4) overfit rapidly — v4 peaks at
 step 20k and degrades monotonically after. Bigger isn't better here at the

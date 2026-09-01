@@ -124,6 +124,10 @@ def main():
     ap.add_argument("--n-steps", type=int, default=1000)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr-schedule", choices=["constant", "cosine"], default="constant")
+    ap.add_argument("--warmup-steps", type=int, default=2000)
+    ap.add_argument("--lr-min", type=float, default=1e-5)
+    ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--save-every", type=int, default=500)
@@ -162,11 +166,20 @@ def main():
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     print(f"model params: {n_params/1e6:.2f} M")
 
+    # LR schedule
+    if args.lr_schedule == "cosine":
+        lr_fn = optax.warmup_cosine_decay_schedule(
+            init_value=0.0, peak_value=args.lr,
+            warmup_steps=args.warmup_steps,
+            decay_steps=args.n_steps,
+            end_value=args.lr_min)
+    else:
+        lr_fn = args.lr
     # Global-norm gradient clipping cures the occasional single-example gradient
     # explosion that produced NaNs in earlier runs.
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(args.lr, weight_decay=1e-4),
+        optax.adamw(lr_fn, weight_decay=args.weight_decay),
     )
     opt_state = optimizer.init(params)
     state = TrainState(params=params, opt_state=opt_state, step=jnp.array(0))

@@ -46,6 +46,7 @@ class UNetConfig:
     # noise channel: low-freq perlin-like scalar map per clip
     noise_scale: float = 1.0
     noise_freq_cells: int = 4            # coarser noise = less overfitting
+    use_bf16: bool = True                # mixed-precision (bf16 compute, fp32 params)
 
     @property
     def n_out_per_pred(self) -> int:
@@ -64,37 +65,46 @@ class UNetConfig:
 
 class ConvBlock(nn.Module):
     features: int
+    dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x, train: bool):
-        x = nn.Conv(self.features, (3, 3), padding="SAME", use_bias=False)(x)
-        x = nn.GroupNorm(num_groups=min(8, self.features))(x)
+        # dtype = compute dtype (bf16 possible); param_dtype = master (fp32).
+        x = nn.Conv(self.features, (3, 3), padding="SAME", use_bias=False,
+                    dtype=self.dtype, param_dtype=jnp.float32)(x)
+        # GroupNorm runs stats in fp32 for stability but casts output to `dtype`.
+        x = nn.GroupNorm(num_groups=min(8, self.features),
+                          dtype=self.dtype, param_dtype=jnp.float32)(x)
         x = nn.gelu(x)
-        x = nn.Conv(self.features, (3, 3), padding="SAME", use_bias=False)(x)
-        x = nn.GroupNorm(num_groups=min(8, self.features))(x)
+        x = nn.Conv(self.features, (3, 3), padding="SAME", use_bias=False,
+                    dtype=self.dtype, param_dtype=jnp.float32)(x)
+        x = nn.GroupNorm(num_groups=min(8, self.features),
+                          dtype=self.dtype, param_dtype=jnp.float32)(x)
         x = nn.gelu(x)
         return x
 
 
 class Down(nn.Module):
     features: int
+    dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x, train):
-        skip = ConvBlock(self.features)(x, train)
+        skip = ConvBlock(self.features, dtype=self.dtype)(x, train)
         pooled = nn.avg_pool(skip, (2, 2), strides=(2, 2), padding="SAME")
         return skip, pooled
 
 
 class Up(nn.Module):
     features: int
+    dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x, skip, train):
         b, h, w, c = x.shape
         x = jax.image.resize(x, (b, h * 2, w * 2, c), method="nearest")
         x = jnp.concatenate([x, skip], axis=-1)
-        x = ConvBlock(self.features)(x, train)
+        x = ConvBlock(self.features, dtype=self.dtype)(x, train)
         return x
 
 
@@ -117,19 +127,22 @@ class UNetEnergy(nn.Module):
           preds: (B, grid_h, grid_w, n_suggestions, n_out_per_pred)
         """
         cfg = self.cfg
+        compute_dtype = jnp.bfloat16 if cfg.use_bf16 else jnp.float32
         # Normalize video shape → (B, H, W, T)
         if video.shape[1] == cfg.T:
             video = jnp.transpose(video, (0, 2, 3, 1))    # (B, T, H, W) → (B, H, W, T)
         x = jnp.concatenate([video, noise], axis=-1)      # (B, H, W, T + 1)
+        x = x.astype(compute_dtype)
 
         # Encoder
         skips = []
         for s in range(cfg.n_stages):
-            skip, x = Down(cfg.base_channels * (2 ** s))(x, train)
+            skip, x = Down(cfg.base_channels * (2 ** s), dtype=compute_dtype)(x, train)
             skips.append(skip)
 
         # Bottleneck
-        x = ConvBlock(cfg.base_channels * (2 ** cfg.n_stages))(x, train)
+        x = ConvBlock(cfg.base_channels * (2 ** cfg.n_stages),
+                       dtype=compute_dtype)(x, train)
 
         # Decoder — go up until we hit `grid_stride`
         # After `n_stages` downsamples we're at stride 2^n_stages relative to input.
@@ -146,11 +159,14 @@ class UNetEnergy(nn.Module):
         for i in range(n_up):
             level = cfg.n_stages - 1 - i
             skip = skips[level]
-            x = Up(cfg.base_channels * (2 ** level))(x, skip, train)
+            x = Up(cfg.base_channels * (2 ** level), dtype=compute_dtype)(x, skip, train)
 
-        # Grid head: reshape channels → (n_suggestions, n_out_per_pred)
+        # Grid head: cast back to fp32 before the final projection so the
+        # loss computation stays in fp32 (Chamfer distances + softmax + BCE).
+        x = x.astype(jnp.float32)
         out_channels = cfg.n_suggestions * cfg.n_out_per_pred
-        x = nn.Conv(out_channels, (1, 1))(x)              # (B, grid_h, grid_w, C)
+        x = nn.Conv(out_channels, (1, 1),
+                     dtype=jnp.float32, param_dtype=jnp.float32)(x)
         b, gh, gw, _ = x.shape
         return x.reshape(b, gh, gw, cfg.n_suggestions, cfg.n_out_per_pred)
 
