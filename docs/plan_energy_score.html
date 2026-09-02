@@ -90,7 +90,8 @@ birth=death=0 (all hypotheses share frame 0, no temporal chain).</p>
 Uniform 500 · score=1.0 · overlap_frac=0.4                | 0.990  | 0.942
 Top-500 by score · real scores · overlap_frac=0.4         | 0.981  | 0.913
 Uniform 500 · recon+score · overlap_frac=0.4              | 0.990  | 0.904
-Uniform 500 · score=1.0 · overlap_frac=0.6                | 0.990  | 0.981  ← best</pre>
+Uniform 500 · score=1.0 · overlap_frac=0.6                | 0.990  | 0.981
+Uniform 1000 · score=1.0 · overlap_frac=0.6               | 1.000  | 0.981  ← best</pre>
 <p>Loosening the same-frame at-most-one from 40% to 60% support-overlap
 recovers 4 of the 5 lost flagella (0.942 → 0.981, only 2 losses left
 out of 104). The default overlap=0.4 was too aggressive: for cells whose
@@ -103,10 +104,13 @@ high-scored cell-body distractors over lower-scored but GT-accurate
 rollouts. The equal-cost + relaxed-overlap winner degenerates to a large
 covering set (140-190 selected per clip vs 30-90 at overlap=0.4).
 Downstream tracking will further prune via temporal linking.</p>
-<p>Remaining 2-flagellum gap: 1 case is subsampling-loss (pool cap dropped
-the good rollout), 1 case is a genuine ILP miss under 0.6 overlap.
-Effectively at the pool-recall ceiling; further gains require pool_cap
-&gt; 500 or a calibrated per-rollout confidence to break remaining ties.</p>
+<p>Doubling pool_cap to 1000 restores pre_recall to 1.000 (recovers the
+one subsampling-loss) but post stays at 0.981 — the 2 remaining losses
+shift to different clips but total count is identical. Suggests the
+ILP is losing exactly 2 flagella regardless of pool size: an
+architectural gap requiring either better per-hypothesis scoring
+(critic head / verifier pass) or a different overlap-constraint
+formulation.</p>
 </div>
 
 <div class="card done">
