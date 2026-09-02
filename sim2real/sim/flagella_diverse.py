@@ -95,15 +95,24 @@ class DiverseSimConfig:
     # Flagellum geometry. Real labels @ 512-canvas: width p50=10, length p50=86.
     # Scaled to our 200-canvas: width ~4 px, length ~34 px.
     flag_length_min: float = 20.0
-    flag_length_max: float = 60.0
+    flag_length_max: float = 45.0
     # A flagellum whose curve leaves [margin, H-margin]×[margin, W-margin]
     # at any time step is marked alive=False (real closeups always show the
     # full flagellum extent). 0 = no margin, disabled if margin < 0.
     flag_frame_margin_px: float = 2.0
     # Beta(a, a) shape for cell placement inside the safe box. a=1 uniform,
-    # a>1 biases toward frame center. a=1.7 gives mode=0.5, std≈0.24 → most
+    # a>1 biases toward frame center. a=3 gives mode=0.5, std≈0.19 → most
     # cells near the middle so flagella don't clip the frame.
-    cell_center_bias: float = 1.7
+    cell_center_bias: float = 3.0
+    # Front-angle jitter half-width around the cell→frame-centre direction.
+    # π = fully uniform; π/4 = ±45° cone toward interior. Combined with pair
+    # spread ≤ π/2 this leaves each paired flag within ±3π/4 of the interior
+    # direction, so most fit inside a centred cell.
+    front_bias_cone: float = 3.14159 / 4
+    # Extra margin for the per-flagellum length cap. Beat curvature adds a
+    # few px of transverse excursion; this buffer ensures the curve still
+    # fits after the beat. Larger → shorter flagella but more survive.
+    flag_length_safety_buffer: float = 10.0
     # SDF sigma; visible width ≈ 2×σ. Target ~2-4 px visible → σ ∈ [0.8, 2.0].
     flag_width_min: float = 0.8
     flag_width_max: float = 2.0
@@ -355,8 +364,16 @@ def sample_cells(key: jax.Array, cfg: DiverseSimConfig, scene_scale: Array):
     axis_ratio = jax.random.uniform(k_ax, (N,), minval=cfg.cell_axis_ratio_min,
                                      maxval=cfg.cell_axis_ratio_max)
     orientation = jax.random.uniform(k_ori, (N,), minval=0.0, maxval=jnp.pi)
-    front_angle = jax.random.uniform(k_front, (N,), minval=0.0,
-                                       maxval=2 * jnp.pi)
+    # Front angle: bias toward the direction from the cell to the frame
+    # centre so paired flagella (which extend at front ± spread) fit inside
+    # the frame most of the time. Uniform ε ∈ [−front_bias_cone, +bias_cone]
+    # around that direction. cfg.front_bias_cone = π → fully uniform.
+    dir_to_center = jnp.arctan2(cfg.H / 2 - centers[:, 0],
+                                  cfg.W / 2 - centers[:, 1])
+    front_noise = jax.random.uniform(k_front, (N,),
+                                       minval=-cfg.front_bias_cone,
+                                       maxval=+cfg.front_bias_cone)
+    front_angle = dir_to_center + front_noise
     # Organelles per cell: n_organelles_max slots, each with (present, offset,
     # radius, amp). Number of active organelles varies per cell.
     n_org = cfg.n_organelles_max
@@ -529,6 +546,25 @@ def pipette_outer_mask(pip: dict, cfg: DiverseSimConfig, t_norm: Array) -> Array
     return outer * pip["present"].astype(jnp.float32)
 
 
+def points_inside_pipette(pts_yx: Array, pip: dict, cfg: DiverseSimConfig,
+                            t_norm: Array) -> Array:
+    """For each point in pts_yx (..., 2) return True if inside pipette outer.
+    Used to kill GT flagella whose knots are hidden behind the pipette."""
+    off = pip["drift"] * (t_norm - 0.5)
+    p0 = pip["base"] + off
+    p1 = pip["tip"] + off
+    axis = p1 - p0
+    axis_len2 = jnp.sum(axis ** 2) + 1e-6
+    d = pts_yx - p0
+    t = jnp.clip((d[..., 0] * axis[0] + d[..., 1] * axis[1]) / axis_len2,
+                  0.0, 1.0)
+    proj = p0 + t[..., None] * axis
+    perp_d = jnp.linalg.norm(pts_yx - proj, axis=-1)
+    outer_r = (pip["base_width"] + t * (pip["tip_width"] - pip["base_width"])) * 0.5
+    inside = perp_d <= outer_r
+    return inside & pip["present"]
+
+
 def render_pipette(pip: dict, cfg: DiverseSimConfig, t_norm: Array) -> Array:
     """Render one HOLLOW CONICAL pipette. Outer soft mask with axial width
     linearly interpolated (base → tip), minus an inner soft mask (hollow), plus
@@ -605,11 +641,10 @@ def sample_flagella(key: jax.Array, cfg: DiverseSimConfig, cells: dict,
                                         maxval=2 * jnp.pi)
     mode_probs = jnp.array(cfg.mode_weights) / sum(cfg.mode_weights)
     cell_mode = jax.random.choice(kc2[1], N_MODES, shape=(Nc,), p=mode_probs)
-    # Half-angular separation between the two flagella of a pair. Was π/8-π/3;
-    # π/8 (22.5°) makes them visually merge — bump min to π/5 (36°) so they're
-    # always distinguishable.
+    # Half-angular separation between the two flagella of a pair. Min π/4
+    # (45°) → paired flagella are at LEAST 90° apart and clearly distinct.
     cell_pair_spread = jax.random.uniform(kc2[2], (Nc,),
-                                            minval=jnp.pi / 5,
+                                            minval=jnp.pi / 4,
                                             maxval=jnp.pi / 2)
     # Biased amp sampling: u^bias skews toward the low end so most flagella
     # are faint (low contrast against BG / cell body). bias=1 uniform,
@@ -680,6 +715,20 @@ def sample_flagella(key: jax.Array, cfg: DiverseSimConfig, cells: dict,
     # Base angle: pointing radially outward from cell center (approximately).
     base_angle = jnp.arctan2(attach_y - pc_center[:, 0],
                               attach_x - pc_center[:, 1])
+
+    # Cap length per slot so a straight extension of `length` in direction
+    # `base_angle` still lands inside [safety_margin, H − safety_margin]²
+    # (with a small buffer for beat curvature). Guarantees the flag has a
+    # chance to survive the OOF filter (still can fail due to curvature).
+    m = cfg.flag_frame_margin_px + cfg.flag_length_safety_buffer
+    dy = jnp.sin(base_angle); dx = jnp.cos(base_angle)
+    bound_y = jnp.where(dy > 0, cfg.H - m - attach_y, attach_y - m)
+    bound_x = jnp.where(dx > 0, cfg.W - m - attach_x, attach_x - m)
+    max_len_y = bound_y / jnp.maximum(jnp.abs(dy), 1e-3)
+    max_len_x = bound_x / jnp.maximum(jnp.abs(dx), 1e-3)
+    max_reach = jnp.maximum(jnp.minimum(max_len_y, max_len_x), 4.0)
+    length = jnp.minimum(length, max_reach)
+
     # Flip breast/lat phase for the mirror partner so their beats are mirror-
     # image rather than in-phase — matches Chlamydomonas breaststroke asymmetry.
     curv_phi = jnp.where((slot_in_pair == 1) & (mode == MODE_BREASTSTROKE),
@@ -1046,7 +1095,14 @@ def sample_clip(key: jax.Array, cfg: DiverseSimConfig) -> dict:
     in_frame = ((ys >= margin) & (ys < cfg.H - margin)
                 & (xs >= margin) & (xs < cfg.W - margin))     # (N, K)
     all_in = in_frame.all(axis=-1)                              # (N,)
-    flag_alive_masked = flag["alive"] & all_in
+
+    # Kill any flagellum with a knot behind the pipette body at mid-frame.
+    # (The render already occludes the pixels, but the GT would still exist
+    # and train the model to hallucinate a flagellum inside the pipette.)
+    t_mid = jnp.float32(0.5)
+    behind_pip = points_inside_pipette(mid, pip, cfg, t_mid)    # (N, K)
+    no_behind = ~behind_pip.any(axis=-1)                         # (N,)
+    flag_alive_masked = flag["alive"] & all_in & no_behind
 
     def render_t(curves_t):
         def one(curve, w, a, al):
