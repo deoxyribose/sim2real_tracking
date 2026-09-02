@@ -122,8 +122,11 @@ class DiverseSimConfig:
     # amp_min + (amp_max − amp_min) · u^bias  for u ~ Uniform(0,1).
     # bias=2 gives median amp near 0.19 instead of 0.36 (uniform) — matches
     # real videos where most flagella are quite faint.
-    flag_amp_min: float = 0.02
-    flag_amp_max: float = 0.70
+    # Real flagella residual has std ≈ 0.006 on /255-scaled images. Old
+    # sim range was 0.02-0.70 which gave sim std ≈ 0.020 — 3x too bright.
+    # Lower max to 0.15 and keep bias=2.5 so median stays around 0.04.
+    flag_amp_min: float = 0.01
+    flag_amp_max: float = 0.15
     flag_amp_bias: float = 2.5
     flag_dark_prob: float = 0.55            # P(polarity == -1, i.e. darker than BG)
 
@@ -270,8 +273,10 @@ class DiverseSimConfig:
     vignette_strength_max: float = 0.10
 
     # Additive gaussian noise σ (in the same [0,1] intensity units)
-    noise_sigma_min: float = 0.005
-    noise_sigma_max: float = 0.040
+    # Real per-pixel noise σ ≈ 0.003–0.008 on /255 units; old sim went to
+    # 0.04 which dominated the residual std. Reduce to match real.
+    noise_sigma_min: float = 0.002
+    noise_sigma_max: float = 0.010
 
     # Post-median residual σ-scaling. When True, divide the median-subtracted
     # clip by its MAD (matching real's canonicalize_clip output range).
@@ -281,8 +286,10 @@ class DiverseSimConfig:
     residual_clip_sigma: float = 10.0    # symmetric clip after σ-scaling
 
     # Background: procedural mean level in [0, 1]
-    bg_level_min: float = 0.40
-    bg_level_max: float = 0.65
+    # Real BG mean ≈ 0.66 in /255 units; sim was 0.40-0.65 (mean 0.53).
+    # Shift up to match real.
+    bg_level_min: float = 0.55
+    bg_level_max: float = 0.75
     bg_texture_amp_max: float = 0.06        # slow 2D perlin-ish texture amplitude
 
 
