@@ -90,9 +90,15 @@ def main():
         for g in row["gt"]:
             if len(g) < 2: continue
             hit = False
+            best_rl = None
             if row["rollouts"]:
                 dists = [_chamfer_polylines(rl, g) for rl in row["rollouts"]]
-                hit = min(dists) <= args.coverage_thresh
+                best_idx = int(np.argmin(dists))
+                best_rl = row["rollouts"][best_idx]
+                hit = dists[best_idx] <= args.coverage_thresh
+            if best_rl is not None:
+                ax.plot(best_rl[:, 1], best_rl[:, 0], "-", color="#00e0ff",
+                        linewidth=1.6, alpha=0.9)
             color = "#33ff44" if hit else "#ff3333"
             ax.plot(g[:, 1], g[:, 0], "-", color=color, linewidth=2.4)
             if hit: n_hit += 1

@@ -218,10 +218,18 @@ def main():
                     help="per-cell-in-radius = fix from AB overfit")
     ap.add_argument("--mask-radius-px", type=float, default=16.0)
     ap.add_argument("--knot-label-smoothing", type=float, default=0.0)
+    ap.add_argument("--n-knots", type=int, default=24)
+    ap.add_argument("--use-stop-head", action="store_true")
+    ap.add_argument("--stop-weight", type=float, default=1.0)
+    ap.add_argument("--smoothness-weight", type=float, default=0.0)
+    ap.add_argument("--target-step-px", type=float, default=4.0,
+                    help="expected inter-knot spacing; used by stop head to compute variable K")
     ap.add_argument("--ss-p-end", type=float, default=1.0,
                     help="scheduled sampling: p_teacher_force at end of --ss-decay-steps. 1.0=off.")
     ap.add_argument("--ss-decay-steps", type=int, default=20000,
                     help="steps to linearly decay p_tf from 1.0 to ss-p-end.")
+    ap.add_argument("--ss-start-step", type=int, default=0,
+                    help="steps of pure teacher-forcing before decay begins.")
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
 
@@ -231,7 +239,10 @@ def main():
                         base_channels=args.base_channels,
                         patch_size=args.patch_size,
                         step_max=args.step_max,
-                        n_step_bins=args.n_step_bins)
+                        n_step_bins=args.n_step_bins,
+                        n_knots=args.n_knots,
+                        has_stop_head=args.use_stop_head,
+                        target_step_px=args.target_step_px)
     sim_cfg = DiverseSimConfig(T=args.T, H=args.H, W=args.H,
                                 sigma_scale_residual=not args.no_sigma_scale)
     print(f"cfg: H={cfg.H} T={cfg.T} grid={cfg.grid_h}×{cfg.grid_w} "
@@ -272,10 +283,15 @@ def main():
     lfn = make_loss_fn(score_mode=args.score_mode, coord_mode=args.coord_mode,
                           mask_radius_px=args.mask_radius_px,
                           knot_label_smoothing=args.knot_label_smoothing,
-                          scheduled_sampling=use_ss)
+                          scheduled_sampling=use_ss,
+                          use_stop_head=args.use_stop_head,
+                          stop_weight=args.stop_weight,
+                          smoothness_weight=args.smoothness_weight)
     print(f"loss: score_mode={args.score_mode}  coord_mode={args.coord_mode}  "
           f"mask_R={args.mask_radius_px}  knot_LS={args.knot_label_smoothing}  "
-          f"scheduled_sampling={use_ss} (p_end={args.ss_p_end}, decay={args.ss_decay_steps})")
+          f"scheduled_sampling={use_ss} (p_end={args.ss_p_end}, decay={args.ss_decay_steps})  "
+          f"stop_head={args.use_stop_head} (w={args.stop_weight})  "
+          f"smoothness_w={args.smoothness_weight}  n_knots={args.n_knots}")
     loss_partial = partial(lfn, backbone=backbone, attach_head=attach_head,
                             knot_gen=knot_gen, cfg=cfg,
                             coord_weight=args.coord_weight,
@@ -291,10 +307,13 @@ def main():
         return TrainState(params=params, opt_state=opt_state, step=state.step + 1), stats
 
     def p_tf_schedule(step: int) -> float:
-        # linear: 1.0 → ss_p_end over ss_decay_steps, then constant
+        # 1.0 for [0, ss_start_step), then linear decay to ss_p_end over
+        # ss_decay_steps steps, then constant.
         if args.ss_p_end >= 1.0:
             return 1.0
-        frac = min(1.0, step / max(1, args.ss_decay_steps))
+        if step < args.ss_start_step:
+            return 1.0
+        frac = min(1.0, (step - args.ss_start_step) / max(1, args.ss_decay_steps))
         return 1.0 - frac * (1.0 - args.ss_p_end)
 
     print("compiling...", flush=True)
@@ -314,11 +333,16 @@ def main():
         if step % args.log_every == 0:
             stats = jax.device_get(stats)
             dt = time.time() - t0
+            extra = ""
+            if "loss_stop" in stats:
+                extra += f"  stop={float(stats['loss_stop']):.3f}"
+            if "loss_smooth" in stats:
+                extra += f"  sm={float(stats['loss_smooth']):.4f}"
             print(f"[step {step:6d}]  t={dt:.1f}s  p_tf={p_tf:.2f}  "
                   f"loss={float(stats['loss_total']):.3f}  "
                   f"coord={float(stats['loss_coord']):.2f}  "
                   f"score={float(stats['loss_score']):.3f}  "
-                  f"knot={float(stats['loss_knot']):.3f}",
+                  f"knot={float(stats['loss_knot']):.3f}{extra}",
                   flush=True)
         if step % args.save_every == 0:
             (out_dir / f"ckpt_step{step:06d}.pkl").write_bytes(

@@ -20,8 +20,8 @@ import jax
 import jax.numpy as jnp
 
 from sim2real.model.unet_ar import (
-    UNetARConfig, encode_gt_polar_steps, rotated_patch_batched,
-    sample_batched_noise, unpack_attachment,
+    UNetARConfig, encode_gt_polar_steps, encode_gt_with_stop,
+    rotated_patch_batched, sample_batched_noise, unpack_attachment,
 )
 
 
@@ -38,7 +38,10 @@ def make_loss_fn(score_mode: str = "wide-gauss",
                    mask_radius_px: float = 16.0,
                    focal_gamma: float = 2.0,
                    knot_label_smoothing: float = 0.0,
-                   scheduled_sampling: bool = False):
+                   scheduled_sampling: bool = False,
+                   use_stop_head: bool = False,
+                   stop_weight: float = 1.0,
+                   smoothness_weight: float = 0.0):
 
     def loss_fn(params, batch, key, backbone, attach_head, knot_gen,
                 cfg: UNetARConfig, coord_weight: float = 5.0,
@@ -137,17 +140,51 @@ def make_loss_fn(score_mode: str = "wide-gauss",
 
         def per_ex_knot(fmap, gt_skel_batch, valid, ex_key):
             def per_gt(skel, is_valid, gkey):
-                att, tangents, d_ang_bin, d_step_bin = encode_gt_polar_steps(skel, cfg)
+                if use_stop_head:
+                    (att, tangents, d_ang_bin, d_step_bin,
+                       valid_mask, stop_target) = encode_gt_with_stop(skel, cfg)
+                else:
+                    att, tangents, d_ang_bin, d_step_bin = encode_gt_polar_steps(
+                        skel, cfg)
+                    valid_mask = jnp.ones(cfg.n_knots, dtype=jnp.bool_)
+                    stop_target = jnp.zeros(cfg.n_knots, dtype=jnp.float32)
                 K = tangents.shape[0]
-                gt_centers = skel[:K]                            # (K, 2)
-                gt_prev_tan = jnp.concatenate([jnp.zeros(1), tangents[:-1]])  # (K,)
+                # Build skel from attachment + tangents for centers (matches
+                # what encode_gt_polar_steps used). Re-run resample_polyline
+                # via arc positions used inside encode:
+                #   centers = attachment + cumulative offsets... too messy;
+                # simplest: use the tangents to reconstruct positions.
+                # Alternative: recompute centers via prev-position + step
+                # from the GT bins. But that costs precision. We keep
+                # centers pointing at the ORIGINAL skel positions by simply
+                # regenerating them from the resampled arc positions used
+                # inside encode_gt_polar_steps → we duplicate that logic here.
+                # For simplicity we compute centers by cumulative reconstruction
+                # of ideal positions (used only as patch centers).
+                d_ang_c = cfg.angle_bin_centers[d_ang_bin]
+                d_step_c = cfg.step_bin_centers[d_step_bin]
+                def _pos_scan(carry, i):
+                    pos, tan = carry
+                    new_tan = tan + d_ang_c[i]
+                    step = d_step_c[i]
+                    new_pos = jnp.stack([pos[0] + step * jnp.sin(new_tan),
+                                          pos[1] + step * jnp.cos(new_tan)])
+                    return (new_pos, new_tan), pos
+                (_, _), centers = jax.lax.scan(
+                    _pos_scan, (att, jnp.array(0.0)), jnp.arange(K))
+                gt_centers = centers                              # (K, 2)
+                gt_prev_tan = jnp.concatenate([jnp.zeros(1), tangents[:-1]])
 
                 if not scheduled_sampling:
                     # Pure teacher-forcing — batched (fast) path
                     patches = rotated_patch_batched(
                         fmap, gt_centers, gt_prev_tan, cfg.patch_size)
-                    angle_logits, step_logits = knot_gen.apply(
-                        params["knot"], patches)
+                    kg_out = knot_gen.apply(params["knot"], patches)
+                    if use_stop_head:
+                        angle_logits, step_logits, stop_logits = kg_out
+                    else:
+                        angle_logits, step_logits = kg_out
+                        stop_logits = jnp.zeros(K)
                     a_loss = jax.vmap(smoothed_ce_row, in_axes=(0, 0, None))(
                         angle_logits, d_ang_bin, cfg.n_angle_bins)
                     s_loss = jax.vmap(smoothed_ce_row, in_axes=(0, 0, None))(
@@ -182,19 +219,55 @@ def make_loss_fn(score_mode: str = "wide-gauss",
                     (_, _, _), (a_loss, s_loss) = jax.lax.scan(
                         step_fn, (skel[0], jnp.array(0.0), jnp.int32(0)),
                         jnp.arange(K))
+                    stop_logits = jnp.zeros(K)      # SS + stop not supported yet
 
-                return (a_loss.mean() + s_loss.mean()) * is_valid.astype(jnp.float32)
+                # Mask by valid: only valid knots count in knot CE
+                vmask = valid_mask.astype(jnp.float32)
+                a_loss = (a_loss * vmask).sum() / jnp.maximum(vmask.sum(), 1)
+                s_loss = (s_loss * vmask).sum() / jnp.maximum(vmask.sum(), 1)
+
+                # Stop BCE (all knots contribute) if stop head is on
+                if use_stop_head:
+                    logp1 = jax.nn.log_sigmoid(stop_logits)
+                    logp0 = jax.nn.log_sigmoid(-stop_logits)
+                    stop_bce = -(stop_target * logp1
+                                  + (1.0 - stop_target) * logp0).mean()
+                else:
+                    stop_bce = jnp.array(0.0)
+
+                # Smoothness prior: penalize (E[Δang_k] - E[Δang_{k-1}])²
+                if smoothness_weight > 0.0:
+                    # E[Δang_k] under the categorical
+                    exp_ang = (jax.nn.softmax(angle_logits, -1)
+                                * cfg.angle_bin_centers[None]).sum(-1)  # (K,)
+                    d_exp = exp_ang[1:] - exp_ang[:-1]           # (K-1,)
+                    # Only count transitions where BOTH knots are valid
+                    v_pair = (vmask[1:] * vmask[:-1])            # (K-1,)
+                    sm = (d_exp ** 2 * v_pair).sum() / jnp.maximum(v_pair.sum(), 1)
+                else:
+                    sm = jnp.array(0.0)
+
+                per_gt_loss = (a_loss + s_loss
+                                + stop_weight * stop_bce
+                                + smoothness_weight * sm)
+                return per_gt_loss * is_valid.astype(jnp.float32), stop_bce, sm
             gt_keys = jax.random.split(ex_key, gt_skel_batch.shape[0])
-            losses = jax.vmap(per_gt)(gt_skel_batch, valid, gt_keys)
+            losses, stop_bces, sms = jax.vmap(per_gt)(
+                gt_skel_batch, valid, gt_keys)
             n_gt = jnp.maximum(valid.sum().astype(jnp.float32), 1)
-            return losses.sum() / n_gt
+            return losses.sum() / n_gt, stop_bces.mean(), sms.mean()
 
         ex_keys = jax.random.split(key_r, video.shape[0])
-        knot_l = jax.vmap(per_ex_knot)(full_res, gt_skels, gt_valid, ex_keys).mean()
+        knot_l_all, stop_l_all, sm_l_all = jax.vmap(per_ex_knot)(
+            full_res, gt_skels, gt_valid, ex_keys)
+        knot_l = knot_l_all.mean()
+        stop_l = stop_l_all.mean()
+        sm_l = sm_l_all.mean()
 
         total = (coord_weight * coord_l + score_weight * score_l
                   + knot_weight * knot_l)
         stats = dict(loss_total=total, loss_coord=coord_l,
-                      loss_score=score_l, loss_knot=knot_l)
+                      loss_score=score_l, loss_knot=knot_l,
+                      loss_stop=stop_l, loss_smooth=sm_l)
         return total, stats
     return loss_fn

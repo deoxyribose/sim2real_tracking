@@ -103,15 +103,25 @@ def main():
         lo, hi = np.percentile(bg, [1, 99])
         gray = np.clip((bg - lo) / max(hi - lo, 1e-6), 0, 1)
         ax.imshow(gray, cmap="gray", extent=(0, CANONICAL_W - 1, CANONICAL_H - 1, 0))
+        # 1. all rollouts as thin yellow (the pool)
         for rl in row["rollouts"]:
             ax.plot(rl[:, 1], rl[:, 0], "-", color="#ffd633",
                     linewidth=0.6, alpha=args.roll_alpha)
         n_hit = 0
         for gt in row["gt"]:
             hit = False
+            best_rl = None
             if row["rollouts"]:
                 dists = [_chamfer_polylines(rl, gt) for rl in row["rollouts"]]
-                hit = min(dists) <= args.coverage_thresh
+                best_idx = int(np.argmin(dists))
+                best_d = dists[best_idx]
+                best_rl = row["rollouts"][best_idx]
+                hit = best_d <= args.coverage_thresh
+            # 2. best-per-GT rollout in cyan (thicker than the pool)
+            if best_rl is not None:
+                ax.plot(best_rl[:, 1], best_rl[:, 0], "-", color="#00e0ff",
+                        linewidth=1.6, alpha=0.9)
+            # 3. GT on top: green if any pool rollout covers, red otherwise
             color = "#33ff44" if hit else "#ff3333"
             ax.plot(gt[:, 1], gt[:, 0], "-", color=color, linewidth=2.4)
             if hit: n_hit += 1
@@ -124,8 +134,9 @@ def main():
         r, c = i // args.ncols, i % args.ncols
         axes[r][c].axis("off")
 
-    fig.suptitle("V8 AR + TTA — full rollout pool on real "
-                 "(yellow = every rollout, green GT = covered, red GT = miss)",
+    fig.suptitle("AR + TTA — full rollout pool on real "
+                 "(yellow = every rollout, cyan = best-per-GT, "
+                 "green GT = covered, red GT = miss)",
                  fontsize=10)
     fig.tight_layout()
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)

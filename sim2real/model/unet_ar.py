@@ -55,6 +55,15 @@ class UNetARConfig:
     angle_range: float = float(jnp.pi / 2)   # Δangle ∈ [-angle_range, angle_range]
     step_min: float = 0.5             # step_len bin edges span [step_min, step_max]
     step_max: float = 8.0             # up to 8-px steps (more room for wider flagella)
+    # Optional stop head for variable-length rollouts. When True, the knot
+    # generator emits an extra logit per knot indicating "flagellum ends here";
+    # rollout terminates at the first knot where sigmoid(stop_logit) > 0.5.
+    has_stop_head: bool = False
+    # For teacher-forced training with the stop head, we resample GT to
+    # min(n_knots, ceil(arc_length / target_step_px)) uniform-arc knots and
+    # place the stop target at the last real knot. target_step_px ≈ typical
+    # inter-knot spacing of "just-right" rollouts.
+    target_step_px: float = 4.0
 
     # Attachment head
     n_attach_suggestions: int = 4     # attachments per grid cell
@@ -220,11 +229,16 @@ def rotated_patch_batched(feature_map: Array, centers: Array, tangents: Array,
 
 class KnotGenerator(nn.Module):
     """Predict categorical distribution over (Δangle, step_len) given a
-    rotated feature-map patch centered on the current knot."""
+    rotated feature-map patch centered on the current knot. If
+    cfg.has_stop_head, also predicts a single stop logit per knot.
+
+    Returns (angle_logits, step_logits) if has_stop_head is False,
+    else (angle_logits, step_logits, stop_logits).
+    """
     cfg: UNetARConfig
 
     @nn.compact
-    def __call__(self, patch: Array) -> tuple[Array, Array]:
+    def __call__(self, patch: Array):
         cfg = self.cfg
         x = nn.Conv(64, (3, 3), padding="SAME",
                      dtype=jnp.float32, param_dtype=jnp.float32)(patch)
@@ -242,6 +256,10 @@ class KnotGenerator(nn.Module):
         step_logits = nn.Dense(cfg.n_step_bins,
                                  dtype=jnp.float32,
                                  param_dtype=jnp.float32)(x)
+        if cfg.has_stop_head:
+            stop_logit = nn.Dense(1, dtype=jnp.float32,
+                                    param_dtype=jnp.float32)(x)
+            return angle_logits, step_logits, stop_logit[..., 0]
         return angle_logits, step_logits
 
 
@@ -263,15 +281,19 @@ def sample_batched_noise(key: jax.Array, batch_size: int, cfg: UNetARConfig,
 # ---- Convenience: encode GT skeleton into (Δangle, step_len) sequence -----
 
 def encode_gt_polar_steps(skeleton: Array, cfg: UNetARConfig) -> tuple[Array, Array, Array, Array]:
-    """Given a (K+1, 2) skeleton polyline (attachment + K knots), return:
+    """Given a variable-length (M, 2) skeleton polyline, resample to exactly
+    cfg.n_knots+1 uniform-arc points and encode the AR training targets.
+
+    Returns:
         attachment:   (2,) initial (y, x)
-        angles:       (K,) tangent angle *at the end of each step*
-        d_angles:     (K,) target Δangle bin index per step (int32 in [0, n_bins))
-        d_steps:      (K,) target step_len bin index per step (int32 in [0, n_bins))
-    d_angles[0] uses tangent=0 as reference (initial "no prior direction").
+        angles:       (K,) tangent at each step, K = cfg.n_knots
+        d_angles:     (K,) Δangle bin index per step (int32)
+        d_steps:      (K,) step_len bin index per step (int32)
+    d_angles[0] uses tangent=0 as reference.
     """
-    K = skeleton.shape[0] - 1
-    diffs = jnp.diff(skeleton, axis=0)                     # (K, 2) in (dy, dx)
+    K = cfg.n_knots
+    skel = _resample_polyline_jax(skeleton, K + 1)         # (K+1, 2)
+    diffs = jnp.diff(skel, axis=0)                          # (K, 2) in (dy, dx)
     step_lens = jnp.linalg.norm(diffs, axis=-1)             # (K,)
     tangents = jnp.arctan2(diffs[:, 0], diffs[:, 1])        # (K,)
     prev_tangents = jnp.concatenate([jnp.zeros(1), tangents[:-1]])
@@ -288,7 +310,75 @@ def encode_gt_polar_steps(skeleton: Array, cfg: UNetARConfig) -> tuple[Array, Ar
     d_angle_bin = jnp.clip(d_angle_bin, 0, cfg.n_angle_bins - 1)
     step_bin = jnp.clip(step_bin, 0, cfg.n_step_bins - 1)
 
-    return skeleton[0], tangents, d_angle_bin.astype(jnp.int32), step_bin.astype(jnp.int32)
+    return skel[0], tangents, d_angle_bin.astype(jnp.int32), step_bin.astype(jnp.int32)
+
+
+def _resample_polyline_jax(polyline: Array, k: int) -> Array:
+    """JAX-friendly uniform-arc resample to k points. polyline: (M, 2)."""
+    seg = jnp.linalg.norm(jnp.diff(polyline, axis=0), axis=1)  # (M-1,)
+    cum = jnp.concatenate([jnp.zeros(1), jnp.cumsum(seg)])     # (M,)
+    total = cum[-1]
+    # Guard: if all seg lens ≈ 0, return first point repeated
+    total_safe = jnp.maximum(total, 1e-6)
+    tgt = jnp.linspace(0.0, total_safe, k)                     # (k,)
+    # Interp coord-wise
+    ys = jnp.interp(tgt, cum, polyline[:, 0])
+    xs = jnp.interp(tgt, cum, polyline[:, 1])
+    return jnp.stack([ys, xs], axis=-1)
+
+
+def encode_gt_with_stop(skeleton: Array, cfg: UNetARConfig):
+    """Like encode_gt_polar_steps but also returns:
+        valid_mask:   (K,) bool — True while flagellum is still going
+        stop_target:  (K,) float32 — 1.0 at the last real knot, else 0
+        arc_length:   scalar
+    Number of "real" knots K_real = min(n_knots, ceil(arc_length / target_step_px)).
+    Skeleton is resampled to K_real + 1 uniform-arc points, then padded to
+    cfg.n_knots + 1 by repeating the last real point (so masked positions
+    have zero-length steps and don't disturb the loss).
+    """
+    K = cfg.n_knots
+    # Compute arc length of the input skeleton
+    seg = jnp.linalg.norm(jnp.diff(skeleton, axis=0), axis=1)
+    arc_length = seg.sum()
+    # Determine how many knots to use
+    k_real = jnp.clip(
+        jnp.ceil(arc_length / cfg.target_step_px).astype(jnp.int32),
+        1, K).astype(jnp.int32)
+    # Resample to K+1 uniform points across [0, arc_length * k_real/K] — i.e.
+    # the first k_real+1 points cover the real curve, the remainder duplicate
+    # the last real point. Instead of a dynamic reshape we build a K+1 target
+    # array where positions >= k_real+1 clamp to arc_length.
+    seg_full = jnp.concatenate([jnp.zeros(1), jnp.cumsum(seg)])
+    total = jnp.maximum(seg_full[-1], 1e-6)
+    step = total / k_real.astype(jnp.float32)
+    tgt = step * jnp.arange(K + 1, dtype=jnp.float32)         # (K+1,)
+    tgt = jnp.clip(tgt, 0.0, total)
+    ys = jnp.interp(tgt, seg_full, skeleton[:, 0])
+    xs = jnp.interp(tgt, seg_full, skeleton[:, 1])
+    skel = jnp.stack([ys, xs], axis=-1)                        # (K+1, 2)
+
+    diffs = jnp.diff(skel, axis=0)
+    step_lens = jnp.linalg.norm(diffs, axis=-1)
+    tangents = jnp.arctan2(diffs[:, 0], diffs[:, 1])
+    prev_tangents = jnp.concatenate([jnp.zeros(1), tangents[:-1]])
+    d_angle = jnp.arctan2(jnp.sin(tangents - prev_tangents),
+                            jnp.cos(tangents - prev_tangents))
+
+    angle_edges = cfg.angle_bin_edges
+    step_edges = cfg.step_bin_edges
+    d_angle_clipped = jnp.clip(d_angle, angle_edges[0], angle_edges[-1] - 1e-6)
+    step_clipped = jnp.clip(step_lens, step_edges[0], step_edges[-1] - 1e-6)
+    d_angle_bin = jnp.searchsorted(angle_edges, d_angle_clipped, side="right") - 1
+    step_bin = jnp.searchsorted(step_edges, step_clipped, side="right") - 1
+    d_angle_bin = jnp.clip(d_angle_bin, 0, cfg.n_angle_bins - 1)
+    step_bin = jnp.clip(step_bin, 0, cfg.n_step_bins - 1)
+
+    valid_mask = jnp.arange(K) < k_real                       # (K,) bool
+    stop_target = (jnp.arange(K) == (k_real - 1)).astype(jnp.float32)
+
+    return (skel[0], tangents, d_angle_bin.astype(jnp.int32),
+            step_bin.astype(jnp.int32), valid_mask, stop_target)
 
 
 def decode_polar_steps(attachment: Array, tangents: Array,
