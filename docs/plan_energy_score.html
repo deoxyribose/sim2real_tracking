@@ -82,26 +82,31 @@ instead of shooting to frame corners (which v7's PCA-based attempt did).</p>
 experiments (aggressive photometric augs, σ-scale, weight decay, larger
 patches, longer training) all peaked at ~0.85-0.89, below v8's original
 0.913. Ceiling for this architecture; inference tuning gets you the rest.</p>
-<p><b>Post-DIR recall (end-to-end pipeline)</b>: DIR selects a non-overlapping
-subset of the candidate pool. Wide-TTA rollouts capped at 500 per clip
-for tractability; birth_cost=death_cost=0 (all hypotheses share frame 0,
-no temporal chain). Three cost/pool strategies compared:</p>
-<pre>Strategy                                       | pre    | post   | Δ
------------------------------------------------|--------|--------|------
-Uniform 500 · score_only · score=1.0           | 0.990  | 0.942  | -0.048
-Top-500 by score · score_only · real scores    | 0.981  | 0.913  | -0.068
-Uniform 500 · recon+score cost                 | 0.990  | 0.904  | -0.086</pre>
-<p>Counterintuitive winner: the ILP does BEST when all candidates have equal
-cost — it degenerates to maximum-independent-set selection, and with 500
-overlapping-tube candidates the covering rollouts survive as members of
-their overlap cluster. Real attachment scores actively HURT: high-scored
-distractors near the cell body get preferred over lower-scored but
-GT-accurate rollouts. The recon+score cost penalises rollouts that don't
-match the noisy residual well, dropping ~4% more than the trivial mode.</p>
-<p>Bottleneck for post→pre gap: no per-hypothesis signal reliably ranks
-GT proximity. A calibrated per-rollout confidence — not the attachment
-score — would close this. Options: verify each rollout with a second
-forward pass, or train a light critic head. Deferred; 0.942 is usable.</p>
+<p><b>Post-DIR recall (end-to-end pipeline)</b>: DIR selects a subset of the
+candidate pool. Wide-TTA rollouts capped at 500 per clip for tractability;
+birth=death=0 (all hypotheses share frame 0, no temporal chain).</p>
+<pre>Strategy                                                  | pre    | post
+----------------------------------------------------------|--------|-------
+Uniform 500 · score=1.0 · overlap_frac=0.4                | 0.990  | 0.942
+Top-500 by score · real scores · overlap_frac=0.4         | 0.981  | 0.913
+Uniform 500 · recon+score · overlap_frac=0.4              | 0.990  | 0.904
+Uniform 500 · score=1.0 · overlap_frac=0.6                | 0.990  | 0.981  ← best</pre>
+<p>Loosening the same-frame at-most-one from 40% to 60% support-overlap
+recovers 4 of the 5 lost flagella (0.942 → 0.981, only 2 losses left
+out of 104). The default overlap=0.4 was too aggressive: for cells whose
+two flagella beat close to each other, the good rollouts for both get
+mutually excluded even though they belong to different physical
+structures. Overlap=0.6 keeps them.</p>
+<p>Score-based ranking actively hurts (0.913 &lt; 0.942 baseline):
+attachment scores rank confidence but not GT proximity — the ILP prefers
+high-scored cell-body distractors over lower-scored but GT-accurate
+rollouts. The equal-cost + relaxed-overlap winner degenerates to a large
+covering set (140-190 selected per clip vs 30-90 at overlap=0.4).
+Downstream tracking will further prune via temporal linking.</p>
+<p>Remaining 2-flagellum gap: 1 case is subsampling-loss (pool cap dropped
+the good rollout), 1 case is a genuine ILP miss under 0.6 overlap.
+Effectively at the pool-recall ceiling; further gains require pool_cap
+&gt; 500 or a calibrated per-rollout confidence to break remaining ties.</p>
 </div>
 
 <div class="card done">
