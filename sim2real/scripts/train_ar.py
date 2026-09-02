@@ -28,6 +28,7 @@ from sim2real.model.unet_ar import (
     encode_gt_polar_steps, rotated_patch_batched, sample_batched_noise,
     unpack_attachment,
 )
+from sim2real.scripts.losses_ar_v2 import make_loss_fn
 from sim2real.sim.flagella_diverse import DiverseSimConfig, sample_clip
 
 
@@ -207,6 +208,13 @@ def main():
     ap.add_argument("--no-augs", action="store_true")
     ap.add_argument("--no-sigma-scale", action="store_true",
                     help="disable the residual σ-scale in the sim")
+    ap.add_argument("--score-mode", choices=["wide-gauss", "hard-mask", "focal"],
+                    default="wide-gauss",
+                    help="wide-gauss = v8 baseline; hard-mask = fix from AB overfit")
+    ap.add_argument("--coord-mode", choices=["min-over-all", "per-cell-in-radius"],
+                    default="min-over-all",
+                    help="per-cell-in-radius = fix from AB overfit")
+    ap.add_argument("--mask-radius-px", type=float, default=16.0)
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
 
