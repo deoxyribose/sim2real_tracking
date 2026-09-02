@@ -107,7 +107,8 @@ def sample_pool_one_clip(params, backbone, attach_head, knot_gen, cfg,
                            n_rollouts: int = 1,
                            score_thresh: float = 0.02,
                            key: jax.Array = None,
-                           _sampler=None):
+                           _sampler=None,
+                           return_scores: bool = False):
     """Return list of rollouts (each (K+1, 2) in model canvas coords)."""
     if _sampler is None:
         _sampler = make_sampler(cfg, backbone, attach_head, knot_gen)
@@ -143,7 +144,7 @@ def sample_pool_one_clip(params, backbone, attach_head, knot_gen, cfg,
     yy, xx = np.meshgrid(ys, xs, indexing="ij")
     cell_centers = np.stack([yy, xx], -1)          # (gh, gw, 2)
 
-    all_attaches, all_keep_mask = [], []
+    all_attaches, all_keep_mask, all_scores = [], [], []
     for b in range(B):
         raw = attach[b]                            # (gh, gw, n_sug, 3)
         dy = 32.0 * np.tanh(raw[..., 0])
@@ -155,23 +156,23 @@ def sample_pool_one_clip(params, backbone, attach_head, knot_gen, cfg,
         idx = np.argsort(-flat_sc)[:n_attach]
         keep = flat_sc[idx] >= score_thresh
         atts = flat_pos[idx].astype(np.float32)    # (n_attach, 2)
-        # Pad rejected slots with (0, 0) — will be masked out post-rollout
-        atts_kept = np.where(keep[:, None], atts, atts[0:1])  # (n_attach, 2)
+        sc_top = flat_sc[idx].astype(np.float32)
+        atts_kept = np.where(keep[:, None], atts, atts[0:1])
         all_attaches.append(atts_kept)
         all_keep_mask.append(keep)
+        all_scores.append(sc_top)
 
     all_attaches  = np.stack(all_attaches, axis=0)   # (B, n_attach, 2)
-    all_keep_mask = np.stack(all_keep_mask, axis=0)  # (B, n_attach) bool
+    all_keep_mask = np.stack(all_keep_mask, axis=0)
+    all_scores    = np.stack(all_scores, axis=0)     # (B, n_attach)
 
-    # For n_rollouts multiple categorical samples per attachment, we tile the
-    # attachments along a new axis and use different keys.
-    out = []
+    out, scores_out = [], []
     for r in range(n_rollouts):
         key, kr = jax.random.split(key)
         keys_flat = jax.random.split(kr, B * n_attach).reshape(B, n_attach)
         rollouts = np.asarray(rollout_scan(
             jnp.asarray(full_res), params["knot"],
-            jnp.asarray(all_attaches), keys_flat))       # (B, n_attach, K+1, 2)
+            jnp.asarray(all_attaches), keys_flat))
         for b in range(B):
             view_idx = b // n_draws
             angle, flipped = angle_flip[view_idx]
@@ -180,4 +181,7 @@ def sample_pool_one_clip(params, backbone, attach_head, knot_gen, cfg,
                     continue
                 inv = _inv_rotate_pts(rollouts[b, m], cfg.H, cfg.W, angle, flipped)
                 out.append(inv)
+                scores_out.append(float(all_scores[b, m]))
+    if return_scores:
+        return out, scores_out, key
     return out, key
