@@ -341,28 +341,81 @@ doesn't reroute the argmax to a wrong bin.</p>
       L2. No teacher-forcing.</li>
 </ul>
 
-<h2>7. Recommendation and current status</h2>
+<h2>7. Iteration log and current status</h2>
 
-<p>Attack in this order:</p>
+<table>
+<tr><th>run</th><th>changes vs prior</th><th>fast pre_recall (peak)</th>
+    <th>wide-TTA (peak)</th></tr>
+<tr><td>v8 (champion, 24 knots)</td>
+    <td>original AR + attach + wide-gauss score + min-over-all coord</td>
+    <td>step 60k → 0.990</td><td>1.000 (60k)</td></tr>
+<tr><td>v13</td>
+    <td>+ hard-mask score + per-cell-in-radius coord + LS 0.1</td>
+    <td>step 5k → 0.846 (peak much earlier)</td><td>0.971 (5k)</td></tr>
+<tr><td>v14</td>
+    <td>+ SS from step 0, p_tf 1.0→0.5 over 20k</td>
+    <td>step 5k → 0.769</td><td>—</td></tr>
+<tr><td>v15</td>
+    <td>SS delayed until step 20k (killed early)</td>
+    <td>—</td><td>—</td></tr>
+<tr><td>v16 <b>(training now)</b></td>
+    <td>+ 12 knots + stop head + smoothness prior; larger patches (24)</td>
+    <td>pending</td><td>pending</td></tr>
+</table>
+
+<h3>Why v14/v15 didn't win</h3>
+<p>Scheduled sampling was expected to fix exposure bias by mixing self-context
+into training. In practice v14 peaked <i>lower</i> than v13 (0.77 vs 0.85 at
+step 5k). Hypothesis: SS active from step 0 hurts the initial categorical
+formation. v15 delayed SS to step 20k but was killed for v16 before it
+completed.</p>
+
+<h3>v16 design</h3>
+<p>Three simultaneous changes attacking three separate failure modes:</p>
 <ol>
-  <li><b>Fix the score/coord losses</b> (hard-mask + per-cell-in-radius) —
-      <span class="win">DONE</span>. Unstuck the score-loss floor
-      (0.190 → 0.034) and doubled overfit recall (0.40 → 0.60).</li>
-  <li><b>Add label smoothing 0.1</b> to knot CE — <span class="win">DONE</span>.
-      Overfit recall reaches 1.0 peak, oscillates 0.87–1.00.</li>
-  <li><b>1h retrain (v13) with the full recipe</b> — <span class="win">IN
-      PROGRESS</span>. Real-data recall trajectory bounces; awaiting the
-      final ckpt sweep. Even at step 5k already 0.654, beating v8's step
-      20k (0.462), but subsequent evals dip. Full sweep needed once
-      training completes.</li>
-  <li><b>If v13 doesn't hit v8's 0.913 peak on real</b>: add rollout-Chamfer
-      auxiliary loss with Gumbel-softmax straight-through so we optimise
-      the metric directly.</li>
-  <li><b>If still not enough</b>: replace attach head with DETR-style set
-      prediction (Hungarian matching) so there's no negative-slot swamping,
-      or add a STOP token so short GT flagella stop penalising the
-      pred→gt Chamfer term.</li>
+  <li><b>12 knots instead of 24</b>: exposure-bias compounding grows roughly
+      linearly with rollout length. Half the steps → half the error
+      accumulation. Doubled step_max (4.5 → 6.0) and doubled bin range
+      (n_step_bins 8 → 10) to keep coverage of the same 12–72 px length
+      range that we used to hit with 24 × [0.75, 4.25].</li>
+
+  <li><b>Stop token</b> (variable-length rollout). Currently 30% of real GT
+      flagella are shorter than the model's minimum (18 px). Chamfer inflates
+      recall by ~2× on those (§4). Fix:
+      <ul>
+        <li>Determine training-time knot count from GT arc length:
+            <code>k_real = ceil(arc_length / target_step_px)</code>, clipped to
+            [1, 12].</li>
+        <li>Resample GT to <code>k_real+1</code> uniform-arc points,
+            pad to 13 with the last point.</li>
+        <li>Knot CE masked to <code>valid_mask = arange(K) < k_real</code>
+            so padded knots don't wash out the signal.</li>
+        <li>Stop head predicts a per-knot logit;
+            <code>stop_target[k_real-1] = 1</code>, else 0. Rollout
+            terminates at the first knot where <code>sigmoid(stop) > 0.5</code>.</li>
+      </ul>
+  </li>
+
+  <li><b>Smoothness prior on the categorical</b>. Currently the knot CE
+      treats every step independently — two adjacent knots can each hit CE=0
+      while predicting wildly different Δangles. Real Chlamydomonas beats
+      are smooth. New loss term:
+      <pre>sm_loss = mean_k [ (E[Δang_k] − E[Δang_{k-1}])² ]
+where  E[Δang_k] = Σ_i softmax(angle_logits[k])_i · bin_center_i</pre>
+      Encourages the model to make similar predictions at adjacent knots.
+      Weight 0.3 in v16.</li>
 </ol>
+
+<h3>Next after v16 (planned)</h3>
+<ul>
+  <li><b>6-CP cubic B-spline</b> (if v16 underwhelms): swap the 12-knot
+      polyline for 6 spline control points, AR-predicted from rotated patches
+      at CP positions. Cuts AR steps another 2× and gives smooth curves for
+      free. Renders as 25 dense samples for Chamfer/render.</li>
+  <li>Ordered-L2 metric to keep from over-reporting under Chamfer.</li>
+  <li>Verify sim rendering quality (pipette occlusion, in-frame flagella,
+      etc.) — see the sim v2 fixes.</li>
+</ul>
 
 <p class="muted">The green line stuck at 0.196 in the overfit curve isn't
 just a hyperparameter tuning issue — the loss surface has a plateau that
