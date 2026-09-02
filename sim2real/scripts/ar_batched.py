@@ -69,15 +69,19 @@ def make_sampler(cfg: UNetARConfig, backbone, attach_head, knot_gen,
 
     @jax.jit
     def rollout_scan(feature_maps, params_knot, attaches, keys):
-        """feature_maps: (B, H, W, C); attaches: (B, M, 2); keys: (B, M)."""
+        """feature_maps: (B, H, W, C); attaches: (B, M, 2); keys: (B, M).
+
+        If cfg.has_stop_head is True, the rollout freezes position once the
+        stop head first fires (sigmoid(stop_logit) > 0.5). Frozen positions
+        return the last valid knot repeated → downstream Chamfer is unaffected
+        by the duplicated tail (zero extra pred→gt distance)."""
         def per_view(feature_map, atts, ks):
             def per_attach(att, k):
                 def step(carry, _):
-                    pos, tangent, kk = carry
+                    pos, tangent, kk, stopped = carry
                     patch = rotated_patch_batched(feature_map, pos[None],
                                                     tangent[None], cfg.patch_size)
                     kg_out = knot_gen.apply(params_knot, patch)
-                    # v16+ models emit (angle, step, stop); older (angle, step)
                     a_lg, s_lg = kg_out[0], kg_out[1]
                     ka = jax.random.fold_in(k, kk)
                     ks_ = jax.random.fold_in(k, kk + 100000)
@@ -90,11 +94,19 @@ def make_sampler(cfg: UNetARConfig, backbone, attach_head, knot_gen,
                     d_ang = cfg.angle_bin_centers[a_bin]
                     d_step = cfg.step_bin_centers[s_bin]
                     new_tan = tangent + d_ang
-                    new_pos = jnp.stack([pos[0] + d_step * jnp.sin(new_tan),
-                                          pos[1] + d_step * jnp.cos(new_tan)])
-                    return (new_pos, new_tan, kk + 1), new_pos
-                (_, _, _), positions = jax.lax.scan(
-                    step, (att, jnp.array(0.0), jnp.int32(0)), jnp.arange(cfg.n_knots))
+                    new_pos_live = jnp.stack([pos[0] + d_step * jnp.sin(new_tan),
+                                                pos[1] + d_step * jnp.cos(new_tan)])
+                    # If stopped: freeze position at current pos (duplicate).
+                    new_pos = jnp.where(stopped, pos, new_pos_live)
+                    new_tan_out = jnp.where(stopped, tangent, new_tan)
+                    # Update stopped flag if this model has a stop head.
+                    if cfg.has_stop_head and len(kg_out) >= 3:
+                        stop_prob = jax.nn.sigmoid(kg_out[2][0])
+                        stopped = jnp.logical_or(stopped, stop_prob > 0.5)
+                    return (new_pos, new_tan_out, kk + 1, stopped), new_pos
+                init = (att, jnp.array(0.0), jnp.int32(0), jnp.bool_(False))
+                (_, _, _, _), positions = jax.lax.scan(
+                    step, init, jnp.arange(cfg.n_knots))
                 return jnp.concatenate([att[None], positions], axis=0)
             return jax.vmap(per_attach)(atts, ks)
         return jax.vmap(per_view)(feature_maps, attaches, keys)
