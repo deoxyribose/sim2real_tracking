@@ -122,12 +122,13 @@ class DiverseSimConfig:
     # amp_min + (amp_max − amp_min) · u^bias  for u ~ Uniform(0,1).
     # bias=2 gives median amp near 0.19 instead of 0.36 (uniform) — matches
     # real videos where most flagella are quite faint.
-    # Real flagella residual has std ≈ 0.006 on /255-scaled images. Old
-    # sim range was 0.02-0.70 which gave sim std ≈ 0.020 — 3x too bright.
-    # Lower max to 0.15 and keep bias=2.5 so median stays around 0.04.
-    flag_amp_min: float = 0.01
-    flag_amp_max: float = 0.15
-    flag_amp_bias: float = 2.5
+    # Domain randomization: wide range spanning sim's original max AND real's
+    # much fainter typical value. Combined with bias=3.0 the median is ~0.03
+    # while max stays at 0.60. Model sees both regimes → robust to real's
+    # faint signal.
+    flag_amp_min: float = 0.005
+    flag_amp_max: float = 0.60
+    flag_amp_bias: float = 3.0
     flag_dark_prob: float = 0.55            # P(polarity == -1, i.e. darker than BG)
 
     # Beat mode mixture. Real labels show peak curvature at ~0.88 along the
@@ -273,10 +274,10 @@ class DiverseSimConfig:
     vignette_strength_max: float = 0.10
 
     # Additive gaussian noise σ (in the same [0,1] intensity units)
-    # Real per-pixel noise σ ≈ 0.003–0.008 on /255 units; old sim went to
-    # 0.04 which dominated the residual std. Reduce to match real.
+    # Wide range: real noise σ ≈ 0.003-0.008; sim's old max 0.04 also covers
+    # noisier real imaging conditions. Wide range = domain randomization.
     noise_sigma_min: float = 0.002
-    noise_sigma_max: float = 0.010
+    noise_sigma_max: float = 0.040
 
     # Post-median residual σ-scaling. When True, divide the median-subtracted
     # clip by its MAD (matching real's canonicalize_clip output range).
