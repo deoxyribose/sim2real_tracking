@@ -50,8 +50,17 @@ def track_one_scene(ckpt_path: str, out_mp4: str, out_png: str,
     clip_raw = np.asarray(out["clip_raw"]).astype(np.float32)     # (T, H, W)
     gt_curves = np.asarray(out["curves"])                         # (T, N, K, 2)
     alive = np.asarray(out["flagella"]["alive"])                  # (N,)
+    gt_widths = np.asarray(out["flagella"]["width"])              # (N,)
+    gt_amps = np.asarray(out["flagella"]["amp"])                  # (N,) signed
     n_alive = int(alive.sum())
-    print(f"scene: T={T_video} H={cfg.H}, {n_alive} alive flagella")
+    # Median amp/width per-rollout defaults (model doesn't predict them).
+    if n_alive > 0:
+        rollout_width = float(np.median(gt_widths[alive]))
+        rollout_amp = float(np.median(gt_amps[alive]))
+    else:
+        rollout_width, rollout_amp = 1.5, -0.15
+    print(f"scene: T={T_video} H={cfg.H}, {n_alive} alive flagella; "
+          f"rollout width={rollout_width:.2f} amp={rollout_amp:.2f}")
 
     # ---- Slide a T_win window, run model at each anchor ---------------------
     key = jax.random.key(0)
@@ -90,7 +99,7 @@ def track_one_scene(ckpt_path: str, out_mp4: str, out_png: str,
         for rl, sc in zip(rollouts, scores):
             all_hypos.append(Hypothesis(
                 frame=k, skeleton=rl.astype(np.float32),
-                width=1.5, amp=-1.0, score=float(sc)))
+                width=rollout_width, amp=rollout_amp, score=float(sc)))
     print(f"model: {len(all_hypos)} hypotheses across {len(anchor_frames)} frames"
           f" in {time.time()-t0:.1f}s")
 
@@ -115,15 +124,16 @@ def track_one_scene(ckpt_path: str, out_mp4: str, out_png: str,
     # Cost design for tracking: each pick pays birth+death unless amortized
     # by links → long chains preferred. score_bonus makes picks attractive;
     # birth/death makes short/isolated picks expensive.
-    # score_only cost with real per-rollout attachment scores (∈ [0, 1]).
-    # A pick with score s costs pick_cost_base − score_bonus · s.
-    # Score-90 rollouts are attractive (-85); score-10 rollouts nearly neutral.
+    # recon+score cost mode: cost = (residual_L1 after − before) − score·bonus
+    # Rewards hypotheses whose Gaussian tube (width, amp) actually darkens
+    # the residual where the flagellum is. Combined with per-rollout scores
+    # this makes distractor tubes-through-noise unprofitable.
     build_cfg = BuildConfig(
-        cost_mode="score_only",
+        cost_mode="recon+score",
         pick_cost_base=5.0,
         score_bonus=100.0,
         max_pair_overlap_frac=0.3,
-        birth_cost=80.0, death_cost=80.0,   # discourage short/isolated tracks
+        birth_cost=200.0, death_cost=200.0,
         link_max_gap=2, link_max_dist=18.0,
         link_cost_scale=0.15, link_gap_cost_factor=1.5,
     )

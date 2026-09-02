@@ -50,7 +50,8 @@ def random_distractor(H, W, K, rng):
 def run_one_annotation(ann: dict, T_video: int, n_noisy: int,
                          noise_sigma: float, drift_px: float,
                          n_distractors: int, model_H: int, model_W: int,
-                         build_cfg, solve_cfg, rng: np.random.Generator):
+                         build_cfg, solve_cfg, rng: np.random.Generator,
+                         flag_width: float = 1.5, flag_amp: float = -0.15):
     """Return dict with n_gt, n_tracks, n_real_tracks, purities."""
     canon, cfg_can = canonicalize_real_frame(ann["meta"], ann["src_width_px"],
                                                 T=T_video)
@@ -88,7 +89,7 @@ def run_one_annotation(ann: dict, T_video: int, n_noisy: int,
                 nc = noisy_copy_with_drift(g, t_norm, noise_sigma, drift_px, rng)
                 all_hypos.append(Hypothesis(
                     frame=t, skeleton=nc.astype(np.float32),
-                    width=1.5, amp=-1.0,
+                    width=flag_width, amp=flag_amp,
                     score=float(0.9 - rng.uniform(0, 0.1))))
                 hypo_gt_flag.append(True)
         for _ in range(n_distractors):
@@ -125,12 +126,19 @@ def main():
     ap.add_argument("--noise-sigma", type=float, default=1.5)
     ap.add_argument("--drift-px", type=float, default=2.0)
     ap.add_argument("--n-distractors-per-frame", type=int, default=20)
-    ap.add_argument("--birth-cost", type=float, default=150.0)
-    ap.add_argument("--death-cost", type=float, default=150.0)
+    ap.add_argument("--cost-mode", choices=["score_only", "recon+score"],
+                    default="recon+score")
+    ap.add_argument("--birth-cost", type=float, default=200.0)
+    ap.add_argument("--death-cost", type=float, default=200.0)
     ap.add_argument("--score-bonus", type=float, default=100.0)
     ap.add_argument("--pick-cost-base", type=float, default=5.0)
     ap.add_argument("--overlap-frac", type=float, default=0.3)
     ap.add_argument("--link-max-dist", type=float, default=18.0)
+    ap.add_argument("--link-max-gap", type=int, default=2)
+    ap.add_argument("--link-cost-scale", type=float, default=0.15)
+    ap.add_argument("--flag-width", type=float, default=1.5)
+    ap.add_argument("--flag-amp", type=float, default=-0.15,
+                    help="signed residual amp at flagellum; real is DARKER than BG → negative")
     ap.add_argument("--model-h", type=int, default=128,
                     help="target image size (matches AR model H)")
     args = ap.parse_args()
@@ -140,13 +148,13 @@ def main():
     print(f"n annotations: {len(annots)}")
 
     build_cfg = BuildConfig(
-        cost_mode="score_only",
+        cost_mode=args.cost_mode,
         pick_cost_base=args.pick_cost_base,
         score_bonus=args.score_bonus,
         max_pair_overlap_frac=args.overlap_frac,
         birth_cost=args.birth_cost, death_cost=args.death_cost,
-        link_max_gap=2, link_max_dist=args.link_max_dist,
-        link_cost_scale=0.15, link_gap_cost_factor=1.5,
+        link_max_gap=args.link_max_gap, link_max_dist=args.link_max_dist,
+        link_cost_scale=args.link_cost_scale, link_gap_cost_factor=1.5,
     )
     solve_cfg = SolveConfig(time_limit_s=15.0, num_workers=8)
 
@@ -158,7 +166,8 @@ def main():
                                      args.noise_sigma, args.drift_px,
                                      args.n_distractors_per_frame,
                                      args.model_h, args.model_h,
-                                     build_cfg, solve_cfg, rng)
+                                     build_cfg, solve_cfg, rng,
+                                     args.flag_width, args.flag_amp)
         except Exception as e:
             print(f"  [{ai:3d}] {ann['name']} — skipped ({e})")
             continue

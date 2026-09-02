@@ -44,10 +44,14 @@ def run_multi_seed(args):
         clip_raw = np.asarray(out["clip_raw"])
         gt_curves = np.asarray(out["curves"])
         alive = np.asarray(out["flagella"]["alive"])
+        gt_widths = np.asarray(out["flagella"]["width"])
+        gt_amps = np.asarray(out["flagella"]["amp"])
         n_alive = int(alive.sum())
         if n_alive == 0:
             rows.append(dict(seed=seed, n_alive=0, skip=True))
             continue
+        d_width = float(np.median(gt_widths[alive]))
+        d_amp = float(np.median(gt_amps[alive]))
         rng = np.random.default_rng(seed)
         all_hypos, hypo_gt_flag = [], []
         for t in range(args.T_video):
@@ -58,7 +62,7 @@ def run_multi_seed(args):
                     nc = noisy_copy(g, args.noise_sigma, rng)
                     all_hypos.append(Hypothesis(
                         frame=t, skeleton=nc.astype(np.float32),
-                        width=1.5, amp=-1.0,
+                        width=float(gt_widths[j]), amp=float(gt_amps[j]),
                         score=float(0.9 - rng.uniform(0, 0.1))))
                     hypo_gt_flag.append(True)
             for _ in range(args.n_distractors_per_frame):
@@ -66,20 +70,20 @@ def run_multi_seed(args):
                                         gt_curves.shape[2] - 1, rng)
                 all_hypos.append(Hypothesis(
                     frame=t, skeleton=d.astype(np.float32),
-                    width=1.5, amp=-1.0,
+                    width=d_width, amp=d_amp,
                     score=float(0.3 + rng.uniform(0, 0.3))))
                 hypo_gt_flag.append(False)
         residuals = np.zeros((args.T_video, cfg.H, cfg.W), dtype=np.float32)
         for t in range(args.T_video):
             residuals[t] = clip_raw[t] - np.median(clip_raw, axis=0)
         build_cfg = BuildConfig(
-            cost_mode="score_only",
+            cost_mode=args.cost_mode,
             pick_cost_base=args.pick_cost_base,
             score_bonus=args.score_bonus,
             max_pair_overlap_frac=args.overlap_frac,
             birth_cost=args.birth_cost, death_cost=args.death_cost,
-            link_max_gap=2, link_max_dist=args.link_max_dist,
-            link_cost_scale=0.15, link_gap_cost_factor=1.5,
+            link_max_gap=args.link_max_gap, link_max_dist=args.link_max_dist,
+            link_cost_scale=args.link_cost_scale, link_gap_cost_factor=1.5,
         )
         problem = build_problem(all_hypos, residuals, build_cfg)
         sol = solve_problem(problem, SolveConfig(time_limit_s=15.0, num_workers=8))
@@ -120,12 +124,16 @@ def main():
     ap.add_argument("--n-noisy-per-gt", type=int, default=6)
     ap.add_argument("--noise-sigma", type=float, default=1.5)
     ap.add_argument("--n-distractors-per-frame", type=int, default=20)
+    ap.add_argument("--cost-mode", choices=["score_only", "recon+score"],
+                    default="recon+score")
     ap.add_argument("--birth-cost", type=float, default=150.0)
     ap.add_argument("--death-cost", type=float, default=150.0)
     ap.add_argument("--score-bonus", type=float, default=100.0)
     ap.add_argument("--pick-cost-base", type=float, default=5.0)
     ap.add_argument("--overlap-frac", type=float, default=0.3)
-    ap.add_argument("--link-max-dist", type=float, default=18.0)
+    ap.add_argument("--link-max-dist", type=float, default=30.0)
+    ap.add_argument("--link-max-gap", type=int, default=3)
+    ap.add_argument("--link-cost-scale", type=float, default=0.03)
     ap.add_argument("--out-png", default=None)
     ap.add_argument("--out-mp4", default=None)
     args = ap.parse_args()
@@ -140,15 +148,22 @@ def main():
     clip_raw = np.asarray(out["clip_raw"])                       # (T, H, W)
     gt_curves = np.asarray(out["curves"])                        # (T, N, K, 2)
     alive = np.asarray(out["flagella"]["alive"])                 # (N,)
+    gt_widths = np.asarray(out["flagella"]["width"])             # (N,) per-slot width
+    gt_amps = np.asarray(out["flagella"]["amp"])                 # (N,) per-slot signed amp
     n_alive = int(alive.sum())
     print(f"scene: T={args.T_video}, {n_alive} alive flagella")
 
     # ---- Build candidate pool ---------------------------------------------
     # For each frame, per alive GT, produce n_noisy copies. Plus random.
+    # Amp/width for GT candidates come from sim's actual flagella params →
+    # recon+score cost mode can evaluate them fairly against the residual.
+    # Distractor amp/width use plausible defaults matched to sim medians.
     rng = np.random.default_rng(0)
+    d_width = float(np.median(gt_widths[alive])) if n_alive else 1.5
+    d_amp = float(np.median(gt_amps[alive])) if n_alive else -0.15
     all_hypos: list[Hypothesis] = []
     per_frame_rollouts: dict[int, list[np.ndarray]] = {}
-    per_frame_gt_flags: dict[int, list[bool]] = {}   # True if hypothesis came from GT+noise
+    per_frame_gt_flags: dict[int, list[bool]] = {}
     for t in range(args.T_video):
         per_frame_rollouts[t] = []
         per_frame_gt_flags[t] = []
@@ -159,19 +174,17 @@ def main():
                 nc = noisy_copy(g, args.noise_sigma, rng)
                 per_frame_rollouts[t].append(nc)
                 per_frame_gt_flags[t].append(True)
-                # Score high — this is a "confident" candidate
                 all_hypos.append(Hypothesis(
                     frame=t, skeleton=nc.astype(np.float32),
-                    width=1.5, amp=-1.0,
+                    width=float(gt_widths[j]), amp=float(gt_amps[j]),
                     score=float(0.9 - rng.uniform(0, 0.1))))
         for _ in range(args.n_distractors_per_frame):
             d = random_distractor(cfg.H, cfg.W, gt_curves.shape[2] - 1, rng)
             per_frame_rollouts[t].append(d)
             per_frame_gt_flags[t].append(False)
-            # Score low — distractors are less confident
             all_hypos.append(Hypothesis(
                 frame=t, skeleton=d.astype(np.float32),
-                width=1.5, amp=-1.0,
+                width=d_width, amp=d_amp,
                 score=float(0.3 + rng.uniform(0, 0.3))))
     print(f"pool: {len(all_hypos)} candidates "
           f"({n_alive * args.n_noisy_per_gt} GT-derived + "
@@ -183,13 +196,13 @@ def main():
         residuals[t] = clip_raw[t] - np.median(clip_raw, axis=0)
 
     build_cfg = BuildConfig(
-        cost_mode="score_only",
+        cost_mode=args.cost_mode,
         pick_cost_base=args.pick_cost_base,
         score_bonus=args.score_bonus,
         max_pair_overlap_frac=args.overlap_frac,
         birth_cost=args.birth_cost, death_cost=args.death_cost,
-        link_max_gap=2, link_max_dist=args.link_max_dist,
-        link_cost_scale=0.15, link_gap_cost_factor=1.5,
+        link_max_gap=args.link_max_gap, link_max_dist=args.link_max_dist,
+        link_cost_scale=args.link_cost_scale, link_gap_cost_factor=1.5,
     )
     solve_cfg = SolveConfig(time_limit_s=30.0, num_workers=8)
 
