@@ -76,7 +76,9 @@ def make_sampler(cfg: UNetARConfig, backbone, attach_head, knot_gen,
                     pos, tangent, kk = carry
                     patch = rotated_patch_batched(feature_map, pos[None],
                                                     tangent[None], cfg.patch_size)
-                    a_lg, s_lg = knot_gen.apply(params_knot, patch)
+                    kg_out = knot_gen.apply(params_knot, patch)
+                    # v16+ models emit (angle, step, stop); older (angle, step)
+                    a_lg, s_lg = kg_out[0], kg_out[1]
                     ka = jax.random.fold_in(k, kk)
                     ks_ = jax.random.fold_in(k, kk + 100000)
                     if temperature == 0.0:

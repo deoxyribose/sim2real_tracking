@@ -31,11 +31,44 @@ from sim2real.scripts.eval_ar import load_ckpt
 from sim2real.sim.flagella_diverse import DiverseSimConfig, sample_clip
 
 
+def make_angle_noisy_candidates(gt_curve: np.ndarray, n_samples: int,
+                                 angle_sigma: float, step_sigma: float,
+                                 rng: np.random.Generator) -> list[np.ndarray]:
+    """Generate rollout-style noisy versions of a GT curve.
+
+    Instead of iid Gaussian on knot positions, perturb the per-step tangent
+    angle and step length — matches how an AR model would sample small
+    variations. Errors compound across knots as in a real rollout."""
+    diffs = np.diff(gt_curve, axis=0)                          # (K, 2)
+    step_lens = np.linalg.norm(diffs, axis=1)                  # (K,)
+    tangents = np.arctan2(diffs[:, 0], diffs[:, 1])            # (K,) atan2(dy, dx)
+    K = tangents.shape[0]
+    d_ang = np.concatenate([[tangents[0]], np.diff(tangents)])
+    out = []
+    for _ in range(n_samples):
+        n_ang = rng.normal(0, angle_sigma, K)
+        n_step = rng.normal(0, step_sigma, K)
+        d_ang_p = d_ang + n_ang
+        step_p = np.clip(step_lens + n_step, 0.3, None)
+        tan_p = np.cumsum(d_ang_p)
+        curve = [gt_curve[0].copy()]
+        pos = gt_curve[0].copy()
+        for k in range(K):
+            pos = pos + step_p[k] * np.array([np.sin(tan_p[k]),
+                                                np.cos(tan_p[k])])
+            curve.append(pos.copy())
+        out.append(np.array(curve, dtype=np.float32))
+    return out
+
+
 def track_one_scene(ckpt_path: str, out_mp4: str, out_png: str,
                       T_video: int = 16, sim_seed: int = 2026,
                       n_draws: int = 2, n_attach: int = 8, n_rollouts: int = 4,
                       tta_angles=(0.0, -8.0, 8.0), score_thresh: float = 0.02,
-                      pool_cap: int = 30):
+                      pool_cap: int = 30,
+                      candidate_source: str = "model",
+                      gt_noise_n: int = 24, gt_noise_angle_sigma: float = 0.05,
+                      gt_noise_step_sigma: float = 0.3):
     params, cfg = load_ckpt(ckpt_path)
     backbone = UNetARBackbone(cfg=cfg)
     attach_head = AttachmentHead(cfg=cfg)
@@ -68,38 +101,56 @@ def track_one_scene(ckpt_path: str, out_mp4: str, out_png: str,
     all_hypos: list[Hypothesis] = []
     per_frame_rollouts: dict[int, list[np.ndarray]] = {}
     per_frame_scores: dict[int, list[float]] = {}
+    rng = np.random.default_rng(0)
     t0 = time.time()
-    for k in anchor_frames:
-        # Window [k - T_win//2, k + T_win - T_win//2)
-        i0 = k - T_win // 2; i1 = i0 + T_win
-        win_raw = clip_raw[i0:i1]
-        # Median subtract (matches training preprocessing)
-        med = np.median(win_raw, axis=0)
-        win_median = win_raw - med
-        # Static context = the median itself
-        smed = med.astype(np.float32)
+    if candidate_source == "noisy-gt":
+        # Skip the model entirely; build candidates from GT + rollout-style noise
+        for k in anchor_frames:
+            per_frame_rollouts[k] = []
+            per_frame_scores[k] = []
+            for j in range(gt_curves.shape[1]):
+                if not bool(alive[j]): continue
+                g = gt_curves[k, j]
+                cands = make_angle_noisy_candidates(g, gt_noise_n,
+                                                     gt_noise_angle_sigma,
+                                                     gt_noise_step_sigma, rng)
+                for c in cands:
+                    per_frame_rollouts[k].append(c)
+                    per_frame_scores[k].append(0.9)
+                    all_hypos.append(Hypothesis(
+                        frame=k, skeleton=c.astype(np.float32),
+                        width=float(gt_widths[j]), amp=float(gt_amps[j]),
+                        score=0.9))
+        print(f"noisy-GT: {len(all_hypos)} candidates across "
+              f"{len(anchor_frames)} frames ({gt_noise_n} per GT per frame)")
+    else:
+        for k in anchor_frames:
+            # Window [k - T_win//2, k + T_win - T_win//2)
+            i0 = k - T_win // 2; i1 = i0 + T_win
+            win_raw = clip_raw[i0:i1]
+            med = np.median(win_raw, axis=0)
+            win_median = win_raw - med
+            smed = med.astype(np.float32)
 
-        # Run model — sample pool via TTA, get per-rollout attachment scores
-        rollouts, scores, key = sample_pool_one_clip(
-            params, backbone, attach_head, knot_gen, cfg,
-            win_median.astype(np.float32), smed,
-            list(tta_angles), flips=(False, True),
-            n_draws=n_draws, n_attach=n_attach, n_rollouts=n_rollouts,
-            score_thresh=score_thresh, key=key, _sampler=sampler,
-            return_scores=True)
+            rollouts, scores, key = sample_pool_one_clip(
+                params, backbone, attach_head, knot_gen, cfg,
+                win_median.astype(np.float32), smed,
+                list(tta_angles), flips=(False, True),
+                n_draws=n_draws, n_attach=n_attach, n_rollouts=n_rollouts,
+                score_thresh=score_thresh, key=key, _sampler=sampler,
+                return_scores=True)
 
-        # Cap: keep the top-scored candidates (higher signal-to-noise for the ILP)
-        if len(rollouts) > pool_cap:
-            order = np.argsort(-np.asarray(scores))[:pool_cap]
-            rollouts = [rollouts[i] for i in order]
-            scores   = [scores[i] for i in order]
+            if len(rollouts) > pool_cap:
+                order = np.argsort(-np.asarray(scores))[:pool_cap]
+                rollouts = [rollouts[i] for i in order]
+                scores   = [scores[i] for i in order]
 
-        per_frame_rollouts[k] = rollouts
-        per_frame_scores[k] = scores
-        for rl, sc in zip(rollouts, scores):
-            all_hypos.append(Hypothesis(
-                frame=k, skeleton=rl.astype(np.float32),
-                width=rollout_width, amp=rollout_amp, score=float(sc)))
+            per_frame_rollouts[k] = rollouts
+            per_frame_scores[k] = scores
+            for rl, sc in zip(rollouts, scores):
+                all_hypos.append(Hypothesis(
+                    frame=k, skeleton=rl.astype(np.float32),
+                    width=rollout_width, amp=rollout_amp, score=float(sc)))
     print(f"model: {len(all_hypos)} hypotheses across {len(anchor_frames)} frames"
           f" in {time.time()-t0:.1f}s")
 
@@ -250,11 +301,21 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--T-video", type=int, default=16)
     ap.add_argument("--sim-seed", type=int, default=2026)
+    ap.add_argument("--candidate-source", choices=["model", "noisy-gt"],
+                    default="model",
+                    help="'noisy-gt' bypasses the model and uses rollout-style noisy GT")
+    ap.add_argument("--gt-noise-n", type=int, default=24)
+    ap.add_argument("--gt-noise-angle-sigma", type=float, default=0.05)
+    ap.add_argument("--gt-noise-step-sigma", type=float, default=0.3)
     ap.add_argument("--out-mp4", required=True)
     ap.add_argument("--out-png", required=True)
     args = ap.parse_args()
     track_one_scene(args.ckpt, args.out_mp4, args.out_png,
-                      T_video=args.T_video, sim_seed=args.sim_seed)
+                      T_video=args.T_video, sim_seed=args.sim_seed,
+                      candidate_source=args.candidate_source,
+                      gt_noise_n=args.gt_noise_n,
+                      gt_noise_angle_sigma=args.gt_noise_angle_sigma,
+                      gt_noise_step_sigma=args.gt_noise_step_sigma)
 
 
 if __name__ == "__main__":
