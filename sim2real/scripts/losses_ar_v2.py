@@ -37,11 +37,13 @@ def make_loss_fn(score_mode: str = "wide-gauss",
                    score_sigma_px: float = 12.0,
                    mask_radius_px: float = 16.0,
                    focal_gamma: float = 2.0,
-                   knot_label_smoothing: float = 0.0):
+                   knot_label_smoothing: float = 0.0,
+                   scheduled_sampling: bool = False):
 
     def loss_fn(params, batch, key, backbone, attach_head, knot_gen,
                 cfg: UNetARConfig, coord_weight: float = 5.0,
-                score_weight: float = 5.0, knot_weight: float = 1.0):
+                score_weight: float = 5.0, knot_weight: float = 1.0,
+                p_teacher_force: float = 1.0):
         video, static_med, gt_skels, gt_valid = batch
         B = video.shape[0]
 
@@ -123,35 +125,72 @@ def make_loss_fn(score_mode: str = "wide-gauss",
             pred_pos, f["score"], gt_skels, gt_valid)
         coord_l = coord_l.mean(); score_l = score_l.mean()
 
-        # ---- Knot loss: identical to v8 ------------------------------------
-        def per_ex_knot(fmap, gt_skel_batch, valid):
-            def per_gt(skel, is_valid):
+        # ---- Knot loss: teacher-forced + optional scheduled sampling ------
+        def smoothed_ce_row(logits, target_bin, n_bins):
+            logp = jax.nn.log_softmax(logits, -1)
+            hard = -logp[target_bin]
+            if knot_label_smoothing > 0.0:
+                uni = -logp.mean()
+                return (1 - knot_label_smoothing) * hard \
+                     + knot_label_smoothing * uni
+            return hard
+
+        def per_ex_knot(fmap, gt_skel_batch, valid, ex_key):
+            def per_gt(skel, is_valid, gkey):
                 att, tangents, d_ang_bin, d_step_bin = encode_gt_polar_steps(skel, cfg)
                 K = tangents.shape[0]
-                centers = skel[:K]
-                prev_tangents = jnp.concatenate([jnp.zeros(1), tangents[:-1]])
-                patches = rotated_patch_batched(
-                    fmap, centers, prev_tangents, cfg.patch_size)
-                angle_logits, step_logits = knot_gen.apply(
-                    params["knot"], patches)
-                # optional label smoothing: mix uniform with one-hot
-                def smoothed_ce(logits, target_bin, n_bins):
-                    logp = jax.nn.log_softmax(logits, -1)
-                    hard = -jnp.take_along_axis(logp, target_bin[:, None],
-                                                  axis=-1)[:, 0]
-                    if knot_label_smoothing > 0.0:
-                        uni = -logp.mean(-1)                    # avg of log-probs
-                        return (1 - knot_label_smoothing) * hard \
-                             + knot_label_smoothing * uni
-                    return hard
-                angle_loss = smoothed_ce(angle_logits, d_ang_bin, cfg.n_angle_bins)
-                step_loss  = smoothed_ce(step_logits,  d_step_bin, cfg.n_step_bins)
-                return (angle_loss.mean() + step_loss.mean()) * is_valid.astype(jnp.float32)
-            losses = jax.vmap(per_gt)(gt_skel_batch, valid)
+                gt_centers = skel[:K]                            # (K, 2)
+                gt_prev_tan = jnp.concatenate([jnp.zeros(1), tangents[:-1]])  # (K,)
+
+                if not scheduled_sampling:
+                    # Pure teacher-forcing — batched (fast) path
+                    patches = rotated_patch_batched(
+                        fmap, gt_centers, gt_prev_tan, cfg.patch_size)
+                    angle_logits, step_logits = knot_gen.apply(
+                        params["knot"], patches)
+                    a_loss = jax.vmap(smoothed_ce_row, in_axes=(0, 0, None))(
+                        angle_logits, d_ang_bin, cfg.n_angle_bins)
+                    s_loss = jax.vmap(smoothed_ce_row, in_axes=(0, 0, None))(
+                        step_logits, d_step_bin, cfg.n_step_bins)
+                else:
+                    # Scheduled sampling — per-knot coin flip; must scan
+                    def step_fn(carry, k):
+                        pos, tangent, kk = carry
+                        # per-knot coin: 1 = teacher-force (use GT), 0 = self-context
+                        k1, k2, k3 = jax.random.split(
+                            jax.random.fold_in(gkey, kk), 3)
+                        coin = jax.random.uniform(k1) < p_teacher_force
+                        # First knot is always teacher-forced (it's the attachment)
+                        force_gt = jnp.logical_or(coin, kk == 0)
+                        center = jnp.where(force_gt, gt_centers[k], pos)
+                        prev_t = jnp.where(force_gt, gt_prev_tan[k], tangent)
+                        patch = rotated_patch_batched(
+                            fmap, center[None], prev_t[None], cfg.patch_size)
+                        a_lg, s_lg = knot_gen.apply(params["knot"], patch)
+                        # Loss: always vs GT bin at step k
+                        al = smoothed_ce_row(a_lg[0], d_ang_bin[k], cfg.n_angle_bins)
+                        sl = smoothed_ce_row(s_lg[0], d_step_bin[k], cfg.n_step_bins)
+                        # Sample from model's categorical to propagate self-state
+                        a_bin_s = jax.random.categorical(k2, a_lg[0])
+                        s_bin_s = jax.random.categorical(k3, s_lg[0])
+                        d_ang_s = cfg.angle_bin_centers[a_bin_s]
+                        d_step_s = cfg.step_bin_centers[s_bin_s]
+                        new_tan = prev_t + d_ang_s
+                        new_pos = jnp.stack([center[0] + d_step_s * jnp.sin(new_tan),
+                                              center[1] + d_step_s * jnp.cos(new_tan)])
+                        return (new_pos, new_tan, kk + 1), (al, sl)
+                    (_, _, _), (a_loss, s_loss) = jax.lax.scan(
+                        step_fn, (skel[0], jnp.array(0.0), jnp.int32(0)),
+                        jnp.arange(K))
+
+                return (a_loss.mean() + s_loss.mean()) * is_valid.astype(jnp.float32)
+            gt_keys = jax.random.split(ex_key, gt_skel_batch.shape[0])
+            losses = jax.vmap(per_gt)(gt_skel_batch, valid, gt_keys)
             n_gt = jnp.maximum(valid.sum().astype(jnp.float32), 1)
             return losses.sum() / n_gt
 
-        knot_l = jax.vmap(per_ex_knot)(full_res, gt_skels, gt_valid).mean()
+        ex_keys = jax.random.split(key_r, video.shape[0])
+        knot_l = jax.vmap(per_ex_knot)(full_res, gt_skels, gt_valid, ex_keys).mean()
 
         total = (coord_weight * coord_l + score_weight * score_l
                   + knot_weight * knot_l)

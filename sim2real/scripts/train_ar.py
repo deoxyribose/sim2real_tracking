@@ -205,6 +205,8 @@ def main():
     ap.add_argument("--base-channels", type=int, default=48)
     ap.add_argument("--patch-size", type=int, default=24)
     ap.add_argument("--step-max", type=float, default=8.0)
+    ap.add_argument("--n-step-bins", type=int, default=12,
+                    help="v8 used 8, v9+ default 12")
     ap.add_argument("--no-augs", action="store_true")
     ap.add_argument("--no-sigma-scale", action="store_true",
                     help="disable the residual σ-scale in the sim")
@@ -215,6 +217,11 @@ def main():
                     default="min-over-all",
                     help="per-cell-in-radius = fix from AB overfit")
     ap.add_argument("--mask-radius-px", type=float, default=16.0)
+    ap.add_argument("--knot-label-smoothing", type=float, default=0.0)
+    ap.add_argument("--ss-p-end", type=float, default=1.0,
+                    help="scheduled sampling: p_teacher_force at end of --ss-decay-steps. 1.0=off.")
+    ap.add_argument("--ss-decay-steps", type=int, default=20000,
+                    help="steps to linearly decay p_tf from 1.0 to ss-p-end.")
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
 
@@ -223,7 +230,8 @@ def main():
     cfg = UNetARConfig(T=args.T, H=args.H, W=args.H,
                         base_channels=args.base_channels,
                         patch_size=args.patch_size,
-                        step_max=args.step_max)
+                        step_max=args.step_max,
+                        n_step_bins=args.n_step_bins)
     sim_cfg = DiverseSimConfig(T=args.T, H=args.H, W=args.H,
                                 sigma_scale_residual=not args.no_sigma_scale)
     print(f"cfg: H={cfg.H} T={cfg.T} grid={cfg.grid_h}×{cfg.grid_w} "
@@ -260,25 +268,40 @@ def main():
     opt_state = optimizer.init(params)
     state = TrainState(params=params, opt_state=opt_state, step=jnp.array(0))
 
-    loss_partial = partial(loss_fn, backbone=backbone, attach_head=attach_head,
+    use_ss = args.ss_p_end < 1.0
+    lfn = make_loss_fn(score_mode=args.score_mode, coord_mode=args.coord_mode,
+                          mask_radius_px=args.mask_radius_px,
+                          knot_label_smoothing=args.knot_label_smoothing,
+                          scheduled_sampling=use_ss)
+    print(f"loss: score_mode={args.score_mode}  coord_mode={args.coord_mode}  "
+          f"mask_R={args.mask_radius_px}  knot_LS={args.knot_label_smoothing}  "
+          f"scheduled_sampling={use_ss} (p_end={args.ss_p_end}, decay={args.ss_decay_steps})")
+    loss_partial = partial(lfn, backbone=backbone, attach_head=attach_head,
                             knot_gen=knot_gen, cfg=cfg,
                             coord_weight=args.coord_weight,
                             score_weight=args.score_weight,
                             knot_weight=args.knot_weight)
 
-    @partial(jax.jit, donate_argnums=(0,))
-    def train_step(state, batch, key):
+    @partial(jax.jit, donate_argnums=(0,), static_argnames=())
+    def train_step(state, batch, key, p_tf):
         (loss, stats), grads = jax.value_and_grad(loss_partial, has_aux=True)(
-            state.params, batch, key)
+            state.params, batch, key, p_teacher_force=p_tf)
         updates, opt_state = optimizer.update(grads, state.opt_state, state.params)
         params = optax.apply_updates(state.params, updates)
         return TrainState(params=params, opt_state=opt_state, step=state.step + 1), stats
+
+    def p_tf_schedule(step: int) -> float:
+        # linear: 1.0 → ss_p_end over ss_decay_steps, then constant
+        if args.ss_p_end >= 1.0:
+            return 1.0
+        frac = min(1.0, step / max(1, args.ss_decay_steps))
+        return 1.0 - frac * (1.0 - args.ss_p_end)
 
     print("compiling...", flush=True)
     key, kb, ks = jax.random.split(key, 3)
     batch = sample_batch(kb, sim_cfg, args.batch_size,
                           apply_augs=not args.no_augs)
-    state, stats = train_step(state, batch, ks)
+    state, stats = train_step(state, batch, ks, p_tf_schedule(0))
     print("first-step stats:", {k: float(v) for k, v in jax.device_get(stats).items()})
 
     t0 = time.time()
@@ -286,11 +309,12 @@ def main():
         key, kb, ks = jax.random.split(key, 3)
         batch = sample_batch(kb, sim_cfg, args.batch_size,
                           apply_augs=not args.no_augs)
-        state, stats = train_step(state, batch, ks)
+        p_tf = p_tf_schedule(step)
+        state, stats = train_step(state, batch, ks, p_tf)
         if step % args.log_every == 0:
             stats = jax.device_get(stats)
             dt = time.time() - t0
-            print(f"[step {step:6d}]  t={dt:.1f}s  "
+            print(f"[step {step:6d}]  t={dt:.1f}s  p_tf={p_tf:.2f}  "
                   f"loss={float(stats['loss_total']):.3f}  "
                   f"coord={float(stats['loss_coord']):.2f}  "
                   f"score={float(stats['loss_score']):.3f}  "

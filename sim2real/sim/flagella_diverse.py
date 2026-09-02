@@ -95,7 +95,15 @@ class DiverseSimConfig:
     # Flagellum geometry. Real labels @ 512-canvas: width p50=10, length p50=86.
     # Scaled to our 200-canvas: width ~4 px, length ~34 px.
     flag_length_min: float = 20.0
-    flag_length_max: float = 80.0
+    flag_length_max: float = 60.0
+    # A flagellum whose curve leaves [margin, H-margin]×[margin, W-margin]
+    # at any time step is marked alive=False (real closeups always show the
+    # full flagellum extent). 0 = no margin, disabled if margin < 0.
+    flag_frame_margin_px: float = 2.0
+    # Beta(a, a) shape for cell placement inside the safe box. a=1 uniform,
+    # a>1 biases toward frame center. a=1.7 gives mode=0.5, std≈0.24 → most
+    # cells near the middle so flagella don't clip the frame.
+    cell_center_bias: float = 1.7
     # SDF sigma; visible width ≈ 2×σ. Target ~2-4 px visible → σ ∈ [0.8, 2.0].
     flag_width_min: float = 0.8
     flag_width_max: float = 2.0
@@ -166,7 +174,7 @@ class DiverseSimConfig:
     # zoomed-in (big cell fills frame) to zoomed-out. Was 0.4-1.6 → the low
     # end made cells 3-4 px radius, indistinguishable from noise/flagella.
     scene_scale_min: float = 0.65
-    scene_scale_max: float = 1.7
+    scene_scale_max: float = 1.2
 
     # Pipette: HOLLOW + CONICAL primitive. Wider at the base (frame edge),
     # narrower at the tip (cell). Real labels @ 512-canvas:
@@ -301,13 +309,19 @@ def sample_cells(key: jax.Array, cfg: DiverseSimConfig, scene_scale: Array):
 
     radii = jax.random.uniform(k_r, (N,), minval=cfg.cell_radius_min, maxval=cfg.cell_radius_max)
     radii = radii * scene_scale
-    # Initial positions uniformly inside safe box
+    # Initial positions inside safe box, biased toward the frame center. Real
+    # closeup crops are centred on the cell → flagella have room to extend in
+    # any direction without clipping the frame. Beta(1.7,1.7) is a mild bump
+    # toward 0.5 (mode=0.5, std ≈ 0.24). Uniform (bias=1) recovers the old
+    # behaviour.
     lo = radii + cfg.cell_margin
     hi_y = cfg.H - radii - cfg.cell_margin
     hi_x = cfg.W - radii - cfg.cell_margin
-    u = jax.random.uniform(k_pos, (N, 2))
-    centers = jnp.stack([lo + u[:, 0] * (hi_y - lo),
-                         lo + u[:, 1] * (hi_x - lo)], axis=1)
+    k_pos_a, k_pos_b = jax.random.split(k_pos)
+    ub = jax.random.beta(k_pos_a, cfg.cell_center_bias, cfg.cell_center_bias,
+                          shape=(N, 2))
+    centers = jnp.stack([lo + ub[:, 0] * (hi_y - lo),
+                         lo + ub[:, 1] * (hi_x - lo)], axis=1)
     amps_mag = jax.random.uniform(k_amp, (N,), minval=cfg.cell_amp_min, maxval=cfg.cell_amp_max)
 
     # Jacobi soft-repulsion: penalize pairwise overlap only.
@@ -488,15 +502,12 @@ def sample_pipette(key: jax.Array, cfg: DiverseSimConfig, cells: dict,
                 hollow_frac=hollow_frac, drift=drift, target_cell=tgt)
 
 
-def render_pipette(pip: dict, cfg: DiverseSimConfig, t_norm: Array) -> Array:
-    """Render one HOLLOW CONICAL pipette. Outer soft mask with axial width
-    linearly interpolated (base → tip), minus an inner soft mask (hollow), plus
-    an interior tint (signed) modulated by the inner mask."""
+def _pipette_geom(pip: dict, cfg: DiverseSimConfig, t_norm: Array):
+    """Shared geometry: axial projection + per-pixel outer radius."""
     yy, xx = jnp.mgrid[:cfg.H, :cfg.W].astype(jnp.float32)
     off = pip["drift"] * (t_norm - 0.5)
-    p0 = pip["base"] + off       # wider end (frame edge)
-    p1 = pip["tip"] + off        # narrower end (touches cell)
-
+    p0 = pip["base"] + off
+    p1 = pip["tip"] + off
     axis = p1 - p0
     axis_len2 = jnp.sum(axis ** 2) + 1e-6
     d_y = yy - p0[0]; d_x = xx - p0[1]
@@ -504,14 +515,28 @@ def render_pipette(pip: dict, cfg: DiverseSimConfig, t_norm: Array) -> Array:
     proj_y = p0[0] + t * axis[0]
     proj_x = p0[1] + t * axis[1]
     perp_d = jnp.sqrt((yy - proj_y) ** 2 + (xx - proj_x) ** 2)
-
-    # Width along the axis: linearly interpolate base → tip
     outer_r = (pip["base_width"] + t * (pip["tip_width"] - pip["base_width"])) * 0.5
     inner_r = outer_r * pip["hollow_frac"]
+    return perp_d, outer_r, inner_r
+
+
+def pipette_outer_mask(pip: dict, cfg: DiverseSimConfig, t_norm: Array) -> Array:
+    """Soft mask covering the FULL body of the pipette (walls + hollow interior).
+    Used to occlude flagella that would otherwise be rendered on top of the
+    pipette — real pipettes occlude everything behind them."""
+    perp_d, outer_r, _ = _pipette_geom(pip, cfg, t_norm)
+    outer = _sigmoid_step(perp_d, outer_r, cfg.pipette_edge_sigma)
+    return outer * pip["present"].astype(jnp.float32)
+
+
+def render_pipette(pip: dict, cfg: DiverseSimConfig, t_norm: Array) -> Array:
+    """Render one HOLLOW CONICAL pipette. Outer soft mask with axial width
+    linearly interpolated (base → tip), minus an inner soft mask (hollow), plus
+    an interior tint (signed) modulated by the inner mask."""
+    perp_d, outer_r, inner_r = _pipette_geom(pip, cfg, t_norm)
     outer = _sigmoid_step(perp_d, outer_r, cfg.pipette_edge_sigma)
     inner = _sigmoid_step(perp_d, inner_r, cfg.pipette_edge_sigma)
     walls = jnp.maximum(outer - inner, 0.0)
-    # Contribution: dark walls (−amp) + interior tint (signed) on the inner mask.
     signal = -pip["amp"] * walls + (-pip["interior_amp"]) * inner
     return signal * pip["present"].astype(jnp.float32)
 
@@ -1011,11 +1036,24 @@ def sample_clip(key: jax.Array, cfg: DiverseSimConfig) -> dict:
 
     curves = jax.vmap(curves_at_t)(t_axis)                                    # (T, N, K, 2)
 
+    # Kill any flagellum whose middle-frame curve leaves the frame. Real
+    # closeup crops always show the full flagellum; keeping OOF flagella
+    # trains the model to hallucinate cut-off tips. Middle-frame is what we
+    # supervise; brief edge-touching during the beat elsewhere is fine.
+    mid = curves[cfg.T // 2]           # (N, K, 2)
+    ys, xs = mid[..., 0], mid[..., 1]
+    margin = cfg.flag_frame_margin_px
+    in_frame = ((ys >= margin) & (ys < cfg.H - margin)
+                & (xs >= margin) & (xs < cfg.W - margin))     # (N, K)
+    all_in = in_frame.all(axis=-1)                              # (N,)
+    flag_alive_masked = flag["alive"] & all_in
+
     def render_t(curves_t):
         def one(curve, w, a, al):
             return render_flagellum_frame(curve, w, a, al, cfg)
         # (N, H, W); sum over slots
-        return jax.vmap(one)(curves_t, flag["width"], flag["amp"], flag["alive"]).sum(0)
+        return jax.vmap(one)(curves_t, flag["width"], flag["amp"],
+                              flag_alive_masked).sum(0)
 
     flag_layer_t = jax.vmap(render_t)(curves)                                 # (T, H, W)
 
@@ -1028,6 +1066,10 @@ def sample_clip(key: jax.Array, cfg: DiverseSimConfig) -> dict:
     cell_interior_t = jax.vmap(lambda tn: cells_interior_mask(cells, cfg, tn))(t_axis)
     flag_layer_t = flag_layer_t * (1.0 - cell_interior_t)
     pip_layer_t = pip_layer_t * (1.0 - cell_interior_t)
+
+    # Pipettes also occlude flagella (real pipettes are opaque).
+    pip_mask_t = jax.vmap(lambda tn: pipette_outer_mask(pip, cfg, tn))(t_axis)
+    flag_layer_t = flag_layer_t * (1.0 - pip_mask_t)
 
     # ---- Compose: BG level + slow texture + BG blobs + cell + pipette + flag
     # Cells + flagella + pipette are signed additive contributions; scale
@@ -1081,12 +1123,16 @@ def sample_clip(key: jax.Array, cfg: DiverseSimConfig) -> dict:
         clip_median = jnp.clip(clip_median / mad, -cfg.residual_clip_sigma,
                                 cfg.residual_clip_sigma)
 
+    # Overwrite flag["alive"] with the OOF-masked version so downstream
+    # trainers, viz, and eval see only fully-in-frame flagella.
+    flag_out = dict(flag)
+    flag_out["alive"] = flag_alive_masked
     return dict(
         clip_raw=clip,
         clip_median=clip_median,
         temporal_median=med,           # (H, W) — the static context (Option A input)
         cells=cells,
-        flagella=flag,
+        flagella=flag_out,
         pipette=pip,
         curves=curves,
         bg_level=bg_level,

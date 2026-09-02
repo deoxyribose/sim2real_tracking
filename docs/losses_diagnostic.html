@@ -205,7 +205,56 @@ the model's own prediction. This is the "exposure bias" problem of AR
 sequence models: at inference the model diverges from GT after a few knots,
 and none of the training loss sees this compounding error.</p>
 
-<h2>4. The <code>loss → recall</code> gap</h2>
+<h2>4. What "recall" actually means <span class="flag">← Chamfer inflates our numbers</span></h2>
+<p>Recall is not "any predicted point close to GT" — it's <b>symmetric
+Chamfer</b>, averaged in both directions:</p>
+<pre>Chamfer(pred, gt) = 0.5 * ( mean_over_pred_pts( min_dist_to_any_gt_pt )
+                          + mean_over_gt_pts  ( min_dist_to_any_pred_pt ) )</pre>
+<p>A rollout is close to a GT only when <i>both</i>:</p>
+<ul>
+  <li>Every predicted knot is on average near some GT point
+      (pred→gt term — penalizes <b>over-extension past GT end</b>)</li>
+  <li>Every GT point is on average near some predicted knot
+      (gt→pred term — penalizes <b>under-coverage</b>)</li>
+</ul>
+<p>Recall per clip:</p>
+<ol>
+  <li>Sample all rollouts (currently 1792 with wide-TTA).</li>
+  <li>For each GT flagellum: compute Chamfer to every rollout, take the
+      <b>min</b>.</li>
+  <li>GT is "covered" if min-Chamfer ≤ 6 px (on 128 canvas ≈ 12 px on 256).</li>
+  <li>Recall = covered / total across all clips.</li>
+</ol>
+<p>Reference: <code>sim2real/eval_v2/coverage.py::_chamfer_polylines</code>.</p>
+
+<h3>Chamfer inflates: measured on v8 60k, 384 rollouts</h3>
+<table>
+<tr><th>threshold (px)</th><th>Chamfer</th><th>ordered_L2</th><th>Hausdorff</th></tr>
+<tr><td>4</td><td>0.856</td><td>0.221</td><td>0.058</td></tr>
+<tr><td>6 (default)</td><td><b>0.990</b></td><td class="flag"><b>0.673</b></td><td>0.240</td></tr>
+<tr><td>8</td><td>1.000</td><td>0.875</td><td>0.519</td></tr>
+<tr><td>12</td><td>1.000</td><td>1.000</td><td>0.856</td></tr>
+</table>
+<p>Under the strict <b>ordered-knot L2</b> (resample both to K=25 knots,
+match knot-i to knot-i, min over reverse) — the champion's actual recall
+is <b>0.673</b>, not 0.99. The Chamfer number was inflated by the very
+snaking / partial-match failure mode we suspected. Ordered_L2 forces a
+knot-to-knot correspondence so a rollout that overlaps GT in the middle
+but misaligns at endpoints gets full penalty.</p>
+<p>Under symmetric Hausdorff (max of directed max-of-mins) the strictest
+number: 0.24 @ 6 px. Only ~24% of GTs have a rollout where <i>every</i>
+predicted point is within 6 px of some GT point AND vice versa.</p>
+<p>Chamfer's percentiles: p50=2.5, p99=5.8. ordered_L2: p50=5.1, p99=10.7.
+Real alignment error is ~2× the Chamfer number. Reference:
+<code>sim2real/eval_v2/ordered_metric.py</code>.</p>
+<p><b>Length-mismatch penalty.</b> The model always emits exactly 25 knots
+of step-length 0.75–4.25 px, so all rollouts are 18–102 px long. But
+30% of real GT flagella are shorter than 18 px. A too-long rollout that
+mostly traces a short GT still incurs a large pred→gt term because the
+extra knots hang out in empty space. That's the mechanism by which the
+metric penalizes our no-STOP-token model on short flagella.</p>
+
+<h2>5. The <code>loss → recall</code> gap</h2>
 <p>Even if all 3 losses fit perfectly, the sampled rollout might still miss
 GT because:</p>
 <ol>
@@ -216,6 +265,21 @@ GT because:</p>
       early error compounds over 24 knots. Same exposure-bias problem as
       MLE-trained language models.</li>
 </ol>
+
+<h2>6. Overfit-to-1.0 with label smoothing</h2>
+<p>Adding <b>knot_label_smoothing = 0.1</b> to the AB recipe closes the
+overfit gap: recall reaches <b>1.000</b> at step 500 and hits 1.0 six
+more times across 10k steps (interleaved with 0.87–0.93 dips).</p>
+<pre>step    recall
+ 500    1.000
+1000    0.867
+1500    0.933
+2000    1.000
+...
+peak hit 6 times across 10k steps</pre>
+<p>The categorical stops collapsing to a delta, so under self-context at
+inference the softmax has enough width that a small feature-map shift
+doesn't reroute the argmax to a wrong bin.</p>
 
 <h2>5. What the literature does for similar problems</h2>
 
@@ -277,19 +341,27 @@ GT because:</p>
       L2. No teacher-forcing.</li>
 </ul>
 
-<h2>6. Recommendation</h2>
+<h2>7. Recommendation and current status</h2>
 
 <p>Attack in this order:</p>
 <ol>
-  <li><b>Fix the score/coord losses first</b> (hard-mask + per-cell-in-radius).
-      This is a 30-line change and directly addresses the observed loss floor.
-      If overfit recall goes to 1.0 we're done with this class of bug.</li>
-  <li><b>If (1) doesn't close the gap</b>: add a Chamfer-on-rollout auxiliary
-      loss. Sample K rollouts per attachment, compute mean min-Chamfer to
-      GT curves (with straight-through Gumbel-softmax through the categorical).
-      This optimizes the actual metric.</li>
+  <li><b>Fix the score/coord losses</b> (hard-mask + per-cell-in-radius) —
+      <span class="win">DONE</span>. Unstuck the score-loss floor
+      (0.190 → 0.034) and doubled overfit recall (0.40 → 0.60).</li>
+  <li><b>Add label smoothing 0.1</b> to knot CE — <span class="win">DONE</span>.
+      Overfit recall reaches 1.0 peak, oscillates 0.87–1.00.</li>
+  <li><b>1h retrain (v13) with the full recipe</b> — <span class="win">IN
+      PROGRESS</span>. Real-data recall trajectory bounces; awaiting the
+      final ckpt sweep. Even at step 5k already 0.654, beating v8's step
+      20k (0.462), but subsequent evals dip. Full sweep needed once
+      training completes.</li>
+  <li><b>If v13 doesn't hit v8's 0.913 peak on real</b>: add rollout-Chamfer
+      auxiliary loss with Gumbel-softmax straight-through so we optimise
+      the metric directly.</li>
   <li><b>If still not enough</b>: replace attach head with DETR-style set
-      prediction (Hungarian matching) so there's no negative-slot swamping.</li>
+      prediction (Hungarian matching) so there's no negative-slot swamping,
+      or add a STOP token so short GT flagella stop penalising the
+      pred→gt Chamfer term.</li>
 </ol>
 
 <p class="muted">The green line stuck at 0.196 in the overfit curve isn't
