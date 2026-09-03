@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--death-cost", type=float, default=0.0)
     ap.add_argument("--pool-cap", type=int, default=500,
                     help="cap on rollouts per clip fed to ILP; uniform-subsample if exceeded")
+    ap.add_argument("--preproc", choices=["canonical", "simlike"],
+                    default="canonical")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -84,29 +86,40 @@ def main():
     key = jax.random.key(42)
     all_pre_recalls, all_post_recalls, all_n_gt = [], [], []
     per_ann = []
+    from sim2real.eval_v2.simlike_preproc import simlike_canonicalize
     for ai, ann in enumerate(annots):
-        try:
-            canon, cfg_can = canonicalize_real_frame(ann["meta"],
-                                                       ann["src_width_px"], T=cfg.T)
-        except Exception:
-            continue
-        clip = canon["clip"]
-        smed_native = canon["static_median"].astype(np.float32) / 255
-        src_h, src_w = clip.shape[1], clip.shape[2]
-        scale_y = cfg.H / src_h; scale_x = cfg.W / src_w
-        clip_r = np.stack([cv2.resize(clip[t], (cfg.W, cfg.H),
-                                        interpolation=cv2.INTER_AREA)
-                            for t in range(clip.shape[0])], axis=0).astype(np.float32)
-        smed_r = cv2.resize(smed_native, (cfg.W, cfg.H),
-                             interpolation=cv2.INTER_AREA).astype(np.float32)
-
-        gt_curves = []
-        for pl in ann["gt_polylines_native"]:
-            gc = gt_polyline_to_canonical(pl, ann["meta"], cfg_can,
-                                            canonical_h=CANONICAL_H,
-                                            canonical_w=CANONICAL_W)
-            if len(gc) >= 4:
-                gt_curves.append(gc * np.asarray([scale_y, scale_x]))
+        if args.preproc == "canonical":
+            try:
+                canon, cfg_can = canonicalize_real_frame(ann["meta"],
+                                                           ann["src_width_px"], T=cfg.T)
+            except Exception:
+                continue
+            clip = canon["clip"]
+            smed_native = canon["static_median"].astype(np.float32) / 255
+            src_h, src_w = clip.shape[1], clip.shape[2]
+            scale_y = cfg.H / src_h; scale_x = cfg.W / src_w
+            clip_r = np.stack([cv2.resize(clip[t], (cfg.W, cfg.H),
+                                            interpolation=cv2.INTER_AREA)
+                                for t in range(clip.shape[0])], axis=0).astype(np.float32)
+            smed_r = cv2.resize(smed_native, (cfg.W, cfg.H),
+                                 interpolation=cv2.INTER_AREA).astype(np.float32)
+            gt_curves = []
+            for pl in ann["gt_polylines_native"]:
+                gc = gt_polyline_to_canonical(pl, ann["meta"], cfg_can,
+                                                canonical_h=CANONICAL_H,
+                                                canonical_w=CANONICAL_W)
+                if len(gc) >= 4:
+                    gt_curves.append(gc * np.asarray([scale_y, scale_x]))
+        else:  # simlike
+            try:
+                clip_r, smed_r, src_h, src_w, sy, sx = simlike_canonicalize(
+                    ann["meta"], T=cfg.T, target_hw=(cfg.H, cfg.W))
+            except Exception:
+                continue
+            gt_curves = []
+            for pl in ann["gt_polylines_native"]:
+                if len(pl) >= 4:
+                    gt_curves.append(pl.astype(np.float32) * np.asarray([sy, sx]))
         if not gt_curves:
             continue
 

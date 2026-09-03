@@ -65,7 +65,8 @@ def rollout_one_flagellum(feature_map: jnp.ndarray, params_knot: dict,
         pos, tangent, k = carry
         patch = rotated_patch_batched(feature_map, pos[None], tangent[None],
                                         cfg.patch_size)         # (1, P, P, C)
-        angle_logits, step_logits = knot_gen.apply(params_knot, patch)
+        kg_out = knot_gen.apply(params_knot, patch)
+        angle_logits, step_logits = kg_out[0], kg_out[1]  # v16+ also emits stop_logit
         # Sample from categorical (with temperature)
         k_a, k_s = jax.random.fold_in(key, k), jax.random.fold_in(key, k + 100000)
         a_bin = jax.random.categorical(k_a, angle_logits[0] / temperature)
