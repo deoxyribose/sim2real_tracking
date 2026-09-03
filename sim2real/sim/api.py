@@ -6,7 +6,8 @@ from typing import Callable
 
 import jax
 
-from sim2real.sim.configs import EasyCellsConfig, FlagellaConfig, ManyCellsConfig, ManyCellsFastConfig, ManyCellsFastSmallConfig, ManyCellsSmallConfig, MultiScaleConfig, TwoCellsConfig, WormsConfig
+from sim2real.sim.configs import AlgaeConfig, AlgaeFastConfig, EasyCellsConfig, FlagellaConfig, FlagellaFastConfig, ManyCellsConfig, ManyCellsFastConfig, ManyCellsFastSmallConfig, ManyCellsSmallConfig, MultiScaleConfig, TwoCellsConfig, WormsConfig, WormsFastConfig
+from sim2real.sim.algae import sample as algae_sample, sample_batch as algae_batch
 from sim2real.sim.flagella import sample as flagella_sample, sample_batch as flagella_batch
 from sim2real.sim.many_cells import sample as many_cells_sample, sample_batch as many_cells_batch
 from sim2real.sim.multiscale import sample as multiscale_sample, sample_batch as multiscale_batch
@@ -16,6 +17,9 @@ from sim2real.types import SimSample
 # `easy_cells` reuses the many_cells sampler with an easier config.
 _REGISTRY: dict[str, tuple[Callable, Callable, type]] = {
     "flagella": (flagella_sample, flagella_batch, FlagellaConfig),
+    "flagella_fast": (flagella_sample, flagella_batch, FlagellaFastConfig),
+    "algae": (algae_sample, algae_batch, AlgaeConfig),
+    "algae_fast": (algae_sample, algae_batch, AlgaeFastConfig),
     "many_cells": (many_cells_sample, many_cells_batch, ManyCellsConfig),
     "many_cells_fast": (many_cells_sample, many_cells_batch, ManyCellsFastConfig),
     "many_cells_fast_small": (many_cells_sample, many_cells_batch, ManyCellsFastSmallConfig),
@@ -24,6 +28,7 @@ _REGISTRY: dict[str, tuple[Callable, Callable, type]] = {
     "two_cells": (many_cells_sample, many_cells_batch, TwoCellsConfig),
     "multiscale": (multiscale_sample, multiscale_batch, MultiScaleConfig),
     "worms": (worms_sample, worms_batch, WormsConfig),
+    "worms_fast": (worms_sample, worms_batch, WormsFastConfig),
 }
 
 

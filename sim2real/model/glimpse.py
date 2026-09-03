@@ -12,6 +12,7 @@ from __future__ import annotations
 import flax.linen as nn
 import jax.numpy as jnp
 
+from sim2real.model.film import FiLMParams, apply_film
 from sim2real.model.nets import add_coords
 from sim2real.model.stn import stn_read
 
@@ -45,12 +46,18 @@ class GlimpseDecoder(nn.Module):
     Uses CoordConv (coord channels concatenated before each ConvT) so the kernels can learn
     position-aware patterns — e.g. "Gaussian blob peaked at patch center", which the bare
     shift-equivariant convs cannot express directly.
+
+    `use_film`: if True, apply FiLM conditioning on z_what after every ConvT layer. Forces
+    the decoder to modulate every intermediate feature by z_what content, preventing the
+    "output mean shape and ignore z_what" mode-collapse failure observed on shape-heavy sims.
+    FiLM params are zero-init so training starts as identity mapping.
     """
 
     glimpse_size: int = 16
     z_what_dim: int = 128
     channels: tuple[int, ...] = (64, 32)
     use_coord_conv: bool = True
+    use_film: bool = False
 
     @nn.compact
     def __call__(self, z_what):  # noqa: C901
@@ -59,17 +66,26 @@ class GlimpseDecoder(nn.Module):
         x = nn.gelu(x).reshape(base, base, self.channels[0])
 
         cur = base
+        layer_idx = 0
         for c in self.channels[1:]:
             if self.use_coord_conv:
                 x = add_coords(x)
             x = nn.ConvTranspose(c, (3, 3), strides=(2, 2), padding="SAME")(x)
             x = nn.gelu(x)
+            if self.use_film:
+                gamma, beta = FiLMParams(out_dim=c, name=f"film_up_{layer_idx}")(z_what)
+                x = apply_film(x, gamma, beta)
+            layer_idx += 1
             cur *= 2
         while cur < self.glimpse_size:
             if self.use_coord_conv:
                 x = add_coords(x)
             x = nn.ConvTranspose(self.channels[-1], (3, 3), strides=(2, 2), padding="SAME")(x)
             x = nn.gelu(x)
+            if self.use_film:
+                gamma, beta = FiLMParams(out_dim=self.channels[-1], name=f"film_up_{layer_idx}")(z_what)
+                x = apply_film(x, gamma, beta)
+            layer_idx += 1
             cur *= 2
         x = x[: self.glimpse_size, : self.glimpse_size]
         if self.use_coord_conv:

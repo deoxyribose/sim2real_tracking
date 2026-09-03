@@ -1,11 +1,13 @@
-"""Image encoder: 3-stage stride-2 CNN → 2 ViT layers with sinusoidal 2D PE.
+"""Image encoders: ConvStem + optional ViT (default), or a U-Net backbone.
 
 Operates on a single frame (H, W, C); the trainer vmaps over (B, T) externally.
+Both encoders return `(feat_grid, pool)` where `feat_grid` has shape (H', W', d_model).
 """
 
 from __future__ import annotations
 
 import flax.linen as nn
+import jax
 import jax.numpy as jnp
 
 from sim2real.model.nets import MultiHeadSelfAttention
@@ -79,4 +81,60 @@ class FrameEncoder(nn.Module):
             tokens = ViTBlock(self.d_model)(tokens)
         feat_grid = tokens.reshape(h, w, d)
         pool = jnp.mean(feat_grid, axis=(0, 1))
+        return feat_grid, pool
+
+
+class UNetEncoder(nn.Module):
+    """U-Net backbone: 128x128 → down to 8x8 bottleneck → up to `out_res` with skip connections.
+
+    Multi-scale features by construction: bottleneck sees global context, up-path recovers
+    spatial detail via skip concatenations from the corresponding down-stage feature map.
+    Memory is O(H*W*d) per layer — no O(L^2) attention matrix, unlike the ViT encoder.
+
+    Args:
+      d_model: final per-token dimensionality (1x1 conv projection on the up-path output).
+      down_channels: channel widths for each down stage. Length K means K down stages, so
+        input at 128 goes down by 2^(K-1) (first stage does not downsample). Default (24, 48,
+        96, 128, 192) → resolutions 128, 64, 32, 16, 8.
+      n_up_stages: how many upsample steps after the bottleneck. Determines output grid
+        resolution: `out_res = 128 / 2^(K-1-n_up_stages)`. n_up_stages=2 → 32x32 (typical);
+        n_up_stages=3 → 64x64 (for small-object recovery).
+      blocks_per_stage: number of Conv→GN→GELU blocks in each stage (both down and up).
+    """
+
+    d_model: int = 192
+    down_channels: tuple[int, ...] = (24, 48, 96, 128, 192)
+    n_up_stages: int = 2
+    blocks_per_stage: int = 2
+
+    @nn.compact
+    def __call__(self, image):
+        assert self.n_up_stages < len(self.down_channels), \
+            f"n_up_stages={self.n_up_stages} must be < len(down_channels)={len(self.down_channels)}"
+
+        x = image
+        skips = []
+        for i, c in enumerate(self.down_channels):
+            for _ in range(self.blocks_per_stage):
+                x = nn.Conv(c, (3, 3), padding="SAME")(x)
+                x = nn.GroupNorm(num_groups=min(8, c))(x)
+                x = nn.gelu(x)
+            skips.append(x)
+            if i < len(self.down_channels) - 1:
+                x = nn.Conv(c, (3, 3), strides=(2, 2), padding="SAME")(x)  # halve resolution
+
+        pool = jnp.mean(x, axis=(0, 1))  # bottleneck global pool
+
+        for j in range(self.n_up_stages):
+            H, W, C = x.shape
+            x = jax.image.resize(x, (H * 2, W * 2, C), method="nearest")
+            skip = skips[-2 - j]
+            x = jnp.concatenate([x, skip], axis=-1)
+            c_out = self.down_channels[-2 - j]
+            for _ in range(self.blocks_per_stage):
+                x = nn.Conv(c_out, (3, 3), padding="SAME")(x)
+                x = nn.GroupNorm(num_groups=min(8, c_out))(x)
+                x = nn.gelu(x)
+
+        feat_grid = nn.Conv(self.d_model, (1, 1))(x)
         return feat_grid, pool

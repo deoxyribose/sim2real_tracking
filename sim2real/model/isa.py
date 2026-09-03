@@ -220,4 +220,6 @@ class ISAStack(nn.Module):
             z_where, z_pres, z_what = refiner(
                 K_base, V, pixel_pos, z_where, z_pres, z_what, prev_z_what
             )
-        return z_where, z_pres, z_what
+        # No per-iter deep supervision for ISA yet; return None for aux slots to match
+        # NeuralEMStack signature.
+        return z_where, z_pres, z_what, None, None

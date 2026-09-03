@@ -25,7 +25,7 @@ import jax
 import jax.numpy as jnp
 
 from sim2real.model.background import BackgroundRenderer
-from sim2real.model.encoder import FrameEncoder
+from sim2real.model.encoder import FrameEncoder, UNetEncoder
 from sim2real.model.glimpse import GlimpseDecoder, GlimpseEncoder, GroupedDecoder
 from sim2real.model.heads import PresHead, WhatHead, WhereHead
 from sim2real.model.isa import ISAStack
@@ -51,6 +51,12 @@ class ModelConfig:
     n_vit_layers: int = 1
     stem_channels: tuple = (16, 32, 64)
     stem_strides: tuple = (2, 2, 2)
+    # Encoder backbone. "vit": ConvStem + ViT (uses stem_channels/stem_strides/n_vit_layers).
+    # "unet": down-then-up path with skip concat; no self-attention. See UNetEncoder for shape math.
+    encoder_type: str = "vit"
+    unet_down_channels: tuple = (24, 48, 96, 128, 192)
+    unet_n_up_stages: int = 2                       # 2 → 32x32 output, 3 → 64x64
+    unet_blocks_per_stage: int = 2
     where_scale: float = 0.5
     pres_init_bias: float = -1.0
     pres_tau: float = 0.5
@@ -112,6 +118,28 @@ class ModelConfig:
     # DETR-style bg slot: phantom "null slot" added to softmax competition. Prevents real
     # slots from becoming background sinks (which contaminates their centroid).
     nem_use_bg_slot: bool = False
+    # Extend the NEM null slot: compute its logit per pixel from (image feats, z_style)
+    # instead of a single learned scalar. Helps when bg is heterogeneous (halo + particles +
+    # texture) so the null slot can "want" some pixels more than others per video.
+    nem_bg_slot_per_pixel: bool = False
+    # Dual-source z_what for NEM: add a learned zero-init projection of `glimpse_feat`
+    # (STN-read local image content) to z_what before decoding. Restores the v18 "dual-source"
+    # trick that was disabled in the NEM path. Gives the decoder direct spatial info about the
+    # slot's territory — useful for shape-heavy sims (worms, non-blob) where NEM's aggregated
+    # z_what loses within-slot spatial structure.
+    nem_dual_source_what: bool = False
+    # PCA-based θ update: compute z_where.θ directly from principal axis of responsibility
+    # covariance (like ISA does). Fixes NEM's tiny-delta θ update (±9°/iter) that limits
+    # slot orientation range. Essential for elongated / non-horizontal objects.
+    nem_use_pca_theta: bool = False
+    # FiLM conditioning of glimpse decoder on z_what. Forces the decoder to modulate every
+    # intermediate feature by z_what content instead of collapsing to a mean shape.
+    # Address the observed "identical horizontal-bar decoder output for all slots" failure.
+    decoder_use_film: bool = False
+    # Separate per-iter delta scale for θ (in NEM). Default 0.05 caps per-iter θ change at
+    # ~9°; total reach from θ=0 init is ~27°/frame. Bump to 0.3+ for objects with arbitrary
+    # orientations (worms, articulated shapes). Position and scale still use z_where_delta_scale.
+    nem_theta_delta_scale: float = 0.05
     # When True, a per-video background field is rendered from z_style and slots composite OVER
     # it. Removes the L_recon = 0.21 floor caused by "unexplained pixels → composite=0".
     use_background: bool = True
@@ -128,11 +156,19 @@ class SlotVideoModel(nn.Module):
 
     def setup(self):
         c = self.cfg
-        self.encoder = FrameEncoder(
-            d_model=c.d_model, n_vit_layers=c.n_vit_layers,
-            stem_channels=tuple(c.stem_channels),
-            stem_strides=tuple(c.stem_strides),
-        )
+        if c.encoder_type == "unet":
+            self.encoder = UNetEncoder(
+                d_model=c.d_model,
+                down_channels=tuple(c.unet_down_channels),
+                n_up_stages=c.unet_n_up_stages,
+                blocks_per_stage=c.unet_blocks_per_stage,
+            )
+        else:
+            self.encoder = FrameEncoder(
+                d_model=c.d_model, n_vit_layers=c.n_vit_layers,
+                stem_channels=tuple(c.stem_channels),
+                stem_strides=tuple(c.stem_strides),
+            )
         self.slot_transformer = SlotTransformer(
             n_max=c.n_max, d_model=c.d_model, n_heads=c.n_heads, n_layers=c.n_transformer_layers,
             slot_competing_cross=c.slot_competing_cross,
@@ -155,7 +191,8 @@ class SlotVideoModel(nn.Module):
             )
         else:
             self.glimpse_decoder = GlimpseDecoder(
-                glimpse_size=c.glimpse_size, z_what_dim=c.z_what_dim, channels=(32, 16)
+                glimpse_size=c.glimpse_size, z_what_dim=c.z_what_dim, channels=(32, 16),
+                use_film=c.decoder_use_film,
             )
         # NOTE: removed standalone SegHead — masks_pred now reuses the GlimpseDecoder's
         # mask_logit channel. Saves params and lets the L_mask gradient train the same network
@@ -207,6 +244,9 @@ class SlotVideoModel(nn.Module):
                 n_iters=c.n_transformer_layers, d_pos=32,
                 attn_temp=c.nem_attn_temp,
                 use_bg_slot=c.nem_use_bg_slot,
+                use_pca_theta=c.nem_use_pca_theta,
+                theta_delta_scale=c.nem_theta_delta_scale,
+                bg_slot_per_pixel=c.nem_bg_slot_per_pixel,
             )
             # Per-slot initial z_what — small learned tensor, one row per slot. Provides the
             # symmetry-breaking bias for slot identity at t=0 (analogous to slot_init_bias in
@@ -216,6 +256,12 @@ class SlotVideoModel(nn.Module):
                 nn.initializers.normal(stddev=c.z_what_init_std),
                 (c.n_max, c.z_what_dim),
             )
+            if c.nem_dual_source_what:
+                # Zero-init so the additive skip starts as a no-op and gets learned.
+                self.what_skip_proj = nn.Dense(
+                    c.z_what_dim, kernel_init=nn.initializers.zeros,
+                    name="what_skip_proj",
+                )
 
         if c.use_isa:
             self.isa = ISAStack(
@@ -232,6 +278,43 @@ class SlotVideoModel(nn.Module):
     def _predict_zwhere(self, q, prev_zwhere):
         return self.where_head(q, prev_zwhere)
 
+    def decode_from_latents(self, video, z_where, z_pres, z_what, z_style):
+        """Decode-only path: (video, per-frame latents, per-video z_style) → (composite, masks).
+
+        Bypasses encoder + refiner + heads entirely; used for test-time refinement where the
+        latents are being optimized directly. All shapes match the outputs of a normal forward:
+          video:   (T, H, W, C)
+          z_where: (T, N, 5)   z_pres: (T, N)   z_what: (T, N, Zw)
+          z_style: (Zs,)
+        Returns: composite (T, H, W, C), masks_pred (T, N, H, W).
+        """
+        cfg = self.cfg
+        T, H, W, _ = video.shape
+
+        if cfg.use_background:
+            bg_frame = self.bg_renderer(z_style)                                            # (128, 128, 1)
+            bg_frame = bg_frame[:H, :W]
+        else:
+            bg_frame = jnp.zeros((H, W, 1))
+
+        def per_frame(image, zw_t, zp_t, zwhat_t):
+            (appear_canvas, mask_appear_canvas, mask_seg_canvas,
+             _mask_logit_patch, _appear_patch, _glimpse_feat) = jax.vmap(
+                self._per_slot_decode_only, in_axes=(0, 0, 0, None)
+            )(zwhat_t, zw_t, zp_t, image)
+            num = jnp.sum(appear_canvas * mask_appear_canvas[..., None], axis=0)
+            den = jnp.sum(mask_appear_canvas, axis=0)[..., None] + 1e-6
+            fg = num / den
+            alpha_fg = jnp.clip(jnp.sum(mask_appear_canvas, axis=0), 0.0, 1.0)[..., None]
+            if cfg.use_background:
+                composite = jnp.clip(alpha_fg * fg + (1.0 - alpha_fg) * bg_frame, 0.0, 1.0)
+            else:
+                composite = jnp.clip(fg, 0.0, 1.0)
+            return composite, mask_seg_canvas                                                # (H, W, C), (N, H, W)
+
+        composites, masks = jax.vmap(per_frame)(video, z_where, z_pres, z_what)             # (T, H, W, C), (T, N, H, W)
+        return composites, masks
+
     def _per_slot_decode_only(self, zwhat, zwhere, zpres, image):
         """Decoder + STN + per-slot canvases for the Neural EM path.
 
@@ -244,6 +327,11 @@ class SlotVideoModel(nn.Module):
 
         if cfg.n_groups > 1:
             raise NotImplementedError("n_groups>1 not supported with use_neural_em")
+        # Dual-source z_what: add STN-read glimpse feature to the aggregated NEM z_what
+        # before decoding. Restores v18 fix (see CLAUDE.md) — gives decoder direct spatial
+        # info about the slot's territory instead of only aggregated features.
+        if cfg.nem_dual_source_what:
+            zwhat = zwhat + self.what_skip_proj(glimpse_feat)
         appear_patch, mask_logit_patch = self.glimpse_decoder(zwhat)                    # (g, g, 1) each
 
         mask_prob_patch = nn.sigmoid(mask_logit_patch)                                  # (g, g, 1)
@@ -332,7 +420,8 @@ class SlotVideoModel(nn.Module):
         )
 
     def __call__(self, video: Array, key, *, teacher_zwhere=None, teacher_zpres=None,
-                 bootstrap_zwhere0=None):
+                 bootstrap_zwhere0=None, resp_override=None,
+                 zwhere_override=None, zpres_override=None):
         """Forward one video.
 
         Args:
@@ -530,19 +619,41 @@ class SlotVideoModel(nn.Module):
                 out["z_pres_logit_aux"] = jnp.stack(aux_zpres_logit_layers, axis=0)
             return new_carry, out
 
-        def step_structured(carry_s, inputs, refiner_module):
+        def step_structured(carry_s, inputs, refiner_module, resp_override_t=None,
+                              zwhere_override_t=None, zpres_override_t=None):
             """One-frame step for Neural EM / ISA — bypasses slot_transformer + heads.
 
             `refiner_module` is a callable (feat_grid, prev_z_where, prev_z_pres, prev_z_what)
             -> (z_where, z_pres, z_what) — i.e. NeuralEMStack or ISAStack (same signature).
             The per-slot decoder + STN + composite pipeline is unchanged. No teacher forcing.
+
+            `resp_override_t` (NEM only): (N, L) responsibility map to force in every NEM
+            iteration for this frame. Used by oracle experiments to override the E-step with
+            downsampled GT masks.
             """
             prev_zwhere_ne, prev_zpres_ne, prev_zwhat_ne = carry_s
             feat_grid, image, _k_unused = inputs
 
-            z_where, z_pres, z_what = refiner_module(
-                feat_grid, prev_zwhere_ne, prev_zpres_ne, prev_zwhat_ne
-            )
+            # NEM takes an optional z_style for per-pixel bg-slot logits; ISA doesn't.
+            if cfg.use_neural_em and cfg.nem_bg_slot_per_pixel:
+                z_where, z_pres, z_what, zw_aux, zp_aux = refiner_module(
+                    feat_grid, prev_zwhere_ne, prev_zpres_ne, prev_zwhat_ne,
+                    z_style=z_style_sample,
+                    resp_override=resp_override_t,
+                    zwhere_override=zwhere_override_t,
+                    zpres_override=zpres_override_t,
+                )
+            elif cfg.use_neural_em:
+                z_where, z_pres, z_what, zw_aux, zp_aux = refiner_module(
+                    feat_grid, prev_zwhere_ne, prev_zpres_ne, prev_zwhat_ne,
+                    resp_override=resp_override_t,
+                    zwhere_override=zwhere_override_t,
+                    zpres_override=zpres_override_t,
+                )
+            else:
+                z_where, z_pres, z_what, zw_aux, zp_aux = refiner_module(
+                    feat_grid, prev_zwhere_ne, prev_zpres_ne, prev_zwhat_ne
+                )
 
             (appear_canvas, mask_appear_canvas, mask_seg_canvas,
              mask_logit_patch, appear_patch, glimpse_feat) = jax.vmap(
@@ -576,6 +687,12 @@ class SlotVideoModel(nn.Module):
                 mask_logit_patch=mask_logit_patch,
                 appear_patch=appear_patch,
             )
+            # Deep supervision: per-iteration z_where and z_pres (excluding the final iter
+            # which is already exposed as z_where / z_pres above). Matches the DETR aux
+            # convention consumed by pretrain_loss when lambda_aux > 0.
+            if zw_aux is not None:
+                out["z_where_aux"] = zw_aux
+                out["z_pres_logit_aux"] = jax.scipy.special.logit(jnp.clip(zp_aux, 1e-6, 1 - 1e-6))
             return new_carry, out
 
         # NOTE: We use a Python-unrolled loop rather than `jax.lax.scan` because the slot
@@ -596,8 +713,11 @@ class SlotVideoModel(nn.Module):
                 prev_zwhat0_s = self.z_what_init
             carry = (prev_zwhere0, prev_zpres0_s, prev_zwhat0_s)
             for t in range(T):
+                resp_t = resp_override[t] if resp_override is not None else None
+                zwo_t = zwhere_override[t] if zwhere_override is not None else None
+                zpo_t = zpres_override[t] if zpres_override is not None else None
                 carry, out_t = step_structured(
-                    carry, (feats[t], video[t], keys_t[t]), refiner_mod
+                    carry, (feats[t], video[t], keys_t[t]), refiner_mod, resp_t, zwo_t, zpo_t,
                 )
                 outs.append(out_t)
         else:

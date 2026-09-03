@@ -231,10 +231,10 @@ def track_one_scene(ckpt_path: str, out_mp4: str, out_png: str,
                     alpha=0.7)
             ax.plot(g[:, 1], g[:, 0], "-", color="#33ff44", linewidth=1.8,
                     alpha=1.0)
-        # All rollouts (yellow faint)
+        # All candidates (yellow, more visible now)
         for rl in per_frame_rollouts.get(k, []):
-            ax.plot(rl[:, 1], rl[:, 0], "-", color="#ffd633", linewidth=0.5,
-                    alpha=0.08)
+            ax.plot(rl[:, 1], rl[:, 0], "-", color="#ffd633", linewidth=0.6,
+                    alpha=0.30)
         # Selected DIR splines, colored by track id
         for hi in sol["selected_indices"]:
             h = all_hypos[hi]

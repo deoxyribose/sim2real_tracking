@@ -49,6 +49,8 @@ def main():
     ap.add_argument("--n-groups", type=int, default=1)
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--n-transformer-layers", type=int, default=2)
+    ap.add_argument("--z-what-dim", type=int, default=64)
+    ap.add_argument("--stem-channels", type=int, nargs="+", default=[16, 32, 64])
     ap.add_argument("--bg-base-res", type=int, default=4)
     ap.add_argument("--bg-channels", type=int, nargs="+", default=[8])
     ap.add_argument("--stem-strides", type=int, nargs="+", default=[2, 2, 2])
@@ -67,28 +69,38 @@ def main():
     ap.add_argument("--z-what-init-std", type=float, default=0.2)
     ap.add_argument("--nem-attn-temp", type=float, default=1.0)
     ap.add_argument("--nem-use-bg-slot", action="store_true")
+    ap.add_argument("--nem-bg-slot-per-pixel", action="store_true")
+    ap.add_argument("--nem-dual-source-what", action="store_true")
+    ap.add_argument("--nem-use-pca-theta", action="store_true")
+    ap.add_argument("--decoder-use-film", action="store_true")
+    ap.add_argument("--nem-theta-delta-scale", type=float, default=0.05)
     ap.add_argument("--hard-pres-gate", action="store_true",
                     help="Forbid dead-pred slots from winning alive-GT columns in the eval "
                          "matcher. Use if the model was trained with hard_pres_gate.")
     ap.add_argument("--savi-bootstrap", action="store_true",
                     help="Pass GT z_where[:, 0] as slot init per video. REQUIRED if the model "
                          "was trained with --savi-bootstrap, else it scores as untrained.")
+    ap.add_argument("--encoder-type", default="vit", choices=["vit", "unet"])
+    ap.add_argument("--unet-down-channels", type=int, nargs="+",
+                    default=[24, 48, 96, 128, 192])
+    ap.add_argument("--unet-n-up-stages", type=int, default=2)
+    ap.add_argument("--unet-blocks-per-stage", type=int, default=2)
     args = ap.parse_args()
 
     ck = ckpt_load(args.ckpt)
     params = ck["params"]
 
-    default_n_max = {"flagella": 8, "many_cells": 48, "many_cells_fast": 24, "many_cells_small": 48, "easy_cells": 8, "two_cells": 4, "multiscale": 16, "worms": 12}
+    default_n_max = {"flagella": 8, "flagella_fast": 6, "many_cells": 48, "many_cells_fast": 24, "many_cells_small": 48, "easy_cells": 8, "two_cells": 4, "multiscale": 16, "worms": 12, "worms_fast": 8, "algae": 6, "algae_fast": 6}
     n_max = args.n_max if args.n_max is not None else default_n_max[args.sim]
     model_cfg = ModelConfig(
         n_max=n_max,
         d_model=args.d_model,
         n_heads=4,
         n_transformer_layers=args.n_transformer_layers,
-        z_what_dim=64,
+        z_what_dim=args.z_what_dim,
         z_style_dim=args.z_style_dim,
         glimpse_size=args.glimpse_size,
-        stem_channels=(16, 32, 64),
+        stem_channels=tuple(args.stem_channels),
         stem_strides=tuple(args.stem_strides),
         n_groups=args.n_groups,
         use_background=True,
@@ -108,6 +120,15 @@ def main():
         z_what_init_std=args.z_what_init_std,
         nem_attn_temp=args.nem_attn_temp,
         nem_use_bg_slot=args.nem_use_bg_slot,
+        nem_bg_slot_per_pixel=args.nem_bg_slot_per_pixel,
+        nem_dual_source_what=args.nem_dual_source_what,
+        nem_use_pca_theta=args.nem_use_pca_theta,
+        decoder_use_film=args.decoder_use_film,
+        nem_theta_delta_scale=args.nem_theta_delta_scale,
+        encoder_type=args.encoder_type,
+        unet_down_channels=tuple(args.unet_down_channels),
+        unet_n_up_stages=args.unet_n_up_stages,
+        unet_blocks_per_stage=args.unet_blocks_per_stage,
     )
     model = SlotVideoModel(cfg=model_cfg)
     batch_fn, _ = build_sim(args.sim)

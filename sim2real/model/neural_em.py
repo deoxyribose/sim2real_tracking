@@ -77,12 +77,18 @@ class NeuralEMRefiner(nn.Module):
     """
     d_model: int
     d_pos: int = 32                          # position-embedding dimension
-    z_where_delta_scale: float = 0.05        # correction magnitude in raw space
+    z_where_delta_scale: float = 0.05        # correction magnitude in raw space (pos, scale)
+    theta_delta_scale: float = 0.05          # separate delta scale for θ (per-iter reach)
     attn_temp: float = 1.0                   # softmax temperature; <1 = sharper responsibility
     use_bg_slot: bool = False                # add null slot for background pixels
+    use_pca_theta: bool = False              # compute θ from PCA of responsibility covariance
 
     @nn.compact
-    def __call__(self, K, V, pixel_pos, z_where, z_pres, z_what, prev_z_what):
+    def __call__(self, K, V, pixel_pos, z_where, z_pres, z_what, prev_z_what,
+                 bg_pixel_logits: Array | None = None,
+                 resp_override: Array | None = None,
+                 zwhere_override: Array | None = None,
+                 zpres_override: Array | None = None):
         # K, V: (L, d_model); pixel_pos: (L, 2); z_where: (N, 5); z_pres: (N,); z_what: (N, Zw); prev_z_what: (N, Zw)
         Zw = z_what.shape[-1]
 
@@ -99,14 +105,24 @@ class NeuralEMRefiner(nn.Module):
         # Optional: append a phantom "background" slot with learned scalar logit. Pixels
         # not strongly wanted by real slots go to bg instead of being uniformly split.
         if self.use_bg_slot:
-            bg_logit = self.param("bg_logit", nn.initializers.constant(0.0), ())
-            bg_row = jnp.broadcast_to(bg_logit, (1, logits.shape[-1]))                     # (1, L)
+            if bg_pixel_logits is not None:
+                # Per-pixel bg logit, computed upstream from (feat, z_style). Overrides scalar.
+                bg_row = bg_pixel_logits[None, :]                                          # (1, L)
+            else:
+                bg_logit = self.param("bg_logit", nn.initializers.constant(0.0), ())
+                bg_row = jnp.broadcast_to(bg_logit, (1, logits.shape[-1]))                 # (1, L)
             logits_full = jnp.concatenate([logits, bg_row], axis=0)                        # (N+1, L)
             resp_full = jax.nn.softmax(logits_full, axis=0)                                # (N+1, L)
             resp = resp_full[:-1]                                                          # (N, L)
         else:
             # Softmax OVER SLOTS (each pixel is soft-claimed by one slot).
             resp = jax.nn.softmax(logits, axis=0)                                          # (N, L)
+
+        # Optional oracle override: replace the computed responsibilities with a supplied
+        # (N, L) map (e.g., downsampled GT masks). Downstream M-step then computes z_where,
+        # z_pres, z_what from the forced responsibilities via the trained M-step weights.
+        if resp_override is not None:
+            resp = resp_override
 
         # --- M-step ---
         mass = resp.sum(axis=-1)                                                            # (N,)
@@ -123,12 +139,24 @@ class NeuralEMRefiner(nn.Module):
         slot_feat = (resp @ V) / (mass[:, None] + 1e-6)                                     # (N, d_model)
         slot_feat_norm = nn.LayerNorm(name="slot_feat_norm")(slot_feat)
 
-        # z_where: centroid + small learned correction. Theta is purely learned (no centroid
-        # notion for orientation of an isotropic cluster).
+        # z_where: centroid + small learned correction.
         x = nn.Dense(self.d_model, name="delta_hidden")(slot_feat_norm)
         x = nn.gelu(x)
         delta = nn.Dense(5, kernel_init=nn.initializers.zeros, name="delta_out")(x)         # (N, 5)
-        theta_raw = z_where[:, 2] + self.z_where_delta_scale * jnp.tanh(delta[:, 2])
+        if self.use_pca_theta:
+            # 2x2 weighted covariance including off-diagonal.
+            cxx = weighted_var[:, 0]                                                        # already computed above
+            cyy = weighted_var[:, 1]
+            cxy = (resp[:, :, None] * (diff[..., 0:1] * diff[..., 1:2])).sum(axis=1) \
+                    .squeeze(-1) / (mass + 1e-6)                                            # (N,)
+            # Principal-axis angle from covariance eigenvector. Range (-π/2, π/2).
+            theta_pca = 0.5 * jnp.arctan2(2.0 * cxy, cxx - cyy + 1e-6)                      # (N,)
+            # STN decodes θ = π * tanh(θ_raw), so invert: θ_raw = arctanh(θ / π).
+            _PI_CLIP = 0.98
+            theta_raw_pca = jnp.arctanh(jnp.clip(theta_pca / jnp.pi, -_PI_CLIP, _PI_CLIP))  # (N,)
+            theta_raw = theta_raw_pca + self.theta_delta_scale * jnp.tanh(delta[:, 2])
+        else:
+            theta_raw = z_where[:, 2] + self.theta_delta_scale * jnp.tanh(delta[:, 2])
         base_zwhere = _pack_zwhere_from_centroid(centroid, std, theta_raw)                  # (N, 5)
         delta_xy = jnp.concatenate([delta[:, 0:2], jnp.zeros_like(delta[:, 2:3]), delta[:, 3:5]], axis=-1)
         z_where_new = base_zwhere + self.z_where_delta_scale * jnp.tanh(delta_xy)           # (N, 5)
@@ -153,6 +181,13 @@ class NeuralEMRefiner(nn.Module):
         temp = self.param("mass_temp", nn.initializers.constant(1.0), ())
         z_pres_new = jax.nn.sigmoid((mass - thresh) / (jnp.abs(temp) + 0.1))                # (N,)
 
+        # Optional oracle overrides: after M-step, replace z_where and/or z_pres with fed values.
+        # z_what is left as computed by the trained M-step (from forced resp @ V, GRU, MLP).
+        if zwhere_override is not None:
+            z_where_new = zwhere_override
+        if zpres_override is not None:
+            z_pres_new = zpres_override
+
         return z_where_new, z_pres_new, z_what_new
 
 
@@ -168,9 +203,19 @@ class NeuralEMStack(nn.Module):
     d_pos: int = 32
     attn_temp: float = 1.0
     use_bg_slot: bool = False
+    use_pca_theta: bool = False
+    theta_delta_scale: float = 0.05
+    # When True (and `use_bg_slot`), the null-slot logit is computed per pixel from a small MLP
+    # over (feats_l, z_style). Requires z_style to be passed in. Lets the bg slot distinguish
+    # "obviously far-bg pixel" from "edge of a thin fg object" instead of a global scalar.
+    bg_slot_per_pixel: bool = False
 
     @nn.compact
-    def __call__(self, feat_grid, prev_z_where, prev_z_pres, prev_z_what):
+    def __call__(self, feat_grid, prev_z_where, prev_z_pres, prev_z_what,
+                 z_style: Array | None = None,
+                 resp_override: Array | None = None,
+                 zwhere_override: Array | None = None,
+                 zpres_override: Array | None = None):
         # feat_grid: (h, w, d). prev_* are the entering iteration state (from carry or init).
         h, w, d = feat_grid.shape
         L = h * w
@@ -184,10 +229,33 @@ class NeuralEMStack(nn.Module):
 
         pixel_pos = _normalized_grid(h, w)                                                  # (L, 2)
 
+        # Per-pixel bg-slot logits (optional). Computed once per frame from (feats, z_style).
+        bg_pixel_logits = None
+        if self.use_bg_slot and self.bg_slot_per_pixel:
+            assert z_style is not None, "bg_slot_per_pixel=True requires z_style"
+            style_broadcast = jnp.broadcast_to(z_style[None], (L, z_style.shape[-1]))
+            bg_in = jnp.concatenate([feats_flat, style_broadcast], axis=-1)                 # (L, d + Zs)
+            bg_h = nn.gelu(nn.Dense(self.d_model // 2, name="bg_pix_h")(bg_in))
+            bg_pixel_logits = nn.Dense(1, name="bg_pix_out",
+                                       bias_init=nn.initializers.constant(0.0))(bg_h)[:, 0]  # (L,)
+
         refiner = NeuralEMRefiner(self.d_model, self.d_pos, attn_temp=self.attn_temp,
-                                  use_bg_slot=self.use_bg_slot, name="refiner")
+                                  use_bg_slot=self.use_bg_slot,
+                                  use_pca_theta=self.use_pca_theta,
+                                  theta_delta_scale=self.theta_delta_scale, name="refiner")
 
         z_where, z_pres, z_what = prev_z_where, prev_z_pres, prev_z_what
+        traj_zwhere = []                    # per-iter outputs, length n_iters
+        traj_zpres = []
         for _ in range(self.n_iters):
-            z_where, z_pres, z_what = refiner(K, V, pixel_pos, z_where, z_pres, z_what, prev_z_what)
-        return z_where, z_pres, z_what
+            z_where, z_pres, z_what = refiner(K, V, pixel_pos, z_where, z_pres, z_what, prev_z_what,
+                                              bg_pixel_logits=bg_pixel_logits,
+                                              resp_override=resp_override,
+                                              zwhere_override=zwhere_override,
+                                              zpres_override=zpres_override)
+            traj_zwhere.append(z_where)
+            traj_zpres.append(z_pres)
+        # Stack trajectories along a new "layer" axis (matches DETR-style aux convention).
+        zw_aux = jnp.stack(traj_zwhere[:-1], axis=0) if len(traj_zwhere) > 1 else None    # (n_iters-1, N, 5)
+        zp_aux = jnp.stack(traj_zpres[:-1], axis=0) if len(traj_zpres) > 1 else None      # (n_iters-1, N)
+        return z_where, z_pres, z_what, zw_aux, zp_aux

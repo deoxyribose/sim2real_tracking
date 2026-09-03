@@ -74,6 +74,10 @@ def main():
     ap.add_argument("--z-what-init-std", type=float, default=0.2)
     ap.add_argument("--nem-attn-temp", type=float, default=1.0)
     ap.add_argument("--nem-use-bg-slot", action="store_true")
+    ap.add_argument("--nem-dual-source-what", action="store_true")
+    ap.add_argument("--nem-use-pca-theta", action="store_true")
+    ap.add_argument("--decoder-use-film", action="store_true")
+    ap.add_argument("--nem-theta-delta-scale", type=float, default=0.05)
     ap.add_argument("--hard-pres-gate", action="store_true",
                     help="Match with hard pres gate: dead pred slots can't win alive-GT columns.")
     ap.add_argument("--savi-bootstrap", action="store_true",
@@ -100,6 +104,10 @@ def main():
         anchor_init_fixed=args.anchor_init_fixed, z_what_init_std=args.z_what_init_std,
         nem_attn_temp=args.nem_attn_temp,
         nem_use_bg_slot=args.nem_use_bg_slot,
+        nem_dual_source_what=args.nem_dual_source_what,
+        nem_use_pca_theta=args.nem_use_pca_theta,
+        decoder_use_film=args.decoder_use_film,
+        nem_theta_delta_scale=args.nem_theta_delta_scale,
     )
     model = SlotVideoModel(cfg=model_cfg)
 

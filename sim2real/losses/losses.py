@@ -87,6 +87,12 @@ class PretrainLossConfig:
     # cell's neighborhood and steals the assignment" — a mechanism observed to drag eval IoU
     # while training losses look converged.
     hard_pres_gate: bool = False
+    # Weighted pixel recon: down-weight bg pixels so slot capacity is spent on the objects we
+    # care about. Weight map is `1.0` inside a 3-px-dilated union of GT masks (over alive
+    # slots), `bg_recon_weight` outside. Set to 1.0 for the vanilla uniform-MSE behavior; 0.1
+    # (default when enabled elsewhere) is a good starting point for texture-heavy sims like algae.
+    bg_recon_weight: float = 1.0
+    bg_recon_dilate_px: int = 3
 
 
 @dataclass(frozen=True)
@@ -134,6 +140,30 @@ def _apply_perm(arr: Array, perm: Array) -> Array:
     return jax.vmap(gather_along_slots)(arr, perm)
 
 
+def _fg_recon_weight(masks: Array, z_pres: Array, dilate_px: int, bg_weight: float) -> Array:
+    """Per-pixel loss weight = 1.0 inside a dilated union of alive GT masks, `bg_weight` outside.
+
+    masks: (T, N, H, W); z_pres: (T, N).
+    """
+    alive = (z_pres > 0.5).astype(masks.dtype)                                              # (T, N)
+    fg = jnp.max(masks * alive[..., None, None], axis=1)                                    # (T, H, W)
+    fg = (fg > 0.5).astype(masks.dtype)
+    if dilate_px > 0:
+        k = 2 * dilate_px + 1
+        # Max-pool with a (k, k) window at stride 1, SAME padding = binary dilation.
+        fg_dil = jax.lax.reduce_window(
+            fg[..., None],                                                                   # (T, H, W, 1)
+            -jnp.inf,
+            jax.lax.max,
+            (1, k, k, 1),
+            (1, 1, 1, 1),
+            "SAME",
+        )[..., 0]
+    else:
+        fg_dil = fg
+    return bg_weight + (1.0 - bg_weight) * fg_dil                                            # (T, H, W)
+
+
 def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
                   prior_cfg: PriorConfig) -> tuple[Array, dict]:
     """Supervised pretrain loss. Single video (no batch dim)."""
@@ -146,7 +176,12 @@ def pretrain_loss(out: ModelOut, sample: SimSample, cfg: PretrainLossConfig,
     lv_w_matched = _apply_perm(out.aux["lv_w"], perm)
     masks_pred_matched = _apply_perm(out.masks_pred, perm)
 
-    L_recon = recon_mse(out.composite, sample.video)
+    if cfg.bg_recon_weight != 1.0:
+        w = _fg_recon_weight(sample.masks, sample.z_pres,
+                             cfg.bg_recon_dilate_px, cfg.bg_recon_weight)                    # (T, H, W)
+        L_recon = recon_mse(out.composite, sample.video, weight=w)
+    else:
+        L_recon = recon_mse(out.composite, sample.video)
     L_where = masked_mse(z_where_matched, sample.z_where, sample.z_pres)
     L_pres = bce_from_logits(
         z_pres_logit_matched, sample.z_pres,
