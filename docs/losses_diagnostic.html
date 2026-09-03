@@ -346,22 +346,47 @@ doesn't reroute the argmax to a wrong bin.</p>
 <table>
 <tr><th>run</th><th>changes vs prior</th><th>fast pre_recall (peak)</th>
     <th>wide-TTA (peak)</th></tr>
-<tr><td>v8 (champion, 24 knots)</td>
+<tr><td>v8 (24 knots)</td>
     <td>original AR + attach + wide-gauss score + min-over-all coord</td>
     <td>step 60k → 0.990</td><td>1.000 (60k)</td></tr>
 <tr><td>v13</td>
     <td>+ hard-mask score + per-cell-in-radius coord + LS 0.1</td>
-    <td>step 5k → 0.846 (peak much earlier)</td><td>0.971 (5k)</td></tr>
+    <td>step 5k → 0.846</td><td>0.971 (5k)</td></tr>
 <tr><td>v14</td>
     <td>+ SS from step 0, p_tf 1.0→0.5 over 20k</td>
     <td>step 5k → 0.769</td><td>—</td></tr>
-<tr><td>v15</td>
-    <td>SS delayed until step 20k (killed early)</td>
-    <td>—</td><td>—</td></tr>
-<tr><td>v16 <b>(training now)</b></td>
-    <td>+ 12 knots + stop head + smoothness prior; larger patches (24)</td>
-    <td>pending</td><td>pending</td></tr>
+<tr><td>v16</td>
+    <td>+ 12 knots + stop head + smoothness prior; patch 24</td>
+    <td>step 40k → 0.673</td><td>0.923 (40k)</td></tr>
+<tr><td>v17</td>
+    <td>+ narrow-match sim (flag_amp max 0.15, noise 0.010)</td>
+    <td class="flag">collapsed 0.055 → 0.38 → 0.055</td><td>—</td></tr>
+<tr><td><b>v18 (champion)</b></td>
+    <td>+ WIDE-range matched sim (0.005-0.60 amp bias-low, bg 0.55-0.75); sim-like preproc at eval</td>
+    <td class="win">step 200k → 0.865  (300k → 0.865)</td>
+    <td class="win"><b>0.990 (300k) → 1.000 (ultra-wide TTA)</b></td></tr>
 </table>
+
+<h3>The sim2real story</h3>
+<p>Diagnostic (2026-09-03): sim's `clip_median` std was <b>3× real's</b>
+(0.020 vs 0.006). Sim was too bright and too noisy for what the model
+would see on real. Two failure modes we ruled out first:</p>
+<ol>
+  <li><b>Preprocessing gap alone (v16 canonical vs simlike on real):</b>
+      0.702 → 0.740, only +5%. Not the main issue.</li>
+  <li><b>Narrow-match sim (v17):</b> setting flag_amp max=0.15, noise=0.010
+      to exactly match real stats. Training COLLAPSED — model gets worse
+      over training on its own sim distribution (sim recall 0.055 at 500k).
+      Reducing signal 5× made the network too fragile.</li>
+</ol>
+<p><b>What worked (v18): wide-range domain randomization biased low.</b>
+Kept the full flag_amp range 0.005-0.60 with bias=3.0 so p50=0.04 (close
+to real) and p90=0.30 (well above real). Same for noise. The model sees
+BOTH regimes and learns a scale-robust representation.</p>
+<p><b>Sim-like preprocessing at eval:</b> for v18, feed real through
+<code>simlike_canonicalize</code> (median-sub + /255) instead of
+<code>canonicalize_clip</code> (bandpass + sigma-scale). Matches the
+input distribution v18 was trained on.</p>
 
 <h3>Why v14/v15 didn't win</h3>
 <p>Scheduled sampling was expected to fix exposure bias by mixing self-context
