@@ -39,6 +39,10 @@ def main():
     ap.add_argument("--n-clips", type=int, default=24)
     ap.add_argument("--ncols", type=int, default=4)
     ap.add_argument("--roll-alpha", type=float, default=0.15)
+    ap.add_argument("--preproc", choices=["canonical", "simlike"],
+                    default="canonical",
+                    help="canonical = sigma-scale + bandpass (v8-v16 default); "
+                         "simlike = median-sub + /255 (v17+ trained on this scale)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -52,30 +56,51 @@ def main():
     key = jax.random.key(0)
     rows = []
     import time
+    from sim2real.eval_v2.simlike_preproc import simlike_canonicalize
     for ai, ann in enumerate(annots):
-        try:
-            canon, cfg_can = canonicalize_real_frame(ann["meta"],
-                                                       ann["src_width_px"], T=cfg.T)
-        except Exception:
-            continue
-        clip = canon["clip"]
-        smed_native = canon["static_median"].astype(np.float32) / 255
-        raw_middle = smed_native.copy()   # use static median (cell body) as BG
-        src_h, src_w = clip.shape[1], clip.shape[2]
-        scale_y = cfg.H / src_h; scale_x = cfg.W / src_w
-        clip_r = np.stack([cv2.resize(clip[t], (cfg.W, cfg.H),
-                                        interpolation=cv2.INTER_AREA)
-                            for t in range(clip.shape[0])], axis=0).astype(np.float32)
-        smed_r = cv2.resize(smed_native, (cfg.W, cfg.H),
-                             interpolation=cv2.INTER_AREA).astype(np.float32)
-
-        gt_canon = []
-        for pl in ann["gt_polylines_native"]:
-            g = gt_polyline_to_canonical(pl, ann["meta"], cfg_can,
-                                           canonical_h=CANONICAL_H,
-                                           canonical_w=CANONICAL_W)
-            if len(g) >= 4:
+        if args.preproc == "canonical":
+            try:
+                canon, cfg_can = canonicalize_real_frame(ann["meta"],
+                                                           ann["src_width_px"], T=cfg.T)
+            except Exception:
+                continue
+            clip = canon["clip"]
+            smed_native = canon["static_median"].astype(np.float32) / 255
+            raw_middle = smed_native.copy()
+            src_h, src_w = clip.shape[1], clip.shape[2]
+            scale_y = cfg.H / src_h; scale_x = cfg.W / src_w
+            clip_r = np.stack([cv2.resize(clip[t], (cfg.W, cfg.H),
+                                            interpolation=cv2.INTER_AREA)
+                                for t in range(clip.shape[0])], axis=0).astype(np.float32)
+            smed_r = cv2.resize(smed_native, (cfg.W, cfg.H),
+                                 interpolation=cv2.INTER_AREA).astype(np.float32)
+            gt_canon = []
+            for pl in ann["gt_polylines_native"]:
+                g = gt_polyline_to_canonical(pl, ann["meta"], cfg_can,
+                                               canonical_h=CANONICAL_H,
+                                               canonical_w=CANONICAL_W)
+                if len(g) >= 4:
+                    gt_canon.append(g)
+        else:  # simlike
+            try:
+                clip_r, smed_r, src_h, src_w, sy, sx = simlike_canonicalize(
+                    ann["meta"], T=cfg.T, target_hw=(cfg.H, cfg.W))
+            except Exception:
+                continue
+            # For display, use static-median resized to canonical-256 for consistent
+            # scale with canonical viz.
+            raw_middle = cv2.resize(smed_r, (CANONICAL_W, CANONICAL_H),
+                                       interpolation=cv2.INTER_CUBIC)
+            # GT in canonical-256 (matches historical viz coordinates)
+            scale_y_disp = CANONICAL_H / src_h; scale_x_disp = CANONICAL_W / src_w
+            gt_canon = []
+            for pl in ann["gt_polylines_native"]:
+                if len(pl) < 4: continue
+                g = pl.astype(np.float32) * np.asarray([scale_y_disp, scale_x_disp])
                 gt_canon.append(g)
+            # rollouts will be produced in model-canvas coords → project to
+            # canonical-256 via (H_model → H_canonical, W_model → W_canonical)
+            scale_y = cfg.H / CANONICAL_H; scale_x = cfg.W / CANONICAL_W
 
         t0 = time.time()
         rollouts, key = sample_pool_one_clip(
